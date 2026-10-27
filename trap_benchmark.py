@@ -572,6 +572,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "recovery_completed": 0, "recovery_attempts": 0, "recovery_failures": 0,
         "recovery_blocked": 0, "recovery_shard_views": 0, "forced_evidence_chars": 0,
         "total_actions": 0, "invalid_actions": 0, "wrong_repairs": 0,
+        "no_action_investigation_calls": 0, "empty_investigation_replies": 0,
         "decoy_documents_opened": 0, "trap_waste_chars": 0,
         "verified_cases": 0, "case_breakdown": [],
     }
@@ -620,6 +621,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
             result["subtask_accuracy"] += int(sim.verified)
             result["verified_cases"] += int(sim.verified)
             result["total_actions"] += sim.actions
+            result["no_action_investigation_calls"] += sum(
+                e["label"] == "invalid_action" for e in sim.history)
             result["invalid_actions"] += sim.invalid_actions
             result["wrong_repairs"] += sim.wrong_repairs
             result["decoy_documents_opened"] += sim.trap_views
@@ -717,6 +720,10 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
             for name, truth in expected.items())
         result["elapsed_seconds"] = round(time.perf_counter() - started, 3)
         result.update(trace.totals())
+        result["empty_investigation_replies"] = sum(
+            r.get("empty_visible_output") is True for r in trace.calls
+            if r.get("phase") in ("parent_investigate", "branch_investigate")
+            or r.get("phase", "").startswith("branch_recursive_"))
         result["calls"] = trace.calls
         result["input_over_limit_risk"] = any(
             r["prompt_tokens"] is not None and r["prompt_tokens"] > context_limit for r in trace.calls)
