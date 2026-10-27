@@ -1,3 +1,15 @@
+## v1.2 reporting and diagnostics
+
+When benchmarking local reasoning models, output tokens used for hidden reasoning can exhaust the final-report cap without producing text. The standalone llama.cpp engine requests `reasoning_effort=none` on ACK and final-report requests (not during investigations), allows `--final-output-tokens` (default 2048), and retries an empty or truncated final once (`--final-retries 1`). All costs count toward benchmark token totals and runtime. Do not interpret a successful retry as a first-attempt success; read `final_first_status`, `final_attempts`, and `final_recovered_on_retry`.
+
+We report `empty_visible_calls`, `reasoning_only_calls` (only when the API exposes evidence), `reported_reasoning_tokens`, and per-call `requested_reasoning_effort`. Some server versions ignore per-request reasoning controls. For compatible engines you can specify `--report-reasoning auto` to omit that hint.
+
+Only the **model-generated report** can pass `exact_final`. `compiled_report` / `compiled_report_complete` in the repair scenario are machine-assembled from simulator-verified outcomes and do not measure model recall. These are diagnostic, not a fourth competitor.
+
+To test summarization you must run **three or more repairs** (default summary cadence is every two *completed* incidents, except the last). `--smoke` only runs one repair per mode.
+
+---
+
 # New in v1.1: dedicated llama.cpp benchmark engine
 
 **Recommended for clean benchmarking:** use `--engine llama` to run a separate
