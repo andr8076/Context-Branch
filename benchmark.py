@@ -726,6 +726,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "error_type", "failed_phase", "error",
         "scenario", "trap_density", "trap_log_lines", "max_actions",
         "total_actions", "verified_cases", "invalid_actions", "wrong_repairs",
+        "no_action_investigation_calls", "empty_investigation_replies",
         "recursive_branch_count", "recursive_max_depth", "recursive_stage_successes", "recursive_stage_failures",
         "decoy_documents_opened", "trap_waste_chars",
         "recovery_log_lines", "recovery_completed", "recovery_attempts",
@@ -821,6 +822,16 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{sum(r['wrong_repairs'] for r in rows)} | "
                                  f"{sum(r['decoy_documents_opened'] for r in rows)} | "
                                  f"{sum(r['trap_waste_chars'] for r in rows)} |")
+        lines += ["", "## Investigation no-action diagnostics", "",
+                  "Counts cover only investigation calls, not final reporting or summaries.",
+                  "| Tasks | Mode | No valid JSON action | Empty model responses |",
+                  "|---:|---|---:|---:|"]
+        for n in args.tasks:
+            for mode in args.modes:
+                rows = [r for r in data if r["tasks"] == n and r["mode"] == mode]
+                if rows:
+                    lines.append(f"| {n} | {mode} | {sum(r.get('no_action_investigation_calls', 0) for r in rows)} "
+                                 f"| {sum(r.get('empty_investigation_replies', 0) for r in rows)} |")
         lines += ["", "## Mandatory recovery investigation", "",
                   "Every incident requires two noisy recovery shards and a correct `recover` action before "
                   "the approvals ledger opens or a repair can be accepted. These reads are necessary work "
