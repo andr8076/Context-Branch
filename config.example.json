@@ -8,6 +8,15 @@
   "max_branch_depth": 2,
   "max_parent_result_chars": 1800,
   "max_context_chars": 5500,
+  "context_limit_tokens": 8192,
+  "context_safety_tokens": 256,
+  "max_total_model_calls": 24,
+  "max_total_branches": 8,
+  "max_total_tokens": 50000,
+  "max_total_seconds": 600,
+  "no_action_retries": 1,
+  "retry_output_tokens": 256,
   "save_transcripts": false,
   "read_only_project_root": ""
 }
+

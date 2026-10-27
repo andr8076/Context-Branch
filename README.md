@@ -1,3 +1,20 @@
+# v1.5 — bounded Jan branches and reliable resumes
+
+The Jan MCP runner now shares persistent model-call, branch, token and active-time
+limits across an entire branch tree, including later resumes. Complete prompt
+checks include tool schemas and a generation reserve. Repeated read-only results
+can be deduplicated; unique evidence that cannot fit causes an explicit stop.
+Transcript saves preserve complete tool exchanges, and health checks contact Jan
+even with an explicit model ID. Empty/unusable replies have bounded, metered
+recovery. File tools support numbered ranges.
+
+Existing configurations work with defaults. See [RUNTIME.md](RUNTIME.md) for
+update/check commands, all settings, result interpretation and live-test scope.
+The repair simulator's controlled-recursion benchmark remains a separate
+experiment; runtime regression tests do not establish live Qwen performance.
+
+---
+
 # Evidence-gated repairs and reproducible context-pressure experiment
 
 **Simulator rule update:** every repair now requires the model to inspect all five authoritative documents: `registry/releases`, `registry/approvals`, `network/aliases`, `network/routes`, and `security/certificates`, even when `--pressure-records 0`. Correct guesses without evidence are rejected and counted as `authority_blocked`. This changes the task protocol relative to older runs; do not compare pass rates across simulator-rule versions without noting the difference. `results.json` now includes `simulator_rules_version=2` and `mandatory_authority_inspection=true`.
@@ -631,3 +648,4 @@ Tests use a local mock API and verify branch creation, isolation, resuming, nest
 - **Tool never called**: enable tool calling and paste assistant instructions; model must follow tool calling.
 - **MCP tool timeout**: raise Jan's MCP tool-call timeout; reduce max_agent_turns or max_output_tokens; ensure Jan local model inference is stable.
 - **VRAM limit**: this project **reuses** Jan's inference endpoint. Avoid a second independent Jan worker loaded with another model if VRAM is tight. The local API model and Jan desktop model configuration may affect memory usage.
+
