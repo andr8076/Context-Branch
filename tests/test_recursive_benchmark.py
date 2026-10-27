@@ -448,6 +448,85 @@ class RecursiveContextTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 bm.arguments(bad_args)
 
+    def test_hard_context_pressure_checkpoint_vs_uncheckpointed_same_agent(self):
+        """Real simulator transcripts, hard request cap, repeated model-selected reads.
+
+        Uses an offline scripted agent, NOT a claim about Qwen performance.
+        Equal seed/actions and immutable observations in both runs; only
+        checkpoint policy differs. A virtual API rejects oversized requests.
+        """
+        class RevisitAgent(RecursiveFakeJan):
+            def __init__(self):
+                super().__init__()
+                self.revisits_left = 13
+                self.revisit_requests = 0
+                self.pressure_rejections = 0
+
+            def __call__(self, method, url, cfg, payload=None):
+                if method == 'GET':
+                    return super().__call__(method, url, cfg, payload)
+                msgs = payload['messages']
+                # Simulate model server's prompt + reserved generation capacity.
+                requested = bm.approximate_tokens(msgs) + payload['max_tokens']
+                if requested > 4096:
+                    self.pressure_rejections += 1
+                    raise RuntimeError(
+                        f'request ({requested} tokens) exceeds context capacity (4096 tokens)')
+                if 'RECURSIVE STAGE=repair' in msgs[0]['content']:
+                    visited = [tb.parse_action(m['content']) for m in msgs
+                               if m['role'] == 'assistant']
+                    read_paths = [a['path'] for a in visited if a and a['action'] == 'inspect']
+                    if 'registry/releases' in read_paths and self.revisits_left:
+                        self.revisits_left -= 1
+                        self.revisit_requests += 1
+                        answer = json.dumps({'action': 'inspect', 'path': 'registry/releases'})
+                        return {'choices': [{'message': {'role': 'assistant', 'content': answer},
+                                             'finish_reason': 'stop'}],
+                                'usage': {'prompt_tokens': bm.approximate_tokens(msgs),
+                                          'completion_tokens': len(answer) // 4}}
+                return super().__call__(method, url, cfg, payload)
+
+        trials = {}
+        for threshold in (0, 0.50):
+            cfg = self.cfg()
+            cfg.update({'_recursive_checkpoint_threshold': threshold,
+                        '_recursive_checkpoint_max': 10,
+                        '_stage_start_inspects': 2,
+                        '_stage_start_output_tokens': 256})
+            fake = RevisitAgent()
+            with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fake):
+                trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 4096,
+                                          Path(tmp), bm, nested_depth=2,
+                                          max_actions=48, pressure_records=1,
+                                          recovery_log_lines=8, nested_log_lines=8)
+            trials[threshold] = (trial, fake)
+        without, baseline = trials[0]
+        with_cp, managed = trials[0.50]
+        self.assertEqual(without['error_type'], 'context_overflow_confirmed', without)
+        self.assertGreater(baseline.pressure_rejections, 0)
+        self.assertTrue(without['partial_failure'])
+        self.assertGreater(without['total_actions'], 0)
+        self.assertEqual(without['verified_cases'], 0)
+        self.assertEqual(without['recursive_checkpoints'], 0)
+        self.assertEqual(with_cp['verified_cases'], 1, with_cp['error'])
+        self.assertTrue(with_cp['exact_final'], with_cp['error'])
+        self.assertGreater(with_cp['recursive_checkpoints'], 0, with_cp['recursive_events'])
+        self.assertEqual(with_cp['recursive_checkpoint_blocked'], 0)
+        self.assertEqual(managed.pressure_rejections, 0)
+        self.assertEqual(managed.revisits_left, 0)
+        self.assertEqual(with_cp['authority_docs_viewed'], 5)
+        self.assertEqual(with_cp['wrong_repairs'], 0)
+        self.assertEqual(with_cp['out_of_scope_actions'], 0)
+        self.assertLessEqual(with_cp['total_actions'], 48)
+        self.assertGreater(with_cp['total_actions'], 21)
+        # No secret repair answer was transmitted in any checkpoint receipt.
+        root = next(x for x in with_cp['recursive_events'][0]['stages']
+                    if x['stage'] == 'repair')
+        self.assertGreater(root['context_checkpoints'], 0)
+        for checkpoint in root['checkpoint_details']:
+            self.assertIn('registry/releases', checkpoint['documents_preserved'])
+            self.assertLess(checkpoint['after_est_tokens'], checkpoint['before_est_tokens'])
+
     def test_cli_opt_in_and_archive_rejected(self):
         args=bm.arguments(['--scenario','repair','--tasks','1','--repeats','1',
                           '--modes','linear','summarized','branch','recursive'])
