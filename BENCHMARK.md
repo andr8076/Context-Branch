@@ -1,3 +1,15 @@
+## v1.3 summarization reliability
+
+Summarization is a model-generated inference task, not free lossless compression. It now uses a separate `--summary-output-tokens` budget (default 2048), requests `reasoning_effort=none` when the reporting policy is enabled on standalone llama.cpp, and retries once (configurable `--summary-retries`) if the generated note is empty or cut off. The original mission instructions are kept unchanged across compaction, and the model never receives correct answers from the benchmark oracle.
+
+A valid, complete summary must also fit the separate retained-memory size limit (`--summary-max-chars`, default 1800). Oversized complete notes are rejected rather than cropped; repeated empty/truncated notes produce `summary_failed`. Additional model requests are included in all cost and timing metrics.
+
+New detailed fields in `results.json`: `summary_events` (each compaction's `first_status`, `status`, `attempts`, `recovered_on_retry`, `chars`), plus totals `summary_attempts`, `summary_retries`, `summary_retry_recoveries` and `summary_failures`. Aggregate counters also appear in `results.csv` and the markdown summary.
+
+To exercise compaction, use at least three repair incidents per trial with the default `--summary-every 2`. A one-incident `--smoke` run does not exercise the summarizer.
+
+---
+
 ## v1.2 reporting and diagnostics
 
 When benchmarking local reasoning models, output tokens used for hidden reasoning can exhaust the final-report cap without producing text. The standalone llama.cpp engine requests `reasoning_effort=none` on ACK and final-report requests (not during investigations), allows `--final-output-tokens` (default 2048), and retries an empty or truncated final once (`--final-retries 1`). All costs count toward benchmark token totals and runtime. Do not interpret a successful retry as a first-attempt success; read `final_first_status`, `final_attempts`, and `final_recovered_on_retry`.
