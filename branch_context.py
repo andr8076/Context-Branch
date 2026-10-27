@@ -13,10 +13,15 @@ import re
 import sys
 import uuid
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+from branch_runtime import (DelegationRefused, RunBudget, RunLimitExceeded,
+                            deduplicate_reads, finish_interrupted_exchange, normalize_conversation,
+                            task_fingerprint, task_identity)
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "config.json"
@@ -45,6 +50,14 @@ DEFAULTS = {
     "max_branch_depth": 2,
     "max_parent_result_chars": 1800,
     "max_context_chars": 5500,
+    "context_limit_tokens": 8192,
+    "context_safety_tokens": 256,
+    "max_total_model_calls": 24,
+    "max_total_branches": 8,
+    "max_total_tokens": 50000,
+    "max_total_seconds": 600,
+    "no_action_retries": 1,
+    "retry_output_tokens": 256,
     "save_transcripts": False,
     "read_only_project_root": ""
 }
@@ -68,10 +81,16 @@ def config():
         raise ValueError("For privacy, api_base_url must be an HTTP loopback address (localhost)")
     for name, low, high in (("request_timeout_seconds", 5, 600), ("max_output_tokens", 64, 4096),
                             ("max_agent_turns", 1, 12), ("max_branch_depth", 0, 4),
-                            ("max_parent_result_chars", 200, 4000), ("max_context_chars", 400, 16000)):
+                            ("max_parent_result_chars", 200, 4000), ("max_context_chars", 400, 16000),
+                            ("context_limit_tokens", 1024, 1048576), ("context_safety_tokens", 64, 4096),
+                            ("max_total_model_calls", 1, 1000), ("max_total_branches", 1, 100),
+                            ("max_total_tokens", 1024, 10000000), ("max_total_seconds", 5, 7200),
+                            ("no_action_retries", 0, 2), ("retry_output_tokens", 64, 4096)):
         val = values[name]
         if type(val) is not int or not low <= val <= high:
             raise ValueError(f"{name} must be an integer between {low} and {high}")
+    if values["max_output_tokens"] + values["context_safety_tokens"] >= values["context_limit_tokens"]:
+        raise ValueError("context_limit_tokens must leave room for the prompt, output and safety reserve")
     if type(values["save_transcripts"]) is not bool:
         raise ValueError("save_transcripts must be boolean")
     if values["read_only_project_root"]:
@@ -142,14 +161,29 @@ def http_json(method, url, cfg, payload=None):
         raise RuntimeError("Cannot reach local inference API (or request timed out). Check server health, address and timeout settings.") from ex
 
 
+def available_models(cfg):
+    result = http_json("GET", cfg["api_base_url"].rstrip("/") + "/models", cfg)
+    ids = [m["id"] for m in result.get("data", [])
+           if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]]
+    if not ids:
+        raise RuntimeError("Jan reported no models. Load one and/or set model in config.json")
+    return ids
+
+
 def chosen_model(cfg):
     if cfg["model"] != "auto":
         return cfg["model"]
-    result = http_json("GET", cfg["api_base_url"].rstrip("/") + "/models", cfg)
-    ids = [m.get("id") for m in result.get("data", []) if isinstance(m, dict) and m.get("id")]
-    if not ids:
-        raise RuntimeError("Jan reported no models. Load one and/or set model in config.json")
+    ids = available_models(cfg)
     return ids[0]
+
+
+class ChatMessage(dict):
+    """Message mapping with API diagnostics kept out of the chat transcript."""
+
+    def __init__(self, message, usage, finish_reason):
+        super().__init__(message)
+        self.usage = usage if isinstance(usage, dict) else {}
+        self.finish_reason = finish_reason
 
 
 def chat(cfg, model, messages, tools=None, reasoning_effort=None):
@@ -167,7 +201,7 @@ def chat(cfg, model, messages, tools=None, reasoning_effort=None):
     message = choices[0].get("message") or {}
     if not isinstance(message, dict):
         raise RuntimeError("Jan returned a malformed completion")
-    return message
+    return ChatMessage(message, answer.get("usage"), choices[0].get("finish_reason"))
 
 
 def ensure_store():
@@ -186,18 +220,46 @@ def branch_path(branch_id):
 
 def save_branch(branch):
     ensure_store()
-    target = branch_path(branch["id"])
+    save_private_json(branch_path(branch["id"]), branch)
+
+
+def save_private_json(target, value):
     temporary = target.with_suffix(".tmp")
     fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(branch, fh, ensure_ascii=False, indent=2)
+            json.dump(value, fh, ensure_ascii=False, indent=2)
             fh.write("\n")
         os.replace(temporary, target)
         if os.name == "posix":
             target.chmod(0o600)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def budget_path(root_id):
+    branch_path(root_id)  # validate before using it in a separate storage directory
+    return DATA / "budgets" / f"{root_id}.json"
+
+
+def save_budget(root_id, ledger):
+    ensure_store()
+    target = budget_path(root_id)
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    if os.name == "posix":
+        target.parent.chmod(0o700)
+    save_private_json(target, ledger)
+
+
+def root_branch(branch):
+    """Resolve legacy branches through parent links; refuse corrupt cycles."""
+    seen = set()
+    while branch.get("parent_id"):
+        if branch["id"] in seen:
+            raise ValueError("Cycle in saved branch parents")
+        seen.add(branch["id"])
+        branch = load_branch(branch["parent_id"])
+    return branch
 
 
 def load_branch(branch_id):
@@ -217,7 +279,7 @@ def clip(value, limit):
     return value if len(value) <= limit else value[:limit - 16] + " ...[truncated]"
 
 
-def parse_result(raw):
+def result_object(raw):
     raw = (raw or "").strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I).strip()
@@ -226,13 +288,20 @@ def parse_result(raw):
         try:
             data, _ = decoder.raw_decode(candidate)
             if isinstance(data, dict) and "result" in data:
-                return {"status": data.get("status") if data.get("status") in ("success", "partial", "blocked") else "partial",
-                        "result": str(data.get("result", "")),
-                        "what_changed": str(data.get("what_changed", "Nothing")),
-                        "next_step": str(data.get("next_step", "")),
-                        "caveats": str(data.get("caveats", ""))}
+                return data
         except (ValueError, TypeError):
             pass
+    return None
+
+
+def parse_result(raw):
+    data = result_object(raw)
+    if data is not None:
+        return {"status": data.get("status") if data.get("status") in ("success", "partial", "blocked") else "partial",
+                "result": str(data.get("result", "")),
+                "what_changed": str(data.get("what_changed", "Nothing")),
+                "next_step": str(data.get("next_step", "")),
+                "caveats": str(data.get("caveats", ""))}
     return {"status": "partial", "result": raw, "what_changed": "Not verified",
             "next_step": "Validate this free-form result", "caveats": "Model did not return structured JSON"}
 
@@ -252,13 +321,36 @@ def safe_file(project_root, requested):
     return resolved
 
 
-def read_project(cfg, path):
+def read_project(cfg, path, start_line=1, max_lines=80):
     root = cfg["read_only_project_root"]
     if not root:
         return "Project files are disabled."
+    if type(start_line) is not int or not 1 <= start_line <= 1000000:
+        raise ValueError("start_line must be an integer between 1 and 1000000")
+    if type(max_lines) is not int or not 1 <= max_lines <= 200:
+        raise ValueError("max_lines must be an integer between 1 and 200")
     p = safe_file(root, path)
+    rows = []
+    size = 0
+    next_line = None
+    truncated_line = False
     with p.open(encoding="utf-8", errors="replace") as fh:
-        return clip(fh.read(5000), 4500)
+        for number, line in enumerate(islice(fh, start_line - 1, None), start_line):
+            row = f"{number}: {line.rstrip()}"
+            if len(rows) >= max_lines or (rows and size + len(row) > 4000):
+                next_line = number
+                break
+            if len(row) > 4000:
+                row = clip(row, 4000)
+                truncated_line = True
+            rows.append(row)
+            size += len(row) + 1
+    result = f"SOURCE: {path}; start_line={start_line}\n" + ("\n".join(rows) or "[No lines in this range]")
+    if next_line is not None:
+        result += f"\n[More text: read this file with start_line={next_line}]"
+    if truncated_line:
+        result += "\n[A single oversized line was truncated; its full contents were not observed]"
+    return result
 
 
 def search_project(cfg, query):
@@ -301,7 +393,7 @@ def agent_tools(cfg, depth):
     tools = []
     if cfg["read_only_project_root"]:
         tools += [
-            {"type": "function", "function": {"name": "read_project_file", "description": "Read a UTF-8 text file relative to the configured read-only project root", "parameters": {"type":"object", "properties": {"path": {"type":"string"}}, "required": ["path"]}}},
+            {"type": "function", "function": {"name": "read_project_file", "description": "Read a numbered range of a UTF-8 project file. Use start_line/max_lines for large sources; continue at the returned next line when needed.", "parameters": {"type":"object", "properties": {"path": {"type":"string"}, "start_line": {"type":"integer", "minimum":1}, "max_lines": {"type":"integer", "minimum":1, "maximum":200}}, "required": ["path"]}}},
             {"type": "function", "function": {"name": "search_project_files", "description": "Search text in project files read-only", "parameters": {"type":"object", "properties": {"query": {"type":"string"}}, "required": ["query"]}}}]
     if depth < cfg["max_branch_depth"]:
         tools += [{"type": "function", "function": {"name": "solve_nested_branch", "description": "Delegate a genuinely independent subproblem and receive only its concise outcome", "parameters": {"type":"object", "properties": {"task": {"type":"string"}, "relevant_context": {"type":"string"}}, "required": ["task"]}}}]
@@ -310,69 +402,203 @@ def agent_tools(cfg, depth):
 
 def format_parent(branch, cfg):
     result = branch.get("outcome") or {}
+    usage = branch.get("usage", {})
+    if branch.get("root_id") and budget_path(branch["root_id"]).exists():
+        ledger = json.loads(budget_path(branch["root_id"]).read_text(encoding="utf-8"))
+        usage = RunBudget(branch["root_id"], cfg, ledger).public()
     return {"branch_id": branch["id"], "parent_id": branch.get("parent_id"),
             "status": branch["status"], "result": clip(result.get("result", ""), cfg["max_parent_result_chars"]),
             "what_changed": clip(result.get("what_changed", "Nothing"), 350),
             "next_step": clip(result.get("next_step", ""), 500),
             "caveats": clip(result.get("caveats", ""), 350),
             "subbranches": branch.get("subbranches", []),
+            "stop_reason": branch.get("stop_reason"),
+            "usage": usage,
+            "verification": "model_reported; read-only tool observations do not independently verify the conclusion",
             "note": "Branch reasoning was isolated. This note does not restore or modify Jan's main conversation history."}
 
 
-def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None):
+def message_content(answer):
+    content = answer.get("content") or ""
+    if isinstance(content, list):
+        return "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
+    return str(content)
+
+
+def nested_handoff(child):
+    """Keep a bounded JSON receipt; never cut serialized child JSON mid-field."""
+    data = {key: child[key] for key in ("branch_id", "parent_id", "status", "result",
+            "what_changed", "next_step", "caveats", "stop_reason", "verification")}
+    data["subbranch_count"] = len(child.get("subbranches", []))
+    data["usage"] = {key: child.get("usage", {}).get(key) for key in
+                     ("root_id", "model_calls", "branches", "total_tokens", "elapsed_seconds", "limits")}
+    for key in ("result", "next_step", "caveats"):
+        size = len(json.dumps(data, ensure_ascii=False))
+        if size <= 4500:
+            break
+        data[key] = clip(data[key], max(32, len(data[key]) - (size - 4500) - 16))
+    return json.dumps(data, ensure_ascii=False)
+
+
+def usable_reply(answer, tools):
+    calls = answer.get("tool_calls")
+    if calls:
+        if not tools or not isinstance(calls, list):
+            return False
+        ids = [call.get("id") for call in calls if isinstance(call, dict)]
+        return (len(ids) == len(calls) and all(isinstance(i, str) and i for i in ids)
+                and len(set(ids)) == len(ids)
+                and all(isinstance(call.get("function"), dict) for call in calls))
+    data = result_object(message_content(answer))
+    return (data is not None and data.get("status") in ("success", "partial", "blocked")
+            and all(isinstance(data.get(key), str) for key in
+                    ("result", "what_changed", "next_step", "caveats"))
+            and bool(data["result"].strip()))
+
+
+def request_branch_reply(cfg, model, messages, tools, budget, metrics):
+    """Every initial call, retry and forced final uses the same run ledger."""
+    answer = {}
+    for attempt in range(cfg["no_action_retries"] + 1):
+        prompt = messages
+        output_tokens = cfg["max_output_tokens"]
+        if attempt:
+            output_tokens = min(output_tokens, cfg["retry_output_tokens"])
+            prompt = messages + [{"role": "user", "content":
+                "No usable response was produced. Return a permitted tool call, or ONLY "
+                "complete final JSON with status, result, what_changed, next_step and caveats. "
+                "No analysis or markdown."}]
+        predicted = budget.predicted_prompt(prompt, tools)
+        if predicted + output_tokens + budget.limits["context_safety_tokens"] >= budget.limits["context_limit_tokens"] * 0.78:
+            shorter, removed = deduplicate_reads(messages)
+            candidate = shorter if not attempt else shorter + [prompt[-1]]
+            candidate_tokens = budget.predicted_prompt(candidate, tools)
+            if removed and candidate_tokens < predicted:
+                messages[:] = shorter
+                prompt = candidate
+                metrics["checkpoints"] += 1
+                budget.state["checkpoints"] += 1
+                budget.state["deduplicated_reads"] += removed
+                predicted = candidate_tokens
+        reservation = budget.before_call(predicted, output_tokens)
+        if attempt:
+            metrics["no_action_retries"] += 1
+            budget.state["no_action_retries"] += 1
+            budget.flush()
+        request_cfg = dict(cfg, max_output_tokens=output_tokens,
+                           request_timeout_seconds=min(cfg["request_timeout_seconds"], budget.remaining_seconds()))
+        metrics["model_calls"] += 1
+        row = {"retry": bool(attempt), "prompt_est_tokens": predicted,
+               "requested_max_tokens": output_tokens, "prompt_tokens": None,
+               "completion_tokens": None, "finish_reason": None,
+               "empty_visible_output": None, "error_type": None}
+        metrics["calls"].append(row)
+        started = budget.elapsed()
+        try:
+            answer = chat(request_cfg, model, prompt, tools)
+            usage = getattr(answer, "usage", {})
+            row.update(prompt_tokens=usage.get("prompt_tokens"),
+                       completion_tokens=usage.get("completion_tokens"),
+                       finish_reason=getattr(answer, "finish_reason", None),
+                       empty_visible_output=not bool(message_content(answer).strip()))
+            budget.after_call(reservation, usage)
+        except Exception as ex:
+            row["error_type"] = type(ex).__name__
+            raise
+        finally:
+            row["elapsed_seconds"] = round(budget.elapsed() - started, 3)
+        if usable_reply(answer, tools):
+            return answer
+    return answer
+
+
+def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None, _budget=None):
     task = clip(task, cfg["max_context_chars"])
+    relevant_context = clip(relevant_context, cfg["max_context_chars"])
     if not task:
         raise ValueError("A nonempty task is required")
-    if parent_id:
-        parent = load_branch(parent_id)
-        depth = parent["depth"] + 1
-        if depth > cfg["max_branch_depth"]:
-            raise ValueError("Maximum branch depth exceeded")
-    else:
-        depth = 0
+    parent = load_branch(parent_id) if parent_id else None
     if existing_id:
         branch = load_branch(existing_id)
-        depth = branch["depth"]
-        model = branch["model"]
-        parent_id = branch["parent_id"]
-        task = clip(task, cfg["max_context_chars"])
-        original = branch["task"]
+        parent_id = branch.get("parent_id")
+        parent = load_branch(parent_id) if parent_id else None
         previous = json.dumps(branch.get("outcome", {}), ensure_ascii=False)
-        intro = f"ORIGINAL TASK:\n{original}\n\nPREVIOUS BRANCH RESULT:\n{previous}\n\nNEW FOLLOW-UP:\n{task}"
-        # Full branch history is only needed when explicitly enabled.
-        if cfg["save_transcripts"] and branch.get("transcript"):
-            # Retain well-formed tool-call sequences rather than slicing into an
-            # assistant/tool exchange, which OpenAI-compatible APIs may reject.
-            messages = list(branch["transcript"])
-            if not messages or messages[0].get("role") != "system":
-                messages.insert(0, {"role": "system", "content": SYSTEM})
-            messages.append({"role": "user", "content": intro})
-        else:
-            messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": intro}]
-        branch["status"] = "running"
+        intro = f"ORIGINAL TASK:\n{branch['task']}\n\nPREVIOUS BRANCH RESULT:\n{previous}\n\nNEW FOLLOW-UP:\n{task}"
+        messages, repaired = normalize_conversation(
+            branch.get("transcript", []) if cfg["save_transcripts"] else [], SYSTEM)
+        messages.append({"role": "user", "content": intro})
+        if repaired:
+            messages.append({"role": "user", "content":
+                "An incomplete legacy transcript exchange was removed. Previous results "
+                "are model reports; re-inspect sources needed to verify them."})
     else:
-        model = chosen_model(cfg)
-        branch = {"id": uuid.uuid4().hex, "parent_id": parent_id, "depth": depth, "model": model,
-                  "task": task, "created": utcnow(), "updated": utcnow(), "status": "running",
+        depth = parent["depth"] + 1 if parent else 0
+        if depth > cfg["max_branch_depth"]:
+            raise ValueError("Maximum branch depth exceeded")
+        ancestor = parent
+        seen = set()
+        while ancestor:
+            if ancestor["id"] in seen:
+                raise ValueError("Cycle in saved branch parents")
+            seen.add(ancestor["id"])
+            if task_identity(task) == task_identity(ancestor["task"]):
+                raise DelegationRefused("A nested branch cannot repeat an ancestor's task")
+            ancestor = load_branch(ancestor["parent_id"]) if ancestor.get("parent_id") else None
+        branch = {"id": uuid.uuid4().hex, "parent_id": parent_id, "depth": depth,
+                  "model": parent["model"] if parent else cfg["model"],
+                  "task": task, "created": utcnow(), "updated": utcnow(),
                   "subbranches": [], "outcome": {}}
-        initial = f"SIDE TASK:\n{task}\n\nONLY RELEVANT MAIN-TASK CONTEXT:\n{clip(relevant_context, cfg['max_context_chars']) or '(none supplied)'}"
+        initial = f"SIDE TASK:\n{task}\n\nONLY RELEVANT MAIN-TASK CONTEXT:\n{relevant_context or '(none supplied)'}"
         messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": initial}]
+        repaired = 0
+    root = root_branch(parent or branch)
+    root_id = root["id"]
+    if _budget is None:
+        path = budget_path(root_id)
+        saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        budget = RunBudget(root_id, cfg, saved, lambda state: save_budget(root_id, state))
+        if saved is None and (parent or existing_id):
+            # Pre-upgrade usage is unknown. Charge existing branch slots so a
+            # migrated child cannot start a disconnected fresh tree allowance.
+            budget.add_branch(task_fingerprint(root["task"]))
+            budget.state["pre_upgrade_usage_unknown"] = True
+    else:
+        budget = _budget
+        if budget.root_id != root_id:
+            raise ValueError("Nested branch was given a different root budget")
+    if not existing_id:
+        budget.add_branch(task_fingerprint(task, relevant_context))
+    branch["root_id"] = root_id
+    branch["status"] = "running"
+    branch.pop("stop_reason", None)
+    metrics = {"model_calls": 0, "checkpoints": 0, "no_action_retries": 0,
+               "repaired_transcript_fragments": repaired, "calls": []}
     save_branch(branch)
+    if parent:
+        # Also maintain the link for explicit MCP calls with parent_id.
+        if branch["id"] not in parent["subbranches"]:
+            parent["subbranches"].append(branch["id"])
+            save_branch(parent)
     try:
-        tools = agent_tools(cfg, depth)
+        budget.check()
+        model = branch["model"]
+        if model == "auto":
+            request_cfg = dict(cfg, request_timeout_seconds=min(cfg["request_timeout_seconds"], budget.remaining_seconds()))
+            model = chosen_model(request_cfg)
+            branch["model"] = model
+            save_branch(branch)
+        tools = agent_tools(cfg, branch["depth"])
         final = None
         for _ in range(cfg["max_agent_turns"]):
-            answer = chat(cfg, model, messages, tools)
+            answer = request_branch_reply(cfg, model, messages, tools, budget, metrics)
             calls = answer.get("tool_calls") or []
-            content = answer.get("content") or ""
-            if isinstance(content, list):
-                content = "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
-            if calls and tools:
-                assistant = {"role": "assistant", "content": content, "tool_calls": calls}
-                messages.append(assistant)
+            content = message_content(answer)
+            if calls and usable_reply(answer, tools):
+                messages.append({"role": "assistant", "content": content, "tool_calls": calls})
                 for index, call in enumerate(calls):
                     spec = call.get("function") or {}
                     try:
+                        budget.check()
                         if index >= 3:
                             raise ValueError("At most 3 tool calls are executed per model turn")
                         args = json.loads(spec.get("arguments") or "{}")
@@ -380,51 +606,81 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None)
                             raise ValueError("Expected arguments object")
                         name = spec.get("name")
                         if name == "read_project_file" and cfg["read_only_project_root"]:
-                            output = read_project(cfg, args.get("path", ""))
+                            output = read_project(cfg, args.get("path", ""),
+                                                  args.get("start_line", 1), args.get("max_lines", 80))
                         elif name == "search_project_files" and cfg["read_only_project_root"]:
                             output = search_project(cfg, args.get("query", ""))
-                        elif name == "solve_nested_branch" and depth < cfg["max_branch_depth"]:
-                            child = run_branch(cfg, args.get("task", ""), args.get("relevant_context", ""), parent_id=branch["id"])
-                            branch["subbranches"].append(child["branch_id"])
-                            output = json.dumps(child, ensure_ascii=False)
+                        elif name == "solve_nested_branch" and branch["depth"] < cfg["max_branch_depth"]:
+                            child = run_branch(cfg, args.get("task", ""), args.get("relevant_context", ""),
+                                               parent_id=branch["id"], _budget=budget)
+                            if child["branch_id"] not in branch["subbranches"]:
+                                branch["subbranches"].append(child["branch_id"])
+                            output = nested_handoff(child)
                         else:
                             output = "Unsupported or disabled tool"
+                    except RunLimitExceeded:
+                        # Stop the entire run instead of converting exhaustion
+                        # into a tool error that the model can retry indefinitely.
+                        raise
                     except Exception as ex:
                         output = f"Tool error: {type(ex).__name__}: {str(ex)[:300]}"
-                    messages.append({"role": "tool", "tool_call_id": str(call.get("id", "unknown")), "content": clip(output, 4500)})
-                # Stay within a modest per-branch context even for large tool outputs.
+                    messages.append({"role": "tool", "tool_call_id": call["id"], "content": clip(output, 4500)})
                 continue
-            final = str(content)
+            final = content
             messages.append({"role": "assistant", "content": final})
+            if not usable_reply(answer, tools):
+                branch["stop_reason"] = "no_usable_response"
             break
         if final is None:
             messages.append({"role": "user", "content": "Tool budget exhausted. Answer now using ONLY compact final JSON, no more tool use."})
-            final_msg = chat(cfg, model, messages)
-            final = str(final_msg.get("content") or "")
+            final_msg = request_branch_reply(cfg, model, messages, None, budget, metrics)
+            final = message_content(final_msg)
             messages.append({"role": "assistant", "content": final})
+            if not usable_reply(final_msg, None):
+                branch["stop_reason"] = "no_usable_response"
         outcome = parse_result(final)
+        if branch.get("stop_reason") and outcome["status"] == "success":
+            outcome["status"] = "partial"
+            outcome["caveats"] += " Response did not match the required tool or final-result protocol."
+        if not final.strip():
+            outcome.update(status="blocked", result="No usable response after bounded recovery",
+                           next_step="Check model output settings or try a smaller side task")
+        if outcome["what_changed"].strip().casefold() not in ("nothing", "none", ""):
+            outcome["caveats"] = clip(outcome["caveats"] + " External changes were not verified; branch tools are read-only.", 700)
+        outcome["what_changed"] = "Nothing"
         for key, maximum in (("result", 5000), ("what_changed", 700), ("next_step", 1000), ("caveats", 700)):
             outcome[key] = clip(outcome[key], maximum)
         branch["outcome"] = outcome
         branch["status"] = outcome["status"]
+    except RunLimitExceeded as ex:
+        finish_interrupted_exchange(messages, ex.kind)
+        branch["status"] = "blocked"
+        branch["stop_reason"] = ex.kind
+        branch["outcome"] = {"status": "blocked", "result": str(ex), "what_changed": "Nothing",
+                             "next_step": "Use a smaller task or start a new root branch with suitable limits",
+                             "caveats": "The branch stopped without claiming completion"}
+    except Exception as ex:
+        finish_interrupted_exchange(messages, type(ex).__name__)
+        branch["status"] = "error"
+        branch["outcome"] = {"status": "blocked", "result": str(ex)[:400], "what_changed": "Nothing",
+                             "next_step": "Check Jan Local API Server settings and retry", "caveats": "Branch failed before completion"}
+        raise
+    finally:
         if cfg["save_transcripts"]:
-            branch["transcript"] = messages[-22:]
+            branch["transcript"], dropped = normalize_conversation(messages, SYSTEM)
+            metrics["repaired_transcript_fragments"] += dropped
         else:
             branch.pop("transcript", None)
+        branch["runtime"] = metrics
+        branch["usage"] = budget.public()
         branch["updated"] = utcnow()
+        budget.flush()
         save_branch(branch)
-        return format_parent(branch, cfg)
-    except Exception as ex:
-        branch["status"] = "error"
-        branch["outcome"] = {"status": "blocked", "result": str(ex)[:400], "what_changed": "Nothing verified",
-                             "next_step": "Check Jan Local API Server settings and retry", "caveats": "Branch failed before completion"}
-        branch["updated"] = utcnow()
-        save_branch(branch)
-        raise
+    return format_parent(branch, cfg)
 
 
 TOOLS = [
-    {"name": "branch_solve", "description": "Solve a self-contained side problem in a NEW isolated Jan-model context. ONLY a short verified outcome returns to this conversation. Use it when navigation, planning or lengthy reasoning would otherwise clutter the main context. It has no access to the parent's browser or other MCP tools. Never pass passwords, tokens, or secrets.",
+    {"name": "branch_solve", "description": "Solve a self-contained side problem in a NEW isolated Jan-model context. A short model-reported outcome and shared run usage return to this conversation. It has no access to the parent's browser or other MCP tools. Never pass passwords, tokens, or secrets.",
      "inputSchema": {"type":"object", "properties": {"task": {"type":"string", "description":"Precise side problem to solve"}, "relevant_context": {"type":"string", "description":"Only essential facts needed from main work"}, "parent_id": {"type":"string", "description":"Optional parent branch ID for nesting"}}, "required": ["task"]}},
     {"name": "branch_resume", "description": "Continue an earlier side branch using its saved result (and full transcript only if enabled). Main conversation remains unchanged.",
      "inputSchema": {"type":"object", "properties": {"branch_id": {"type":"string"}, "question": {"type":"string"}}, "required": ["branch_id", "question"]}},
@@ -460,9 +716,14 @@ def dispatch_tool(name, args):
                 continue
         return {"branches": found}
     if name == "branch_health":
-        model = chosen_model(cfg)
+        ids = available_models(cfg)
+        model = ids[0] if cfg["model"] == "auto" else cfg["model"]
+        if model not in ids:
+            raise RuntimeError("The configured model is not advertised by Jan's local API")
         return {"ok": True, "api": cfg["api_base_url"], "model": model,
-                "transcripts_saved": cfg["save_transcripts"], "read_only_project_root": cfg["read_only_project_root"] or "disabled"}
+                "check": "models_endpoint_reachable_and_model_advertised; generation_not_tested",
+                "transcripts_saved": cfg["save_transcripts"], "read_only_project_root": cfg["read_only_project_root"] or "disabled",
+                "context_limit_tokens": cfg["context_limit_tokens"]}
     raise ValueError("Unknown tool: " + str(name))
 
 
@@ -480,7 +741,7 @@ def handle_rpc(request):
         requested = (request.get("params") or {}).get("protocolVersion", PROTOCOL)
         return {"jsonrpc": "2.0", "id": rid,
                 "result": {"protocolVersion": requested, "capabilities": {"tools": {"listChanged": False}},
-                           "serverInfo": {"name": "jan-branch-context", "version": "0.1.0"},
+                           "serverInfo": {"name": "jan-branch-context", "version": "1.5.0"},
                            "instructions": "Use branch_solve for isolated side tasks; only short results return. No browser/tools inherited. Do not pass secrets."}}
     if method == "ping":
         return {"jsonrpc": "2.0", "id": rid, "result": {}}
@@ -529,3 +790,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

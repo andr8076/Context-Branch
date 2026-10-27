@@ -1,3 +1,17 @@
+# v1.5 — Jan runtime reliability
+
+Completed in the MCP runner: whole-request budget checks, persistent shared tree
+limits, safe transcript/resume handling, read-result deduplication, paged project
+reads, bounded no-action recovery, real model-list health checks and explicit
+model-reported handoffs. See [RUNTIME.md](RUNTIME.md) for settings and validation.
+
+Next: validate the runtime against the local Jan model; measure context isolation
+against a matched single-conversation stage plan across repeated live runs; then
+evaluate model-chosen branch decisions. The repair benchmark still selects its
+own dependency tree. Earlier milestone notes below describe their release scope.
+
+---
+
 # v1.4.4 — pressure-aware recursive checkpoints and failure snapshots
 
 Recursive repair stages can now **restart their private conversation before exhausting its context window**. The controller estimates upcoming prompt size, using actual API prompt-token counts when available. At the configured pressure threshold it rebuilds that stage's message list from:
@@ -85,7 +99,7 @@ experiments so improvements in one cannot disguise regressions in another.
 - Benchmark decisions against both always-linear and controlled recursion.
   Measure unnecessary branches and missed opportunities, not just successes.
 
-## 3. Investigation responses with no usable action — next (diagnostics added)
+## 3. Investigation responses with no usable action — bounded recovery implemented
 
 - Log `no_action_investigation_calls` (no parseable simulator JSON action)
   and `empty_investigation_replies` (empty visible content) independently
@@ -93,8 +107,9 @@ experiments so improvements in one cannot disguise regressions in another.
 - Determine whether the generation budget was consumed by hidden reasoning,
   output truncation, malformed JSON or genuine indecision before selecting a
   fallback.
-- Consider one bounded *same-context* retry with a concise JSON-action reminder,
-  charging the retry for inference tokens/time/actions; never invent an action.
+- Both the repair benchmark and Jan MCP runner now use bounded same-context
+  recovery. Every retry counts toward inference tokens/time; the MCP runner also
+  charges the shared model-call budget. Neither controller invents an action.
 - Keep the primary benchmark unbiased: do not silently enable this recovery
   for only one strategy or infer model success from simulated action text.
 
@@ -105,3 +120,4 @@ across modes. Track tokens over **all** parents and children. Use a fresh
 llama-server for each trial when possible; never kill unrelated servers. A
 deterministic simulator can verify a repair, but only actual model responses
 establish final-report correctness. The three goals above are not interchangeable.
+
