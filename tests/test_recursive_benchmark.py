@@ -343,7 +343,7 @@ class RecursiveContextTests(unittest.TestCase):
                     '_stage_start_output_tokens': 256})
         fake = RecursiveFakeJan()
         with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fake):
-            trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 8192,
+            trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 4096,
                                       Path(tmp), bm, nested_depth=2,
                                       recovery_log_lines=8, nested_log_lines=8)
         self.assertEqual(trial['verified_cases'], 1, trial['error'])
