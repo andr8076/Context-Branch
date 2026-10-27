@@ -93,6 +93,26 @@ If your build rejects the per-request reasoning setting, add `--report-reasoning
 
 The additional `compiled_report` field is assembled by the benchmark after verifying repairs in its simulator. It is **not** scored as a successful *model* final report; it simply lets you see whether repair work was completed even when the AI's JSON failed.
 
+## Periodic summary controls (v1.3)
+
+When comparing all three context methods, summarization is performed only
+after the configured number of completed repairs (default two) and not after
+the final repair. A three-repair run exercises it:
+
+```bash
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --tasks 3 --repeats 1 \
+  --nested-depth 0 --pressure-records 0 --recovery-log-lines 8 \
+  --context-limit 16384 --summary-output-tokens 2048 --summary-retries 1
+```
+
+The summary generation cap is distinct from both the investigation cap
+(default 1024) and the retained summary memory budget (1800 characters).
+Summary calls use the reporting no-reasoning hint when enabled; the GPU and
+model decide whether that hint is honored. A summary that remains empty or
+cut off after its retry fails explicitly; it is never filled from the
+benchmark answer key. All calls are measured and recorded.
+
 ## 5. Longer run (three competitors)
 
 ```bash
