@@ -662,7 +662,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                            "seal": seal, "caveats": "" if sim.verified else "No verified repair"}
                 messages.append({"role": "user", "content": "Isolated repair finished. Keep only this verified outcome: "
                                  + json.dumps(compact) + "\nReply ONLY READY."})
-                ack = bm.call_parent(cfg, model, messages)
+                ack = bm.call_parent(cfg, model, messages, reporting=True)
                 messages.append({"role": "assistant", "content": ack})
             if (mode == "summarized" and result["solved_subtasks"] % summary_every == 0
                     and result["solved_subtasks"] < tasks):
@@ -673,15 +673,21 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 result["summaries_generated"] += 1
                 result["summary_chars_peak"] = max(result["summary_chars_peak"], len(summary))
                 result["summaries"].append({"after_batch": name, "chars": len(summary), "text": summary})
+        # This artifact is assembled by the benchmark from the simulator's VERIFIED
+        # outcomes, never from its hidden expected-repair oracle. It is diagnostic
+        # only and NEVER upgrades a failed model-generated final report.
+        compiled = {"mission_id": puzzle["mission"], "control_code": puzzle["control"],
+                    "seals": {name: result["reported_answers"].get(name, "") for name in expected}}
+        result["compiled_report"] = compiled
+        result["compiled_verified_cases"] = sum(bool(value) for value in compiled["seals"].values())
+        result["compiled_report_complete"] = result["compiled_verified_cases"] == tasks
         stage = "final_report"
-        trace.phase = "parent_final"
         messages.append({"role": "user", "content": (
             "FINAL REPORT. From VERIFIED repairs only, output ONLY complete JSON "
             "with keys mission_id, control_code and seals mapping every batch_N to its "
             "verification seal (empty string if not verified). Preserve the original IDs.")})
-        final = bm.call_parent(cfg, model, messages)
-        result.update(bm.score_final_report(final, expected, puzzle["mission"], puzzle["control"], trace.calls[-1]))
-        result["raw_final_excerpt"] = final[:1500]
+        result.update(bm.model_final_report(cfg, model, messages, trace, expected,
+                                            puzzle["mission"], puzzle["control"]))
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
         result["error_type"] = ("summary_failed" if stage.startswith("summary:") and isinstance(exc, ValueError)
