@@ -335,6 +335,107 @@ class RecursiveContextTests(unittest.TestCase):
         self.assertEqual(trial['stage_start_calls'], 8)
         self.assertEqual(trial['invalid_actions'], 0)
 
+    def test_context_checkpoint_retains_real_observations_and_completes(self):
+        cfg = self.cfg()
+        cfg.update({'_recursive_checkpoint_threshold': 0.50,
+                    '_recursive_checkpoint_max': 8,
+                    '_stage_start_inspects': 2,
+                    '_stage_start_output_tokens': 256})
+        fake = RecursiveFakeJan()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fake):
+            trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertTrue(trial['exact_final'], trial['error'])
+        self.assertGreater(trial['recursive_checkpoints'], 0, trial['recursive_events'])
+        self.assertEqual(trial['recursive_checkpoint_blocked'], 0)
+        cases = trial['recursive_events'][0]['stages']
+        self.assertEqual(sum(e['context_checkpoints'] for e in cases), trial['recursive_checkpoints'])
+        self.assertTrue(any(e['checkpoint_details'] for e in cases))
+        self.assertTrue(all('after_est_tokens' in x for e in cases for x in e['checkpoint_details']))
+        # The parent must never receive child shard transcripts after checkpoints.
+        parent_messages = [msgs for msgs in fake.messages_seen
+                           if 'RECURSIVE STAGE=repair' in msgs[0]['content']]
+        self.assertTrue(parent_messages)
+        joined = json.dumps(parent_messages)
+        self.assertNotIn('RECOVERY SHARD A:', joined)
+        self.assertNotIn('INDEX SHARD A:', joined)
+
+    def test_failed_recursive_inference_keeps_partial_stage_history(self):
+        cfg = self.cfg()
+        fake = RecursiveFakeJan()
+        interrupted = [False]
+        def fail_in_repair(method, url, conf, payload=None):
+            if payload and 'RECURSIVE STAGE=repair' in payload['messages'][0]['content']:
+                interrupted[0] = True
+                raise RuntimeError('request exceeds context capacity')
+            return fake(method, url, conf, payload)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fail_in_repair):
+            trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertTrue(interrupted[0])
+        self.assertEqual(trial['error_type'], 'context_overflow_confirmed')
+        self.assertTrue(trial['partial_failure'])
+        self.assertEqual(trial['interrupted_batch'], 'batch_1')
+        self.assertGreater(trial['total_actions'], 0)
+        self.assertEqual(trial['total_actions'], trial['case_breakdown'][0]['actions'])
+        self.assertEqual(len(trial['case_breakdown'][0]['events']), trial['total_actions'])
+        self.assertEqual(trial['recursive_stage_successes'], 3)
+        self.assertEqual(trial['recursive_context_count'], 4)
+        self.assertEqual(trial['recursive_stage_failures'], 1)
+        self.assertEqual(trial['nested_index_completed'], 1)
+        self.assertEqual(trial['nested_escrow_completed'], 1)
+        self.assertEqual(trial['recovery_completed'], 1)
+        self.assertEqual(trial['verified_cases'], 0)
+        self.assertFalse(trial['exact_final'])
+        self.assertEqual(trial['final_status'], 'not_attempted')
+
+    def test_failed_ordinary_branch_preserves_nonzero_actions(self):
+        fake = RecursiveFakeJan()
+        calls = [0]
+        def fail_after_inspection(method, url, conf, payload=None):
+            if payload and any('SIMULATED REPAIR INCIDENT' in m.get('content','')
+                               for m in payload['messages']):
+                calls[0] += 1
+                if calls[0] == 4:
+                    raise RuntimeError('request exceeds context capacity')
+            return fake(method, url, conf, payload)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fail_after_inspection):
+            trial = tb.run_trap_trial('branch', 17, 1, self.cfg(), 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=0,
+                                      recovery_log_lines=8)
+        self.assertEqual(trial['error_type'], 'context_overflow_confirmed')
+        self.assertTrue(trial['partial_failure'])
+        self.assertEqual(trial['total_actions'], 3, trial['case_breakdown'])
+        self.assertEqual(len(trial['case_breakdown'][0]['events']), 3)
+        self.assertEqual(trial['recursive_checkpoints'], 0)
+
+    def test_checkpoint_opt_out_has_no_context_rebuilds(self):
+        cfg = self.cfg()
+        cfg['_recursive_checkpoint_threshold'] = 0
+        cfg['_recursive_checkpoint_max'] = 8
+        fake = RecursiveFakeJan()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fake):
+            trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertEqual(trial['recursive_checkpoints'], 0)
+
+    def test_checkpoint_threshold_argument_validation(self):
+        args = bm.arguments(['--scenario','repair','--recursive-checkpoint-threshold','0.76',
+                             '--recursive-checkpoint-max','5'])
+        self.assertEqual(args.recursive_checkpoint_threshold, 0.76)
+        self.assertEqual(args.recursive_checkpoint_max, 5)
+        self.assertEqual(bm.arguments(['--recursive-checkpoint-threshold','0']).recursive_checkpoint_threshold, 0)
+        for bad_args in (['--recursive-checkpoint-threshold','0.25'],
+                         ['--recursive-checkpoint-threshold','0.98'],
+                         ['--recursive-checkpoint-max','99']):
+            with self.assertRaises(SystemExit):
+                bm.arguments(bad_args)
+
     def test_cli_opt_in_and_archive_rejected(self):
         args=bm.arguments(['--scenario','repair','--tasks','1','--repeats','1',
                           '--modes','linear','summarized','branch','recursive'])
