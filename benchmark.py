@@ -585,11 +585,11 @@ def arguments(argv=None):
     parser.add_argument("--repeats", type=int, default=2, help="Different seeds per task level (default 2)")
     parser.add_argument("--seed", type=int, default=20261026)
     parser.add_argument("--context-limit", type=int, default=8192, help="Context in tokens: passed to llama-server; for Jan used for reporting only")
-    parser.add_argument("--max-output-tokens", type=int, default=1024, help="Investigation/summary output cap (default 1024; equal for all modes)")
+    parser.add_argument("--max-output-tokens", type=int, default=1024, help="Investigation output cap (default 1024; equal for all modes)")
     parser.add_argument("--final-output-tokens", type=int, default=2048, help="Output cap for final reporting ONLY (default 2048)")
     parser.add_argument("--final-retries", type=int, default=1, help="Retries for truncated or empty final report (default 1; retries counted in time/tokens)")
     parser.add_argument("--report-reasoning", choices=("auto", "none"), default="none",
-                        help="Request no thinking on ACK/final reports with standalone llama.cpp (default none); investigation reasoning stays enabled")
+                        help="Request no thinking on ACK, summary and final-report calls with llama.cpp (default none); investigation reasoning stays enabled")
     parser.add_argument("--summary-output-tokens", type=int, default=2048,
                         help="Output cap only for periodic summaries (default 2048)")
     parser.add_argument("--summary-retries", type=int, default=1,
