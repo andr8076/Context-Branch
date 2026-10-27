@@ -165,7 +165,23 @@ class Trace:
         total_prompt = sum((r["prompt_tokens"] if r["prompt_tokens"] is not None else r["prompt_est_tokens"]) for r in self.calls)
         total_completion = sum((r["completion_tokens"] if r["completion_tokens"] is not None else (r["completion_est_tokens"] or 0)) for r in self.calls)
         actual_usage = len(self.calls) > 0 and all(r["prompt_tokens"] is not None and r["completion_tokens"] is not None for r in self.calls)
+        action_retry_rows = [r for r in self.calls if r["phase"].endswith("_retry") and
+                             (r["phase"].startswith("branch_recursive_") or
+                              r["phase"] in ("branch_investigate_retry", "parent_investigate_retry"))]
+        action_retry_prompt = sum(
+            r["prompt_tokens"] if r["prompt_tokens"] is not None else r["prompt_est_tokens"]
+            for r in action_retry_rows)
+        action_retry_completion = sum(
+            r["completion_tokens"] if r["completion_tokens"] is not None else (r["completion_est_tokens"] or 0)
+            for r in action_retry_rows)
         return {
+            "no_action_retry_inference_seconds": round(sum(r["elapsed_seconds"] or 0 for r in action_retry_rows), 3),
+            "no_action_retry_prompt_tokens": action_retry_prompt,
+            "no_action_retry_completion_tokens": action_retry_completion,
+            "no_action_retry_total_tokens": action_retry_prompt + action_retry_completion,
+            "no_action_retry_token_counts_exact_from_api": all(
+                r["prompt_tokens"] is not None and r["completion_tokens"] is not None for r in action_retry_rows),
+            "no_action_retry_empty_visible_calls": sum(r["empty_visible_output"] is True for r in action_retry_rows),
             "peak_main_prompt_tokens": peak_main, "peak_branch_prompt_tokens": peak_branch,
             "total_prompt_tokens": total_prompt, "total_completion_tokens": total_completion,
             "total_processed_tokens": total_prompt + total_completion,
@@ -356,7 +372,8 @@ def classify_exception(exc):
     return 'api_or_runtime_error'
 
 
-def call_parent(cfg, model, messages, *, reporting=False, final=False, summary=False):
+def call_parent(cfg, model, messages, *, reporting=False, final=False, summary=False,
+                no_action_retry=False):
     # Preserve investigative reasoning. ACK, final report and compaction are
     # lightweight reporting tasks, so they may request no hidden reasoning.
     # This is best-effort: older inference servers may ignore the hint.
@@ -367,7 +384,13 @@ def call_parent(cfg, model, messages, *, reporting=False, final=False, summary=F
     elif summary and cfg.get("_summary_output_tokens") is not None:
         request_cfg = dict(cfg)
         request_cfg["max_output_tokens"] = cfg["_summary_output_tokens"]
-    effort = cfg.get("_report_reasoning_effort") if reporting or summary else None
+    elif no_action_retry and cfg.get("_no_action_retry_output_tokens") is not None:
+        request_cfg = dict(cfg)
+        request_cfg["max_output_tokens"] = cfg["_no_action_retry_output_tokens"]
+    # The first investigation request keeps its normal reasoning allowance.
+    # Only a *failed* JSON-action generation switches to lightweight recovery.
+    effort = (cfg.get("_no_action_retry_reasoning_effort") if no_action_retry
+              else cfg.get("_report_reasoning_effort") if reporting or summary else None)
     result = bc.chat(request_cfg, model, messages, reasoning_effort=effort)
     content = result.get("content") or ""
     if isinstance(content, list):
@@ -609,6 +632,10 @@ def arguments(argv=None):
                         help="Competitors to run; add recursive for controlled nested branching (repair only)")
     parser.add_argument("--no-action-retries", type=int, default=1,
                         help="Retry invalid/empty investigation JSON action before spending a simulator action (0-2; default 1)")
+    parser.add_argument("--no-action-retry-output-tokens", type=int, default=256,
+                        help="Generation cap on each no-action recovery request (64-4096; default 256)")
+    parser.add_argument("--no-action-retry-reasoning", choices=("auto", "none"), default="none",
+                        help="Request no thinking on recovery retries only with llama.cpp (default none; auto skips hint)")
     parser.add_argument("--recursive-max-depth", type=int, default=3,
                         help="Maximum child levels in controlled recursive mode (0-3, default 3)")
     parser.add_argument("--tasks", type=int, nargs="+", default=None, help="Archive: 3 6 8; repair: 1 2 4 by default")
@@ -696,6 +723,8 @@ def arguments(argv=None):
         parser.error("--modes recursive is supported only for --scenario repair")
     if not 0 <= args.no_action_retries <= 2:
         parser.error("--no-action-retries must be 0-2")
+    if not 64 <= args.no_action_retry_output_tokens <= 4096:
+        parser.error("--no-action-retry-output-tokens must be 64-4096")
     if not 0 <= args.recursive_max_depth <= 3:
         parser.error("--recursive-max-depth must be 0-3")
     if args.records < 2 or args.repeats < 1 or not args.tasks or any(n < 1 for n in args.tasks):
@@ -736,6 +765,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "max_actions": args.max_actions if args.scenario == "repair" else None,
                   "modes": args.modes, "recursive_max_depth": args.recursive_max_depth,
                   "no_action_retries": args.no_action_retries,
+                  "no_action_retry_output_tokens": args.no_action_retry_output_tokens,
+                  "no_action_retry_reasoning": args.no_action_retry_reasoning if args.engine == "llama" else "auto",
                   "summary_every": args.summary_every, "summary_max_chars": args.summary_max_chars,
                   "summary_output_tokens": args.summary_output_tokens,
                   "summary_retries": args.summary_retries,
@@ -762,6 +793,9 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "total_actions", "verified_cases", "invalid_actions", "wrong_repairs",
         "no_action_investigation_calls", "empty_investigation_replies",
         "no_action_retry_attempts", "no_action_retry_recoveries", "no_action_retry_failures", "out_of_scope_actions",
+        "no_action_retry_inference_seconds", "no_action_retry_prompt_tokens",
+        "no_action_retry_completion_tokens", "no_action_retry_total_tokens",
+        "no_action_retry_token_counts_exact_from_api", "no_action_retry_empty_visible_calls",
         "recursive_branch_count", "recursive_context_count", "recursive_max_depth", "recursive_stage_successes", "recursive_stage_failures",
         "decoy_documents_opened", "trap_waste_chars",
         "recovery_log_lines", "recovery_completed", "recovery_attempts",
@@ -1072,6 +1106,9 @@ def main(argv=None):
             return 2
     cfg["_recursive_max_depth"] = args.recursive_max_depth
     cfg["_no_action_retries"] = args.no_action_retries
+    cfg["_no_action_retry_output_tokens"] = args.no_action_retry_output_tokens
+    cfg["_no_action_retry_reasoning_effort"] = (
+        "none" if args.engine == "llama" and args.no_action_retry_reasoning == "none" else None)
     cfg["_final_output_tokens"] = args.final_output_tokens
     cfg["_final_retries"] = args.final_retries
     cfg["_summary_output_tokens"] = args.summary_output_tokens
