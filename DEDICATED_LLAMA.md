@@ -43,6 +43,32 @@ python3 benchmark.py --engine llama --llama-model "$MODEL" --check-llama-server
 python3 benchmark.py --engine llama --llama-model "$MODEL" --scenario repair --smoke --context-limit 8192
 ```
 
+## If a repair returns HTTP 400 near the context limit
+
+The dedicated server may reject a chat request once the **input history plus
+reserved output** no longer fits within `--context-limit`. A repair with default
+nested depth 2 and pressure records 4 can overwhelm an 8K context **even in
+branch mode**, because branches are isolated *per repair*, not per nested step.
+This is not a failure to start llama-server, and it does not imply Jan API auth.
+
+Start with a deliberately lighter 8K baseline to verify inference/actions:
+
+```bash
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --smoke --context-limit 8192 \
+  --nested-depth 0 --pressure-records 0 \
+  --recovery-log-lines 8 --max-actions 20
+```
+
+For the **full nested-depth-2 test**, use a larger server context if your GPU
+has enough available memory (for example, start with 16384, then 32768 if
+necessary), or lower the evidence pressure. Larger contexts consume more memory.
+
+`--dry-run` prints a rough warning when mandatory evidence plus output reserve
+approaches the context budget. On HTTP errors, the benchmark now provides a
+sanitized cause if llama.cpp explicitly reports context overflow. For other
+HTTP 400 errors, consult the actual response in the `server_logs/` directory.
+
 ## 5. Longer run (three competitors)
 
 ```bash
