@@ -403,9 +403,10 @@ def agent_tools(cfg, depth):
 def format_parent(branch, cfg):
     result = branch.get("outcome") or {}
     usage = branch.get("usage", {})
-    if branch.get("root_id") and budget_path(branch["root_id"]).exists():
-        ledger = json.loads(budget_path(branch["root_id"]).read_text(encoding="utf-8"))
-        usage = RunBudget(branch["root_id"], cfg, ledger).public()
+    root_id = branch.get("root_id") or root_branch(branch)["id"]
+    if budget_path(root_id).exists():
+        ledger = json.loads(budget_path(root_id).read_text(encoding="utf-8"))
+        usage = RunBudget(root_id, cfg, ledger).public()
     return {"branch_id": branch["id"], "parent_id": branch.get("parent_id"),
             "status": branch["status"], "result": clip(result.get("result", ""), cfg["max_parent_result_chars"]),
             "what_changed": clip(result.get("what_changed", "Nothing"), 350),

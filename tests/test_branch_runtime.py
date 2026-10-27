@@ -280,6 +280,24 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertGreater(b.load_branch(result["branch_id"])["runtime"]["repaired_transcript_fragments"], 0)
 
+    def test_legacy_parent_reports_shared_usage_after_child_starts_first_post_upgrade_ledger(self):
+        self.cfg["max_branch_depth"] = 2
+        with patch.object(b, "chat", return_value=final()):
+            parent = b.run_branch(self.cfg, "Legacy parent")
+            record = b.load_branch(parent["branch_id"])
+            record.pop("root_id")
+            record.pop("usage")
+            b.save_branch(record)
+            b.budget_path(parent["branch_id"]).unlink()
+            child = b.run_branch(self.cfg, "New child", parent_id=parent["branch_id"])
+        refreshed = b.format_parent(b.load_branch(parent["branch_id"]), self.cfg)
+        self.assertEqual(refreshed["usage"]["root_id"], parent["branch_id"])
+        self.assertEqual(refreshed["usage"]["model_calls"], 1)
+        self.assertEqual(refreshed["usage"]["branches"], 2)
+        self.assertTrue(refreshed["usage"]["pre_upgrade_usage_unknown"])
+        self.assertFalse(refreshed["usage"]["token_counts_exact_from_api"])
+        self.assertEqual(child["usage"]["root_id"], parent["branch_id"])
+
     def test_health_with_explicit_model_checks_api_and_rejects_missing_model(self):
         with patch.object(b, "config", return_value=self.cfg):
             with patch.object(b, "http_json", side_effect=RuntimeError("Offline")) as api:
