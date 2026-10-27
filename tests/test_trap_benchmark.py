@@ -440,6 +440,48 @@ class TrapBenchmarkTests(unittest.TestCase):
             self.assertEqual(sim.wrong_repairs, 0)
             self.assertEqual(sim.trap_chars, 0)
 
+    def test_authoritative_evidence_always_required_even_without_pressure(self):
+        """A correct repair proposal is not evidence of a valid investigation."""
+        mandatory = ("registry/releases", "registry/approvals", "network/aliases",
+                     "network/routes", "security/certificates")
+        for records in (0, 1, 4):
+            case = tb.create_trap_puzzle(121, 1, recovery_log_lines=4,
+                                         pressure_records=records)["cases"][0]
+            sim = tb.RepairSimulator(case)
+            for path in ("recovery/shard-a", "recovery/shard-b"):
+                sim.step({"action": "inspect", "path": path})
+            self.assertIn("RECOVERY COMPLETE", sim.step(
+                {"action": "recover", "token": case["recovery_token"]}))
+            self.assertIn("EVIDENCE CHECK", case["docs"]["guide/policy"])
+            for count, path in enumerate(mandatory):
+                self.assertIn("REPAIR BLOCKED", sim.step({
+                    "action": "repair", **case["expected_repair"]}))
+                self.assertEqual(len(sim.authority_views), count)
+                self.assertFalse(sim.applied)
+                sim.step({"action": "inspect", "path": path})
+            self.assertEqual(sim.authority_views, set(mandatory))
+            self.assertIn("APPLIED", sim.step({
+                "action": "repair", **case["expected_repair"]}))
+            self.assertIn("VERIFIED", sim.step({"action": "verify"}))
+            self.assertEqual(sim.authority_blocked, len(mandatory))
+            self.assertTrue(sim.verified)
+
+    def test_policy_does_not_allow_correct_guess_after_only_four_documents(self):
+        case = tb.create_trap_puzzle(170, 1, pressure_records=0)["cases"][0]
+        sim = tb.RepairSimulator(case)
+        for path in ("recovery/shard-a", "recovery/shard-b"):
+            sim.step({"action": "inspect", "path": path})
+        sim.step({"action": "recover", "token": case["recovery_token"]})
+        for path in ("registry/releases", "registry/approvals", "network/aliases",
+                     "network/routes"):
+            sim.step({"action": "inspect", "path": path})
+        self.assertEqual(len(sim.authority_views), 4)
+        result = sim.step({"action": "repair", **case["expected_repair"]})
+        self.assertIn("REPAIR BLOCKED", result)
+        self.assertFalse(sim.applied)
+        self.assertEqual(sim.wrong_repairs, 0)
+        self.assertEqual(sim.authority_blocked, 1)
+
     def test_shards_have_current_and_misleading_records(self):
         for seed in range(15):
             case = tb.create_trap_puzzle(seed, 1, recovery_log_lines=30)["cases"][0]
