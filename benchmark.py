@@ -10,6 +10,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -26,6 +27,29 @@ import llama_runner
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "data" / "benchmarks"
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+def resolve_llama_model_path(cli_model=None, project_root=None):
+    """Find the GGUF path without storing machine-specific paths in Git.
+
+    Priority: explicit --llama-model > CONTEXT_BRANCH_MODEL environment
+    variable > ignored local_model.json MODEL_PATH. Jan does not use this.
+    """
+    if cli_model is not None:
+        return cli_model
+    env_model = os.environ.get("CONTEXT_BRANCH_MODEL", "").strip()
+    if env_model:
+        return env_model
+    settings = Path(project_root or ROOT) / "local_model.json"
+    if not settings.is_file():
+        return None
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read {settings.name}: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("MODEL_PATH"), str):
+        raise ValueError('local_model.json must contain a string "MODEL_PATH" value')
+    return data["MODEL_PATH"].strip() or None
+
 
 
 def code(rng, n=8):
@@ -572,7 +596,7 @@ def arguments(argv=None):
     parser = argparse.ArgumentParser(description="Benchmark linear, summarized and branching context on Jan or a dedicated llama.cpp server")
     parser.add_argument("--engine", choices=("jan", "llama"), default="jan", help="Use Jan (legacy) or an independently managed llama.cpp server. For fresh server each trial use --engine llama")
     parser.add_argument("--llama-server", default="llama-server", help="Executable for standalone llama-server (system PATH or absolute path)")
-    parser.add_argument("--llama-model", default=None, help="Absolute path to local .gguf file (required for --engine llama)")
+    parser.add_argument("--llama-model", default=None, help="Override local_model.json MODEL_PATH or CONTEXT_BRANCH_MODEL with a GGUF file path")
     parser.add_argument("--llama-port", type=int, default=18089, help="Dedicated loopback port, default 18089; refuses to overwrite an existing listener")
     parser.add_argument("--llama-gpu-layers", type=int, default=99, help="GPU layers to offload (default 99; use 0 for CPU-only)")
     parser.add_argument("--llama-startup-timeout", type=float, default=180, help="Seconds to wait for local server readiness")
@@ -656,6 +680,11 @@ def arguments(argv=None):
         parser.error("Jan router reset flags are not applicable to --engine llama (each llama trial is fresh by default)")
     if args.engine == "jan" and (args.reuse_llama or args.check_llama_server or args.llama_model or args.llama_arg):
         parser.error("llama options require --engine llama")
+    if args.engine == "llama":
+        try:
+            args.llama_model = resolve_llama_model_path(args.llama_model)
+        except ValueError as exc:
+            parser.error(f"Invalid local model configuration: {exc}")
     if args.jan_router_url:
         try:
             args.jan_router_url = jan_reset.validate_router_url(args.jan_router_url)
@@ -1007,7 +1036,8 @@ def main(argv=None):
     managed_server = None
     if args.engine == "llama":
         if not args.llama_model:
-            print("Missing --llama-model: supply the full path to your Qwen GGUF file.", file=sys.stderr)
+            print("Missing GGUF model path: set MODEL_PATH in local_model.json (copy local_model.example.json), "
+                  "export CONTEXT_BRANCH_MODEL, or specify --llama-model /path/to/model.gguf.", file=sys.stderr)
             return 2
         managed_server = llama_runner.LocalLlamaServer(
             args.llama_server, args.llama_model, args.llama_port, args.context_limit,
