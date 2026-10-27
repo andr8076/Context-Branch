@@ -527,8 +527,8 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual([c["phase"] for c in calls], ["parent_summary", "parent_summary_retry"])
         self.assertEqual([c["requested_max_tokens"] for c in calls], [2048, 2048])
         self.assertTrue(all(c["requested_reasoning_effort"] == "none" for c in calls))
-        investigations = [x for x in seen if "INDEPENDENT ARCHIVE LOOKUP" in
-                          x["messages"][-1]["content"]]
+        investigations = [x for x in seen if any(
+            "INDEPENDENT ARCHIVE LOOKUP" in m["content"] for m in x["messages"])]
         self.assertTrue(investigations)
         self.assertTrue(all(x.get("reasoning_effort") is None for x in investigations))
         self.assertTrue(all(x["max_tokens"] == 1024 for x in investigations))
