@@ -1,3 +1,25 @@
+# v1.4.3 — low-overhead recursive stage starts
+
+New recursive contexts now begin with a **limited, non-thinking inspection phase**: the model itself selects the first two *in-scope* document inspections, each with a 256-token output cap and a best-effort `reasoning_effort=none` hint on llama.cpp. This avoids spending the full 1,024-token investigation allowance on trivial guide/initial-evidence reads.
+
+After two successful inspections, or immediately when the model chooses a non-inspection/invalid/out-of-scope action, the stage returns to **normal full-reasoning inference**. It never skips simulator actions, invents document contents, shares child histories, or changes the shared action budget. Unusable stage-start responses still use v1.4.2's bounded no-action retry path.
+
+CLI settings: `--stage-start-inspects 2` (default; `0` disables), `--stage-start-output-tokens 256`, and `--stage-start-reasoning none` (use `auto` to omit the hint). This optimization only applies to `recursive` repair mode. Results include `stage_start_calls`, `stage_start_inference_seconds`, `stage_start_total_tokens`, `stage_start_empty_visible_calls` and per-stage `stage_start_inspections`.
+
+To run the same scenario with and without the optimization, use the following command twice, changing just `--stage-start-inspects 2` to `0` for the control:
+
+```bash
+python3 benchmark.py --engine llama --scenario repair \
+  --modes recursive --tasks 1 --repeats 1 --seed 20261026 \
+  --context-limit 8192 --nested-depth 2 --nested-log-lines 8 \
+  --recovery-log-lines 8 --pressure-records 0 --max-actions 32 \
+  --no-action-retries 1 --stage-start-inspects 2
+```
+
+Results from scripted agents or GitHub Actions validate plumbing, **not** live Qwen performance. Compare verified repairs, context, tokens, *and wall-clock time* across several seeds before evaluating effectiveness.
+
+---
+
 # One-time model path configuration
 
 Set the GGUF model path **once** on this computer, instead of passing `--llama-model "$MODEL"` with every benchmark:
