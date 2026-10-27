@@ -529,7 +529,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
     in parent. This exercises branch isolation, not autonomous branch selection or
     the installed MCP branch_solve tool's capabilities.
     """
-    if mode not in ("linear", "summarized", "branch"):
+    if mode not in ("linear", "summarized", "branch", "recursive"):
         raise ValueError(f"Unknown mode {mode}")
     if max_actions < 2:
         raise ValueError("max_actions must be >= 2")
@@ -558,6 +558,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "summaries_generated": 0, "summary_chars_peak": 0, "summaries": [],
         "trap_density": trap_density, "trap_log_lines": trap_log_lines,
         "recovery_log_lines": recovery_log_lines, "max_actions": max_actions,
+        "recursive_branch_count": 0, "recursive_max_depth": 0, "recursive_stage_successes": 0,
+        "recursive_stage_failures": 0, "recursive_events": [],
         "nested_depth": nested_depth, "nested_log_lines": nested_log_lines,
         "pressure_records": pressure_records, "pressure_detail_chars": pressure_detail_chars,
         "pressure_generated_chars": sum(sum(c["pressure_deltas"].values()) for c in puzzle["cases"]),
@@ -583,7 +585,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
             name = case["name"]
             stage = f"investigate:{name}"
             sim = RepairSimulator(case)
-            if mode == "branch":
+            if mode in ("branch", "recursive"):
                 # Isolated case history starts here; parent never sees its logs.
                 incident_msgs = [{"role": "system", "content": ACTION_SYSTEM},
                                  {"role": "user", "content": case["intro"]}]
@@ -592,7 +594,18 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 # Same policy for parent and branches, but the parent keeps its previous cases.
                 messages.append({"role": "user", "content": "INCIDENT ACTION PROTOCOL: " + ACTION_SYSTEM})
                 incident_msgs = messages
-            for _ in range(max_actions):
+            if mode == "recursive":
+                from recursive_benchmark import solve_recursive_case
+                success, recursive_events = solve_recursive_case(
+                    sim, case, cfg, model, trace, bm, max_actions,
+                    max_depth=cfg.get("_recursive_max_depth", 3))
+                result["recursive_events"].append({"batch": name, "stages": recursive_events})
+                result["recursive_branch_count"] += len(recursive_events)
+                result["recursive_max_depth"] = max(result["recursive_max_depth"],
+                    max((e["depth"] for e in recursive_events), default=0))
+                result["recursive_stage_successes"] += sum(e["completed"] for e in recursive_events)
+                result["recursive_stage_failures"] += sum(not e["completed"] for e in recursive_events)
+            for _ in range(0 if mode == "recursive" else max_actions):
                 trace.phase = "branch_investigate" if mode == "branch" else "parent_investigate"
                 answer = bm.call_parent(cfg, model, incident_msgs)
                 incident_msgs.append({"role": "assistant", "content": answer})
@@ -655,7 +668,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                                              "authority_blocked": sim.authority_blocked,
                                              "events": sim.history,
                                              "expected_repair_debug_only": case["expected_repair"]})
-            if mode == "branch":
+            if mode in ("branch", "recursive"):
                 # No model call gets the independent case history as part of the parent.
                 trace.phase = "parent_ack"
                 compact = {"batch": name, "status": "verified" if sim.verified else "blocked",
