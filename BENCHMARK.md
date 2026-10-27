@@ -1,3 +1,36 @@
+## v1.4 — controlled recursion and investigation diagnostics
+
+The `recursive` strategy creates independent model histories for dependency
+stages inside one repair: root repair → recovery → escrow → index. A child
+updates the same simulator as its parent. Ancestors receive only a short,
+verified completion note; shard transcripts remain isolated. All model actions
+use the **same incident budget**, including child stages. The benchmark controls
+delegation based on public dependency depth; the model does not autonomously
+choose branches. No oracle repair solutions are supplied in prompts.
+
+Use `--scenario repair --modes linear summarized branch recursive` to enable
+four competitors. The default remains the original three. Supported recursion
+depth limit: `--recursive-max-depth 0..3`. At `--nested-depth 2`, the
+full chain needs depth 3; lower limits are scored as blocked rather than
+implicitly skipping dependencies. In `archive` mode, recursive is unsupported.
+
+New per-trial fields: `recursive_branch_count` (spawned children, excluding
+root), `recursive_context_count`, `recursive_max_depth`,
+`recursive_stage_successes`, `recursive_stage_failures`, and detailed
+`recursive_events` in results.json. Existing total API tokens, peak branch
+context and elapsed time include nested calls. New no-action metrics:
+`no_action_investigation_calls` counts simulator responses where the model
+produced no parseable action; `empty_investigation_replies` counts empty visible
+text from investigation requests. No-action recovery is a **separate future
+feature**, not silently activated here.
+
+Testing: mocked-model benchmarks exercise dependency gating, branch isolation,
+shared state, action cap and a synthetic per-context overflow. A passing
+mock-model test says nothing definitive about your local Qwen model. See
+[ROADMAP.md](ROADMAP.md) for recursive, autonomous and no-action goals.
+
+---
+
 ## v1.3 summarization reliability
 
 Summarization is a model-generated inference task, not free lossless compression. It now uses a separate `--summary-output-tokens` budget (default 2048), requests `reasoning_effort=none` when the reporting policy is enabled on standalone llama.cpp, and retries once (configurable `--summary-retries`) if the generated note is empty or cut off. The original mission instructions are kept unchanged across compaction, and the model never receives correct answers from the benchmark oracle.
