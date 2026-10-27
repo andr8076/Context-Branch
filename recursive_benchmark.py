@@ -101,32 +101,31 @@ def stage_instruction(stage, depth):
 
 
 def checkpoint_context(base_context, inspected, last_change):
-    """Rebuild a private conversation from exact, previously observed simulator output.
+    """Keep verbatim observed evidence while dropping repeated conversation turns.
 
-    No oracle and no generated summary: previous observations remain verbatim.
-    Repeated document inspections are represented only once by path.
+    One document cache message minimizes role framing and repeated boilerplate.
+    Small assistant inspection records preserve which documents were actually
+    read; no new simulator actions and no hidden/oracle data are introduced.
     """
     context = [dict(m) for m in base_context]
-    context.append({'role': 'user', 'content':
-                    'CONTEXT CHECKPOINT: The following simulator responses were observed '
-                    'earlier in this SAME stage. They are not new tool calls. '
-                    'Already inspected document paths are listed verbatim below. '
-                    'Do not reread them unless needed. Continue ONLY your current stage.'})
-    for path, observation in inspected.items():
-        context.extend((
-            {'role': 'assistant', 'content': json.dumps({'action': 'inspect', 'path': path})},
-            {'role': 'user', 'content': 'PREVIOUS SIMULATOR RESULT for ' + path +
-             ':\n' + observation},
-        ))
+    for path in inspected:
+        context.append({'role': 'assistant', 'content':
+                        json.dumps({'action': 'inspect', 'path': path})})
+    if inspected:
+        cache = ['ALREADY INSPECTED DOCUMENTS (verbatim simulator observations; '
+                 'not new tool actions):']
+        for path, observation in inspected.items():
+            cache.extend(('PATH: ' + path, observation))
+        context.append({'role': 'user', 'content': '\\n'.join(cache)})
     if last_change is not None:
         action, observation = last_change
         context.extend((
             {'role': 'assistant', 'content': json.dumps(action)},
-            {'role': 'user', 'content': 'PREVIOUS SIMULATOR RESULT:\n' + observation},
+            {'role': 'user', 'content': 'LAST ACTION RESULT:\\n' + observation},
         ))
     context.append({'role': 'user', 'content':
-                    'All above evidence is from completed simulator calls; continue '
-                    'without replaying completed actions. Output one permitted JSON action.'})
+                    'Use the observed evidence above. Do not repeat completed '
+                    'inspections or child stages. Output one permitted JSON action.'})
     return context
 
 
