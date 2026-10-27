@@ -1,12 +1,12 @@
 ## v1.4.1: rerun the recursive handoff comparison
 
-\`\`\`bash
+```bash
 python3 benchmark.py --engine llama --llama-model "$MODEL" \
   --scenario repair --modes branch recursive \
   --tasks 1 --repeats 1 --context-limit 8192 \
   --nested-depth 2 --nested-log-lines 8 --recovery-log-lines 8 \
   --pressure-records 0 --max-actions 32 --no-action-retries 1
-\`\`\`
+```
 
 Recursive child tasks are restricted to their own document paths and actions. Verified child handoffs describe the unlocked simulator state, not the child transcript. Empty or invalid JSON investigation replies get one additional model call before the simulator charges an invalid action. The additional token/time overhead is always measured.
 
