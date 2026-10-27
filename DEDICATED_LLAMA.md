@@ -1,3 +1,26 @@
+# v1.4: optional recursive benchmark
+
+```bash
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --modes branch recursive \
+  --tasks 1 --repeats 1 --nested-depth 2 \
+  --nested-log-lines 8 --recovery-log-lines 8 \
+  --pressure-records 0 --context-limit 8192
+```
+
+This compares one context per repair with independent contexts for its nested
+index, escrow, recovery and final repair stages. The dedicated llama-server
+is restarted between each trial as before. Each recursive stage operates on
+a common virtual simulator but does not inherit another stage's conversation.
+This controlled approach tests the mechanism, **not** autonomous model
+branch-selection. Include `--modes linear summarized branch recursive` for a
+four-way test; use at least `--tasks 3` to exercise summarized mode.
+
+See [ROADMAP.md](ROADMAP.md) for the additional goals: autonomous branching
+and handling investigation calls that consume tokens without an action.
+
+---
+
 # Branch Context Benchmark v1.1 — fresh llama.cpp process per trial
 
 **This option does not use Jan's router and does not need an internal API key.**
