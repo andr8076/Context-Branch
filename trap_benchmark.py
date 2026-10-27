@@ -392,6 +392,15 @@ class RepairSimulator:
     authority_blocked: int = 0
     history: list = field(default_factory=list)
 
+    def reject_out_of_scope(self, stage, action, paths, actions):
+        """Reject a wrong-stage action without executing it in shared state."""
+        self.actions += 1
+        self.invalid_actions += 1
+        self.history.append({"action": action, "label": "stage_scope_rejected", "observation_chars": 0})
+        return (f"OUT OF SCOPE for stage={stage}. Prerequisite is already done. "
+                f"Only actions {', '.join(actions)} and paths {', '.join(paths)} are allowed. "
+                "Do not repeat the child investigation.")
+
     def step(self, action):
         self.actions += 1
         if action is None:
@@ -518,6 +527,32 @@ TRAP_SUMMARY_REQUEST = (
 )
 
 
+def request_investigation_action(cfg, model, context, trace, bm, *, phase, max_retries=1):
+    """Bounded retries of unusable JSON without immediately charging simulator actions.
+
+    Every inference request still counts towards tokens and elapsed time.
+    The retry prompt is ephemeral; only the chosen answer enters task history.
+    """
+    if not 0 <= max_retries <= 2:
+        raise ValueError("Invalid no-action retry count")
+    no_actions = 0
+    answer = ""
+    for attempt in range(max_retries + 1):
+        trace.phase = phase if attempt == 0 else phase + "_retry"
+        prompt = context if attempt == 0 else context + [{
+            "role": "user",
+            "content": "NO VALID ACTION was produced. Reply NOW with exactly ONE complete JSON "
+                       "action permitted in your current stage. No reasoning text or markdown."}]
+        answer = bm.call_parent(cfg, model, prompt)
+        action = parse_action(answer)
+        if action is not None:
+            return action, answer, {"no_actions": no_actions, "retries": attempt,
+                                    "recovered": int(attempt > 0), "failed": 0}
+        no_actions += 1
+    return None, answer, {"no_actions": no_actions, "retries": max_retries,
+                          "recovered": 0, "failed": 1}
+
+
 def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                    summary_every=2, summary_max_chars=1800, trap_log_lines=32,
                    trap_density=2, max_actions=32, recovery_log_lines=36,
@@ -574,6 +609,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "recovery_blocked": 0, "recovery_shard_views": 0, "forced_evidence_chars": 0,
         "total_actions": 0, "invalid_actions": 0, "wrong_repairs": 0,
         "no_action_investigation_calls": 0, "empty_investigation_replies": 0,
+        "no_action_retry_attempts": 0, "no_action_retry_recoveries": 0,
+        "no_action_retry_failures": 0, "out_of_scope_actions": 0,
         "decoy_documents_opened": 0, "trap_waste_chars": 0,
         "verified_cases": 0, "case_breakdown": [],
     }
@@ -598,9 +635,14 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 incident_msgs = messages
             if mode == "recursive":
                 from recursive_benchmark import solve_recursive_case
-                success, recursive_events = solve_recursive_case(
+                success, recursive_events, retry_stats = solve_recursive_case(
                     sim, case, cfg, model, trace, bm, max_actions,
                     max_depth=cfg.get("_recursive_max_depth", 3))
+                result["no_action_investigation_calls"] += retry_stats["no_actions"]
+                result["no_action_retry_attempts"] += retry_stats["retries"]
+                result["no_action_retry_recoveries"] += retry_stats["recoveries"]
+                result["no_action_retry_failures"] += retry_stats["retry_failures"]
+                result["out_of_scope_actions"] += sum(e["rejected_out_of_scope"] for e in recursive_events)
                 result["recursive_events"].append({"batch": name, "stages": recursive_events})
                 result["recursive_branch_count"] += sum(e["depth"] > 0 for e in recursive_events)
                 result["recursive_context_count"] += len(recursive_events)
@@ -609,10 +651,15 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 result["recursive_stage_successes"] += sum(e["completed"] for e in recursive_events)
                 result["recursive_stage_failures"] += sum(not e["completed"] for e in recursive_events)
             for _ in range(0 if mode == "recursive" else max_actions):
-                trace.phase = "branch_investigate" if mode == "branch" else "parent_investigate"
-                answer = bm.call_parent(cfg, model, incident_msgs)
+                phase = "branch_investigate" if mode == "branch" else "parent_investigate"
+                action, answer, retry_stats = request_investigation_action(
+                    cfg, model, incident_msgs, trace, bm, phase=phase,
+                    max_retries=cfg.get("_no_action_retries", 1))
+                result["no_action_investigation_calls"] += retry_stats["no_actions"]
+                result["no_action_retry_attempts"] += retry_stats["retries"]
+                result["no_action_retry_recoveries"] += retry_stats["recovered"]
+                result["no_action_retry_failures"] += retry_stats["failed"]
                 incident_msgs.append({"role": "assistant", "content": answer})
-                action = parse_action(answer)
                 observation = sim.step(action)
                 incident_msgs.append({"role": "user", "content": "SIMULATOR RESULT:\n" + observation + "\nContinue the incident; JSON action only."})
                 if sim.verified:
@@ -623,8 +670,6 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
             result["subtask_accuracy"] += int(sim.verified)
             result["verified_cases"] += int(sim.verified)
             result["total_actions"] += sim.actions
-            result["no_action_investigation_calls"] += sum(
-                e["label"] == "invalid_action" for e in sim.history)
             result["invalid_actions"] += sim.invalid_actions
             result["wrong_repairs"] += sim.wrong_repairs
             result["decoy_documents_opened"] += sim.trap_views
@@ -650,6 +695,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
             result["lookup_breakdown"].append({"batch": name, "answer": seal, "correct": sim.verified,
                                                  "status": "verified" if sim.verified else "unverified"})
             result["case_breakdown"].append({"batch": name, "verified": sim.verified,
+                                             "stage_scope_rejected": sum(
+                                                 e["label"] == "stage_scope_rejected" for e in sim.history),
                                              "actions": sim.actions, "invalid_actions": sim.invalid_actions,
                                              "wrong_repairs": sim.wrong_repairs,
                                              "trap_views": sim.trap_views, "trap_waste_chars": sim.trap_chars,
@@ -724,8 +771,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         result.update(trace.totals())
         result["empty_investigation_replies"] = sum(
             r.get("empty_visible_output") is True for r in trace.calls
-            if r.get("phase") in ("parent_investigate", "branch_investigate")
-            or r.get("phase", "").startswith("branch_recursive_"))
+            if r.get("phase", "").startswith(
+                ("parent_investigate", "branch_investigate", "branch_recursive_")))
         result["calls"] = trace.calls
         result["input_over_limit_risk"] = any(
             r["prompt_tokens"] is not None and r["prompt_tokens"] > context_limit for r in trace.calls)
