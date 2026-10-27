@@ -1,0 +1,13 @@
+{
+  "api_base_url": "http://127.0.0.1:1337/v1",
+  "api_key": "",
+  "model": "auto",
+  "request_timeout_seconds": 180,
+  "max_output_tokens": 700,
+  "max_agent_turns": 5,
+  "max_branch_depth": 2,
+  "max_parent_result_chars": 1800,
+  "max_context_chars": 5500,
+  "save_transcripts": false,
+  "read_only_project_root": ""
+}
