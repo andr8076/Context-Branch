@@ -664,6 +664,10 @@ def arguments(argv=None):
                         help="Recursive stage-start generation cap (64-4096; default 256)")
     parser.add_argument("--stage-start-reasoning", choices=("auto", "none"), default="none",
                         help="Stage-start reasoning hint for llama.cpp (none or auto; default none)")
+    parser.add_argument("--recursive-checkpoint-threshold", type=float, default=0.78,
+                        help="Recursive context pressure trigger as fraction of total context capacity (0.50-0.90; 0 disables; default 0.78)")
+    parser.add_argument("--recursive-checkpoint-max", type=int, default=4,
+                        help="Maximum evidence-preserving context checkpoints per recursive stage (0-12, default 4)")
     parser.add_argument("--recursive-max-depth", type=int, default=3,
                         help="Maximum child levels in controlled recursive mode (0-3, default 3)")
     parser.add_argument("--tasks", type=int, nargs="+", default=None, help="Archive: 3 6 8; repair: 1 2 4 by default")
@@ -757,6 +761,10 @@ def arguments(argv=None):
         parser.error("--stage-start-inspects must be 0-2")
     if not 64 <= args.stage_start_output_tokens <= 4096:
         parser.error("--stage-start-output-tokens must be 64-4096")
+    if args.recursive_checkpoint_threshold != 0 and not 0.50 <= args.recursive_checkpoint_threshold <= 0.90:
+        parser.error("--recursive-checkpoint-threshold must be 0 or between 0.50 and 0.90")
+    if not 0 <= args.recursive_checkpoint_max <= 12:
+        parser.error("--recursive-checkpoint-max must be 0-12")
     if not 0 <= args.recursive_max_depth <= 3:
         parser.error("--recursive-max-depth must be 0-3")
     if args.records < 2 or args.repeats < 1 or not args.tasks or any(n < 1 for n in args.tasks):
@@ -796,6 +804,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "mandatory_recovery": args.scenario == "repair",
                   "max_actions": args.max_actions if args.scenario == "repair" else None,
                   "modes": args.modes, "recursive_max_depth": args.recursive_max_depth,
+                  "recursive_checkpoint_threshold": args.recursive_checkpoint_threshold,
+                  "recursive_checkpoint_max": args.recursive_checkpoint_max,
                   "stage_start_inspects": args.stage_start_inspects,
                   "stage_start_output_tokens": args.stage_start_output_tokens,
                   "stage_start_reasoning": (args.stage_start_reasoning if args.engine == "llama" else "auto"),
@@ -826,6 +836,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "error_type", "failed_phase", "error",
         "scenario", "trap_density", "trap_log_lines", "max_actions",
         "total_actions", "verified_cases", "invalid_actions", "wrong_repairs",
+        "partial_failure", "interrupted_batch",
+        "recursive_checkpoints", "recursive_checkpoint_blocked",
         "no_action_investigation_calls", "empty_investigation_replies",
         "no_action_retry_attempts", "no_action_retry_recoveries", "no_action_retry_failures", "out_of_scope_actions",
         "stage_start_calls", "stage_start_inference_seconds",
@@ -1142,6 +1154,9 @@ def main(argv=None):
             print(f"Jan connection error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
     cfg["_recursive_max_depth"] = args.recursive_max_depth
+    cfg["_recursive_checkpoint_threshold"] = args.recursive_checkpoint_threshold
+    cfg["_recursive_checkpoint_max"] = args.recursive_checkpoint_max
+    cfg["_context_limit"] = args.context_limit
     cfg["_stage_start_inspects"] = args.stage_start_inspects
     cfg["_stage_start_output_tokens"] = args.stage_start_output_tokens
     cfg["_stage_start_reasoning_effort"] = (

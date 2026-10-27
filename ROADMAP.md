@@ -1,3 +1,31 @@
+# v1.4.4 — pressure-aware recursive checkpoints and failure snapshots
+
+Recursive repair stages can now **restart their private conversation before exhausting its context window**. The controller estimates upcoming prompt size, using actual API prompt-token counts when available. At the configured pressure threshold it rebuilds that stage's message list from:
+
+- The original stage-only system instructions and *verified* child handoff.
+- Exact simulator observations for documents already inspected by **that stage** (one copy per path).
+- The last non-inspection action outcome, if present.
+
+No expected repair, hidden oracle, fabricated summary, or child's transcript is inserted. Environment state is not reset, and checkpointing performs **zero simulator actions**. All model calls and tokens remain counted. If all previously observed evidence itself cannot fit, the stage fails explicitly instead of silently dropping it.
+
+The default is `--recursive-checkpoint-threshold 0.78` (fraction of the context limit), `--recursive-checkpoint-max 4` per stage. Set `--recursive-checkpoint-threshold 0` to reproduce legacy behavior. Checkpoint details are in `recursive_events[].stages[].checkpoint_details`; totals appear as `recursive_checkpoints` and `recursive_checkpoint_blocked`. Pressure estimates are conservative heuristics and can still miss tokenizer differences, so these settings do **not** guarantee no context overflow.
+
+When a simulator trial fails midway through an incident, its **partial simulator actions, completed prerequisites, document reads and nested stage events now survive in `results.json`**, marked `partial_failure` / `interrupted_batch`. An unverified incident remains unverified; the run does not fabricate a successful final report.
+
+Compare controlled recursion with and without checkpointing using the **same seed**, changing only the threshold:
+
+```bash
+python3 benchmark.py --engine llama --scenario repair \
+  --modes recursive --tasks 1 --repeats 1 --seed 20261026 \
+  --context-limit 8192 --nested-depth 2 --nested-log-lines 8 \
+  --recovery-log-lines 8 --pressure-records 0 --max-actions 32 \
+  --stage-start-inspects 2 --recursive-checkpoint-threshold 0.78
+```
+
+No live Qwen improvement is claimed until this configuration is run. Autonomous branching is still a separate future milestone.
+
+---
+
 # v1.4.3 — low-overhead recursive stage starts
 
 New recursive contexts now begin with a **limited, non-thinking inspection phase**: the model itself selects the first two *in-scope* document inspections, each with a 256-token output cap and a best-effort `reasoning_effort=none` hint on llama.cpp. This avoids spending the full 1,024-token investigation allowance on trivial guide/initial-evidence reads.

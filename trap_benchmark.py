@@ -596,6 +596,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "recursive_branch_count": 0, "recursive_context_count": 0,
         "recursive_max_depth": 0, "recursive_stage_successes": 0,
         "recursive_stage_failures": 0, "recursive_events": [],
+        "recursive_checkpoints": 0, "recursive_checkpoint_blocked": 0,
+        "partial_failure": False, "interrupted_batch": None,
         "nested_depth": nested_depth, "nested_log_lines": nested_log_lines,
         "pressure_records": pressure_records, "pressure_detail_chars": pressure_detail_chars,
         "pressure_generated_chars": sum(sum(c["pressure_deltas"].values()) for c in puzzle["cases"]),
@@ -619,11 +621,17 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
     bm.bc.http_json = trace
     started = time.perf_counter()
     stage = "setup"
+    active_sim = None
+    active_case = None
+    case_recorded = True
     try:
         for case in puzzle["cases"]:
             name = case["name"]
             stage = f"investigate:{name}"
             sim = RepairSimulator(case)
+            active_sim = sim
+            active_case = case
+            case_recorded = False
             if mode in ("branch", "recursive"):
                 # Isolated case history starts here; parent never sees its logs.
                 incident_msgs = [{"role": "system", "content": ACTION_SYSTEM},
@@ -637,7 +645,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 from recursive_benchmark import solve_recursive_case
                 success, recursive_events, retry_stats = solve_recursive_case(
                     sim, case, cfg, model, trace, bm, max_actions,
-                    max_depth=cfg.get("_recursive_max_depth", 3))
+                    max_depth=cfg.get("_recursive_max_depth", 3),
+                    context_limit=context_limit)
                 result["no_action_investigation_calls"] += retry_stats["no_actions"]
                 result["no_action_retry_attempts"] += retry_stats["retries"]
                 result["no_action_retry_recoveries"] += retry_stats["recoveries"]
@@ -650,6 +659,9 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                     max((e["depth"] for e in recursive_events), default=0))
                 result["recursive_stage_successes"] += sum(e["completed"] for e in recursive_events)
                 result["recursive_stage_failures"] += sum(not e["completed"] for e in recursive_events)
+                result["recursive_checkpoints"] += sum(e.get("context_checkpoints", 0) for e in recursive_events)
+                result["recursive_checkpoint_blocked"] += sum(
+                    bool(e.get("context_checkpoint_blocked")) for e in recursive_events)
             for _ in range(0 if mode == "recursive" else max_actions):
                 phase = "branch_investigate" if mode == "branch" else "parent_investigate"
                 action, answer, retry_stats = request_investigation_action(
@@ -720,6 +732,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                                              "authority_blocked": sim.authority_blocked,
                                              "events": sim.history,
                                              "expected_repair_debug_only": case["expected_repair"]})
+            case_recorded = True
             if mode in ("branch", "recursive"):
                 # No model call gets the independent case history as part of the parent.
                 trace.phase = "parent_ack"
@@ -754,6 +767,75 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         result.update(bm.model_final_report(cfg, model, messages, trace, expected,
                                             puzzle["mission"], puzzle["control"]))
     except Exception as exc:
+        # A failed API request may interrupt a case BEFORE the normal accounting
+        # block. Retain verified shared state and all actions actually executed.
+        # Never fabricate verification seals or a final model-generated report.
+        if active_sim is not None and active_case is not None and not case_recorded:
+            sim, case = active_sim, active_case
+            name = case["name"]
+            seal = case["seal"] if sim.verified else ""
+            result["partial_failure"] = True
+            result["interrupted_batch"] = name
+            result["reported_answers"][name] = seal
+            result["solved_subtasks"] += 1
+            result["subtask_accuracy"] += int(sim.verified)
+            result["verified_cases"] += int(sim.verified)
+            result["total_actions"] += sim.actions
+            result["invalid_actions"] += sim.invalid_actions
+            result["wrong_repairs"] += sim.wrong_repairs
+            result["decoy_documents_opened"] += sim.trap_views
+            result["trap_waste_chars"] += sim.trap_chars
+            result["recovery_completed"] += int(sim.recovery_completed)
+            result["recovery_attempts"] += sim.recovery_attempts
+            result["recovery_failures"] += sim.recovery_failures
+            result["recovery_blocked"] += sim.recovery_blocked
+            result["recovery_shard_views"] += len(sim.recovery_shards_viewed)
+            result["forced_evidence_chars"] += sim.forced_evidence_chars
+            result["nested_index_completed"] += int("index" in sim.nested_completed)
+            result["nested_escrow_completed"] += int("escrow" in sim.nested_completed)
+            for substage in ("index", "escrow"):
+                result[f"nested_{substage}_attempts"] += sim.nested_attempts[substage]
+                result[f"nested_{substage}_failures"] += sim.nested_failures[substage]
+            result["nested_blocked"] += sim.nested_blocked
+            result["nested_shard_views"] += sum(len(v) for v in sim.nested_views.values())
+            result["nested_evidence_chars"] += sim.nested_evidence_chars
+            result["pressure_evidence_chars"] += sim.pressure_evidence_chars
+            result["authority_evidence_chars"] += sim.authority_evidence_chars
+            result["authority_docs_viewed"] += len(sim.authority_views)
+            result["authority_blocked"] += sim.authority_blocked
+            result["lookup_breakdown"].append({"batch": name, "answer": seal,
+                "correct": sim.verified, "status": "verified" if sim.verified else "interrupted"})
+            result["case_breakdown"].append({
+                "batch": name, "verified": sim.verified, "interrupted": True,
+                "actions": sim.actions, "invalid_actions": sim.invalid_actions,
+                "wrong_repairs": sim.wrong_repairs, "recovery_completed": sim.recovery_completed,
+                "nested_completed": sorted(sim.nested_completed),
+                "nested_attempts": sim.nested_attempts.copy(),
+                "nested_failures": sim.nested_failures.copy(),
+                "recovery_attempts": sim.recovery_attempts,
+                "recovery_failures": sim.recovery_failures,
+                "recovery_shard_views": len(sim.recovery_shards_viewed),
+                "nested_shard_views": {k: len(v) for k, v in sim.nested_views.items()},
+                "stage_scope_rejected": sum(e["label"] == "stage_scope_rejected" for e in sim.history),
+                "events": list(sim.history)})
+            if mode == "recursive" and getattr(trace, "active_recursive_events", None) is not None:
+                recursive_events = trace.active_recursive_events
+                retry_stats = trace.active_recursive_counters
+                result["recursive_events"].append({"batch": name, "stages": recursive_events})
+                result["recursive_branch_count"] += sum(e["depth"] > 0 for e in recursive_events)
+                result["recursive_context_count"] += len(recursive_events)
+                result["recursive_max_depth"] = max(result["recursive_max_depth"],
+                    max((e["depth"] for e in recursive_events), default=0))
+                result["recursive_stage_successes"] += sum(e["completed"] for e in recursive_events)
+                result["recursive_stage_failures"] += sum(not e["completed"] for e in recursive_events)
+                result["recursive_checkpoints"] += sum(e.get("context_checkpoints", 0) for e in recursive_events)
+                result["recursive_checkpoint_blocked"] += sum(
+                    bool(e.get("context_checkpoint_blocked")) for e in recursive_events)
+                result["out_of_scope_actions"] += sum(e["rejected_out_of_scope"] for e in recursive_events)
+                result["no_action_investigation_calls"] += retry_stats["no_actions"]
+                result["no_action_retry_attempts"] += retry_stats["retries"]
+                result["no_action_retry_recoveries"] += retry_stats["recoveries"]
+                result["no_action_retry_failures"] += retry_stats["retry_failures"]
         result["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
         result["error_type"] = ("summary_failed" if stage.startswith("summary:") and isinstance(exc, ValueError)
                                 else bm.classify_exception(exc))
