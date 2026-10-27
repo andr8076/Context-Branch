@@ -784,6 +784,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "report_reasoning": args.report_reasoning if args.engine == "llama" else "auto",
                   "seed": args.seed,
                   "scoring_version": 3,
+                  "simulator_rules_version": 2,
+                  "mandatory_authority_inspection": args.scenario == "repair",
                   "benchmark_version": "1.2.0", "scenario": args.scenario,
                   "engine": args.engine,
                   "llama_reset_policy": ("reuse" if args.reuse_llama else "fresh_each_trial") if args.engine == "llama" else None,
