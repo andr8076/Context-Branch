@@ -7,6 +7,9 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 SCRIPT = Path(__file__).resolve().parents[1] / "branch_context.py"
 spec = importlib.util.spec_from_file_location("branch_context", SCRIPT)
@@ -74,6 +77,29 @@ class IntegrationTests(unittest.TestCase):
 
     def restore(self):
         b.DATA, b.CONFIG = self.old
+
+    def test_http_400_context_error_is_specific_and_redacted(self):
+        body = b'{"error":{"message":"the request exceeds the available context size; private-secret-123"}}'
+        error = HTTPError("http://127.0.0.1:18089/v1/chat/completions", 400,
+                          "Bad Request", {}, BytesIO(body))
+        with patch.object(b, "urlopen", side_effect=error):
+            with self.assertRaises(b.LocalAPIError) as caught:
+                b.http_json("POST", self.cfg["api_base_url"] + "/chat/completions", self.cfg, {"messages": []})
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(caught.exception.error_kind, "context_overflow_confirmed")
+        self.assertIn("context budget exceeded", str(caught.exception))
+        self.assertNotIn("private-secret-123", str(caught.exception))
+        self.assertNotIn("Jan API", str(caught.exception))
+
+    def test_http_400_unknown_does_not_echo_prompt(self):
+        body = b'{"error":{"message":"illegal prompt: private-secret-123"}}'
+        error = HTTPError("http://127.0.0.1:18089/v1/chat/completions", 400,
+                          "Bad Request", {}, BytesIO(body))
+        with patch.object(b, "urlopen", side_effect=error):
+            with self.assertRaises(b.LocalAPIError) as caught:
+                b.http_json("POST", self.cfg["api_base_url"] + "/chat/completions", self.cfg, {"messages": []})
+        self.assertEqual(caught.exception.error_kind, "api_or_runtime_error")
+        self.assertNotIn("private-secret-123", str(caught.exception))
 
     def test_isolation_storage_and_resume(self):
         a = b.dispatch_tool("branch_solve", {"task":"Create glaze", "relevant_context":"Cake is ready"})
