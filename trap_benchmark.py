@@ -558,7 +558,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "summaries_generated": 0, "summary_chars_peak": 0, "summaries": [],
         "trap_density": trap_density, "trap_log_lines": trap_log_lines,
         "recovery_log_lines": recovery_log_lines, "max_actions": max_actions,
-        "recursive_branch_count": 0, "recursive_max_depth": 0, "recursive_stage_successes": 0,
+        "recursive_branch_count": 0, "recursive_context_count": 0,
+        "recursive_max_depth": 0, "recursive_stage_successes": 0,
         "recursive_stage_failures": 0, "recursive_events": [],
         "nested_depth": nested_depth, "nested_log_lines": nested_log_lines,
         "pressure_records": pressure_records, "pressure_detail_chars": pressure_detail_chars,
@@ -601,7 +602,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                     sim, case, cfg, model, trace, bm, max_actions,
                     max_depth=cfg.get("_recursive_max_depth", 3))
                 result["recursive_events"].append({"batch": name, "stages": recursive_events})
-                result["recursive_branch_count"] += len(recursive_events)
+                result["recursive_branch_count"] += sum(e["depth"] > 0 for e in recursive_events)
+                result["recursive_context_count"] += len(recursive_events)
                 result["recursive_max_depth"] = max(result["recursive_max_depth"],
                     max((e["depth"] for e in recursive_events), default=0))
                 result["recursive_stage_successes"] += sum(e["completed"] for e in recursive_events)
