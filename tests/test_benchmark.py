@@ -394,5 +394,80 @@ class ScoringV2Tests(unittest.TestCase):
             self.assertIn('visible_seals_correct', csv_file)
 
 
+class ReportingTests(unittest.TestCase):
+    def test_final_retry_and_reasoning_diagnostics(self):
+        # First response is 100% invisible thinking; retry is a genuine model
+        # completion based on the same original conversation, not the oracle.
+        seen = []
+        model = FakeJan()
+
+        def fake(method, url, cfg, payload=None):
+            if method == 'GET':
+                return model(method, url, cfg, payload)
+            seen.append(payload)
+            last = payload['messages'][-1]['content']
+            if last.startswith('FINAL REPORT.') and not any(
+                    x['messages'][-1]['content'].startswith('The final report was not completed.')
+                    for x in seen[:-1]):
+                return {'choices': [{'message': {'role': 'assistant', 'content': '',
+                            'reasoning_content': 'private deliberation is not shown'},
+                            'finish_reason': 'length'}],
+                        'usage': {'prompt_tokens': 200, 'completion_tokens': 2048,
+                                  'completion_tokens_details': {'reasoning_tokens': 2048}}}
+            if last.startswith('The final report was not completed.'):
+                copy = dict(payload)
+                copy['messages'] = payload['messages'][:-1]
+                return model(method, url, cfg, copy)
+            return model(method, url, cfg, payload)
+
+        cfg = dict(bm.bc.DEFAULTS)
+        cfg.update({'model': 'mock', 'max_agent_turns': 1, 'max_branch_depth': 0,
+                    'max_output_tokens': 1024, '_final_output_tokens': 2048,
+                    '_final_retries': 1, '_report_reasoning_effort': 'none'})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fake):
+            outcome = bm.run_trial('linear', 77, 2, 15, cfg, 'mock', 8192, Path(tmp))
+        self.assertEqual(outcome['final_attempts'], 2)
+        self.assertEqual(outcome['final_first_status'], 'output_truncated_confirmed')
+        self.assertTrue(outcome['final_recovered_on_retry'])
+        self.assertTrue(outcome['exact_final'])
+        self.assertEqual(outcome['reasoning_only_calls'], 1)
+        self.assertEqual(outcome['reported_reasoning_tokens'], 2048)
+        self.assertEqual(outcome['empty_visible_calls'], 1)
+        final_calls = [x for x in outcome['calls'] if x['phase'].startswith('parent_final')]
+        self.assertEqual([x['requested_max_tokens'] for x in final_calls], [2048, 2048])
+        self.assertTrue(all(x['requested_reasoning_effort'] == 'none' for x in final_calls))
+        self.assertEqual(outcome['total_completion_tokens'] > 2048, True)
+        self.assertEqual(outcome['calls'][0]['requested_max_tokens'], 1024)
+
+    def test_report_mode_preserves_investigation_reasoning(self):
+        seen = []
+        fake_model = FakeJan()
+        def fake(method, url, cfg, payload=None):
+            if payload:
+                seen.append(payload)
+            return fake_model(method, url, cfg, payload)
+        cfg = dict(bm.bc.DEFAULTS)
+        cfg.update({'max_branch_depth': 0, 'max_agent_turns': 1, 'max_output_tokens': 1024,
+                    '_final_output_tokens': 2048, '_report_reasoning_effort': 'none'})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fake):
+            result = bm.run_trial('branch', 77, 2, 15, cfg, 'mock', 8192, Path(tmp))
+        self.assertTrue(result['exact_final'])
+        investigation = [x for x in seen if 'INDEPENDENT ARCHIVE LOOKUP' in
+                         json.dumps(x['messages']) and x.get('reasoning_effort') is None]
+        ack = [x for x in seen if 'Isolated lookup finished.' in
+               json.dumps(x['messages']) and x.get('reasoning_effort') == 'none']
+        self.assertTrue(investigation)
+        self.assertTrue(ack)
+        self.assertTrue(all('reasoning_effort' not in x for x in investigation))
+        self.assertTrue(all(x.get('reasoning_effort') == 'none' for x in ack))
+
+    def test_new_cli_options_and_multiple_repairs(self):
+        args = bm.arguments(['--scenario', 'repair', '--tasks', '3', '--repeats', '1',
+                             '--final-output-tokens', '2048', '--final-retries', '1'])
+        self.assertEqual(args.tasks, [3])
+        self.assertEqual(args.report_reasoning, 'none')
+        self.assertEqual(args.final_output_tokens, 2048)
+
+
 if __name__ == '__main__':
     unittest.main()
