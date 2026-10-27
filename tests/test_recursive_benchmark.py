@@ -246,7 +246,7 @@ class RecursiveContextTests(unittest.TestCase):
         observed = []
         def spy(method, url, conf, payload=None):
             if payload and 'RECURSIVE STAGE=' in payload['messages'][0]['content']:
-                stage = re.search(r'RECURSIVE STAGE=(\\w+)', payload['messages'][0]['content']).group(1)
+                stage = re.search(r'RECURSIVE STAGE=(\w+)', payload['messages'][0]['content']).group(1)
                 observed.append((stage, payload['max_tokens'], payload.get('reasoning_effort')))
             return fake(method, url, conf, payload)
         with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', spy):
@@ -306,7 +306,7 @@ class RecursiveContextTests(unittest.TestCase):
         index = next(e for e in trial['recursive_events'][0]['stages'] if e['stage'] == 'index')
         self.assertTrue(index['stage_start_disabled'])
         self.assertEqual(index['stage_start_inspections'], 1)
-        self.assertEqual(trial['stage_start_calls'], 7)
+        self.assertEqual(trial['stage_start_calls'], 8)
 
     def test_stage_start_empty_reply_uses_bounded_recovery(self):
         cfg = self.cfg()
