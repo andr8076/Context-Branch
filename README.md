@@ -1,3 +1,51 @@
+# v1.4 — controlled recursive context branching
+
+A fourth, **opt-in** benchmark competitor, `recursive`, now splits a single
+simulated repair into separate nested contexts for **index → escrow →
+authorization recovery → final repair**. Stages share the actual simulator state,
+not their conversation transcripts. Each parent receives only a compact
+simulator-verified child outcome, and **every stage shares the same per-repair
+action limit**. Total token usage includes *all* child and parent calls.
+
+```bash
+# First run: compare per-repair branching with recursive delegation
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --modes branch recursive \
+  --tasks 1 --repeats 1 --context-limit 8192 \
+  --nested-depth 2 --nested-log-lines 8 \
+  --recovery-log-lines 8 --pressure-records 0 --max-actions 32
+
+# A stronger but more expensive context-pressure experiment
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --modes branch recursive \
+  --tasks 1 --repeats 3 --context-limit 8192 \
+  --nested-depth 2 --nested-log-lines 14 \
+  --recovery-log-lines 36 --pressure-records 4 --max-actions 32
+
+# Explicit four-way comparison, including real summarization between repairs
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --modes linear summarized branch recursive \
+  --tasks 3 --repeats 1 --context-limit 16384 \
+  --nested-depth 1 --nested-log-lines 8 \
+  --recovery-log-lines 8 --pressure-records 0 --max-actions 32
+```
+
+The default mode list is still **linear, summarized, branch**. Use `--modes`
+to opt into recursion. `--recursive-max-depth 3` includes all nested stages;
+reducing the limit deliberately blocks dependencies that cannot be reached.
+`results.json` records the per-case recursive stage tree and stage statuses;
+the CSV includes spawned children, context count, peak recursion depth and stage
+outcomes. `no_action_investigation_calls` and `empty_investigation_replies`
+track the next reliability issue without silently changing how actions are scored.
+
+**Scope:** This is controlled *benchmark* recursion, not autonomous model-
+chosen delegation or recursive tool calls inside Jan. Offline simulator tests
+prove plumbing and integrity but not real GPU/model accuracy. See
+[ROADMAP.md](ROADMAP.md) for all three development goals: recursive branching,
+autonomous branching, and no-action investigation recovery.
+
+---
+
 # New in v1.3: robust model-written summaries
 
 The **summarized** competitor now uses the same lightweight reporting policy as the final report. On standalone llama.cpp, periodic compaction requests ask for `reasoning_effort=none` (best effort), have a separate **2,048-token** generation budget, and are retried once if the first answer is empty or explicitly/suspected truncated. Investigation reasoning remains enabled.
