@@ -87,6 +87,7 @@ class Trace:
     mode: str
     api: object
     calls: list = field(default_factory=list)
+    summary_events: list = field(default_factory=list)
     phase: str = "parent"
 
     def __call__(self, method, url, cfg, payload=None):
@@ -152,6 +153,11 @@ class Trace:
             "reasoning_only_calls": sum(r["empty_visible_output"] is True and
                 ((r["reasoning_output_chars"] or 0) > 0 or (r["reasoning_tokens"] or 0) > 0)
                 for r in self.calls),
+            "summary_attempts": sum(event["attempts"] for event in self.summary_events),
+            "summary_retries": sum(event["attempts"] - 1 for event in self.summary_events),
+            "summary_retry_recoveries": sum(bool(event["recovered_on_retry"]) for event in self.summary_events),
+            "summary_failures": sum(event["status"] != "success" for event in self.summary_events),
+            "summary_events": list(self.summary_events),
         }
 
 
@@ -326,15 +332,18 @@ def classify_exception(exc):
     return 'api_or_runtime_error'
 
 
-def call_parent(cfg, model, messages, *, reporting=False, final=False):
-    # Reporting is deliberately separate from the model's investigative policy.
-    # No-thinking is requested only for simple ACK/final JSON calls. Backends
-    # may ignore reasoning_effort; recorded output diagnostics reveal that.
+def call_parent(cfg, model, messages, *, reporting=False, final=False, summary=False):
+    # Preserve investigative reasoning. ACK, final report and compaction are
+    # lightweight reporting tasks, so they may request no hidden reasoning.
+    # This is best-effort: older inference servers may ignore the hint.
     request_cfg = cfg
     if final and cfg.get("_final_output_tokens") is not None:
         request_cfg = dict(cfg)
         request_cfg["max_output_tokens"] = cfg["_final_output_tokens"]
-    effort = cfg.get("_report_reasoning_effort") if reporting else None
+    elif summary and cfg.get("_summary_output_tokens") is not None:
+        request_cfg = dict(cfg)
+        request_cfg["max_output_tokens"] = cfg["_summary_output_tokens"]
+    effort = cfg.get("_report_reasoning_effort") if reporting or summary else None
     result = bc.chat(request_cfg, model, messages, reasoning_effort=effort)
     content = result.get("content") or ""
     if isinstance(content, list):
@@ -383,24 +392,65 @@ SUMMARY_REQUEST = (
 
 
 def compact_history(cfg, model, messages, preserved, trace, max_chars, summary_request=SUMMARY_REQUEST):
-    """Ask the SAME model to summarize observed history, then drop that history.
+    """Compact only model-visible history, preserving the original instructions.
 
-    The benchmark never provides ground truth to the summarizer; its output is
-    preserved verbatim. Oversized/empty summaries are observable failures.
+    Summarization uses its own output allowance and reporting reasoning policy.
+    Empty or truncated answers can be retried once (configurable). Never use
+    benchmark oracle data, rewrite the original task or accept cut-off memory.
     """
-    trace.phase = "parent_summary"
     request = summary_request.format(max_chars=max_chars)
-    summary = call_parent(cfg, model, messages + [{"role": "user", "content": request}])
-    summary = summary.strip()
-    if not summary:
-        raise ValueError("Context summarization returned empty memory")
-    if len(summary) > max_chars:
-        raise ValueError(f"Context summarization exceeded memory budget ({len(summary)} > {max_chars} chars)")
-    # The original task and instructions survive unchanged; raw archives and
-    # the summarization request itself do not enter future parent calls.
+    request_messages = messages + [{"role": "user", "content": request}]
+    max_retries = cfg.get("_summary_retries", 1)
+    attempts = 0
+    first_status = None
+    status = "empty"
+    summary = ""
+    try:
+        for attempt in range(max_retries + 1):
+            trace.phase = "parent_summary" if attempt == 0 else "parent_summary_retry"
+            current_messages = request_messages if attempt == 0 else messages + [
+                {"role": "user", "content": request + "\n"
+                 "Your previous summary attempt was empty or cut off. Return ONLY "
+                 "completed batch names and exact verified seals, one per line. "
+                 "No analysis; stay within the stated character limit."}]
+            summary = call_parent(cfg, model, current_messages, reporting=True, summary=True).strip()
+            attempts += 1
+            last = trace.calls[-1] if trace.calls else {}
+            cut_off = output_was_cut_off(last.get("finish_reason"), last.get("completion_tokens"),
+                                         last.get("requested_max_tokens"), summary, None)
+            if not summary:
+                status = "empty"
+            elif len(summary) > max_chars:
+                status = "oversized"
+            elif cut_off != "none":
+                status = "truncated_" + cut_off
+            else:
+                status = "success"
+            if first_status is None:
+                first_status = status
+            if status == "success":
+                break
+            # Retry only empty or cut-off output, never a fully produced
+            # oversized note: a size violation is not safe memory compaction.
+            if status not in ("empty", "truncated_confirmed", "truncated_suspected"):
+                break
+    finally:
+        trace.summary_events.append({
+            "attempts": attempts,
+            "first_status": first_status or "error",
+            "status": status if attempts else "error",
+            "recovered_on_retry": attempts > 1 and status == "success",
+            "chars": len(summary),
+        })
+    if status != "success":
+        raise ValueError(f"Context summarization failed after {attempts} attempt(s): {status}"
+                         + (f" ({len(summary)} > {max_chars} chars)" if status == "oversized" else ""))
+    # The original task survives unchanged. Neither the full investigative
+    # history nor either summarization request enters future parent calls.
     compacted = [dict(preserved[0]), dict(preserved[1]),
                  {"role": "assistant", "content": "COMPACT MEMORY OF COMPLETED LOOKUPS:\n" + summary}]
     return compacted, summary
+
 
 
 def run_trial(mode, seed, tasks, records, cfg, model, context_limit, save_dir,
@@ -540,6 +590,10 @@ def arguments(argv=None):
     parser.add_argument("--final-retries", type=int, default=1, help="Retries for truncated or empty final report (default 1; retries counted in time/tokens)")
     parser.add_argument("--report-reasoning", choices=("auto", "none"), default="none",
                         help="Request no thinking on ACK/final reports with standalone llama.cpp (default none); investigation reasoning stays enabled")
+    parser.add_argument("--summary-output-tokens", type=int, default=2048,
+                        help="Output cap only for periodic summaries (default 2048)")
+    parser.add_argument("--summary-retries", type=int, default=1,
+                        help="Retries for empty or truncated summaries (default 1)")
     parser.add_argument("--summary-every", type=int, default=2, help="Summarize history after every N completed lookups, except after the last (default: 2)")
     parser.add_argument("--summary-max-chars", type=int, default=1800, help="Maximum length of each compact memory note (default: 1800 chars)")
     parser.add_argument("--trap-log-lines", type=int, default=32, help="Repair: non-authoritative log lines per trap (default 32; 0-150)")
@@ -581,6 +635,8 @@ def arguments(argv=None):
         parser.error("--max-output-tokens must be between 64 and 4096")
     if not 64 <= args.final_output_tokens <= 4096 or not 0 <= args.final_retries <= 2:
         parser.error("--final-output-tokens must be 64-4096 and --final-retries 0-2")
+    if not 64 <= args.summary_output_tokens <= 4096 or not 0 <= args.summary_retries <= 2:
+        parser.error("--summary-output-tokens must be 64-4096 and --summary-retries 0-2")
     if args.summary_every < 1 or not 100 <= args.summary_max_chars <= 10000:
         parser.error("--summary-every must be >= 1 and --summary-max-chars between 100 and 10000")
     if (not 0 <= args.trap_log_lines <= 150 or not 0 <= args.recovery_log_lines <= 120
@@ -636,6 +692,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "max_actions": args.max_actions if args.scenario == "repair" else None,
                   "modes": ["linear", "summarized", "branch"],
                   "summary_every": args.summary_every, "summary_max_chars": args.summary_max_chars,
+                  "summary_output_tokens": args.summary_output_tokens,
+                  "summary_retries": args.summary_retries,
                   "strict_pass_rule": "Complete valid JSON with every field and seal correct. Partial visible fields are diagnostics only."},
                    "trials": data, "resets": reset_events or []}, fh, indent=2, ensure_ascii=False)
     columns = [
@@ -653,6 +711,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "reset_before_trial", "reset_status", "reset_seconds", "reset_method", "reset_memory_before_mb",
         "reset_memory_after_unload_mb", "reset_memory_after_reload_mb",
         "summary_every", "summary_max_chars", "summaries_generated", "summary_chars_peak",
+        "summary_attempts", "summary_retries", "summary_retry_recoveries", "summary_failures",
         "error_type", "failed_phase", "error",
         "scenario", "trap_density", "trap_log_lines", "max_actions",
         "total_actions", "verified_cases", "invalid_actions", "wrong_repairs",
@@ -836,7 +895,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "- `context_overflow_confirmed`: exception explicitly indicates context overflow.",
         "- `timeout`: a definitive timeout; `connection_or_timeout_unknown` means the error was ambiguous.",
         "- `not_attempted`: a lookup or summarization failed before the final report request.",
-        "- `summary_failed`: the summary was empty or exceeded the configured size budget.",
+        "- `summary_failed`: the summary stayed empty, truncated, or oversized after its retry allowance.",
         "", "**Token counts:** Actual Jan API `usage` when provided; otherwise rough chars/4 estimates, "
         "not tokenizer counts. Avoid comparing estimated and measured values as equivalent.",
         "**Fairness:** Same model, seed, synthetic cases, final-answer criteria, and output cap across three modes. "
@@ -846,7 +905,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "**Modes:** linear retains entire history; summarized periodically replaces old steps with a note "
         "written by the same model; branch isolates each case and returns an outcome. "
         f"Summarized cadence: every {args.summary_every} lookups, memory budget {args.summary_max_chars} characters. "
-        "Summaries and per-call traces are in results.json.\n",
+        f"Summary cap: {args.summary_output_tokens} tokens; retry allowance: {args.summary_retries}. "
+        "Summaries, retry events and per-call traces are in results.json.\n",
         "**Limitations:** Repair scenario uses a VIRTUAL simulator, not real files, browser actions, shell, or credentials. "
         "Branching is selected by benchmark orchestration, not autonomously. Nested dependencies happen INSIDE each case's active context (the harness does not spawn nested branches for them). No tool inheritance or real Jan UI/MCP tool-selection evaluation. "
         "A server may silently truncate oversized inputs.",
@@ -930,6 +990,8 @@ def main(argv=None):
             return 2
     cfg["_final_output_tokens"] = args.final_output_tokens
     cfg["_final_retries"] = args.final_retries
+    cfg["_summary_output_tokens"] = args.summary_output_tokens
+    cfg["_summary_retries"] = args.summary_retries
     # Per-request control is best-effort: older llama.cpp builds may ignore it.
     cfg["_report_reasoning_effort"] = "none" if args.engine == "llama" and args.report_reasoning == "none" else None
     resetter = None
