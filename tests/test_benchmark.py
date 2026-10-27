@@ -336,6 +336,8 @@ class ScoringV2Tests(unittest.TestCase):
         self.assertEqual(bm.classify_exception(RuntimeError("Cannot reach Jan API (or request timed out). Start Jan")),
                          'connection_or_timeout_unknown')
         self.assertEqual(bm.classify_exception(RuntimeError("HTTP 502")), 'api_or_runtime_error')
+        self.assertEqual(bm.classify_exception(bm.bc.LocalAPIError(400, "context budget exceeded", "context_overflow_confirmed")),
+                         'context_overflow_confirmed')
 
     def test_lookup_recovers_plain_seal_without_looking_into_archive(self):
         self.assertEqual(bm.extract_lookup_answer('seal: SABCDEFGH'), 'SABCDEFGH')
