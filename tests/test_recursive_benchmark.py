@@ -155,9 +155,88 @@ class RecursiveContextTests(unittest.TestCase):
         self.assertTrue(injected)
         self.assertEqual(trial['no_action_investigation_calls'], 1)
         self.assertEqual(trial['empty_investigation_replies'], 1)
-        self.assertEqual(trial['invalid_actions'], 1)
+        self.assertEqual(trial['invalid_actions'], 0)  # recovered before simulator action
+        self.assertEqual(trial['no_action_retry_attempts'], 1)
+        self.assertEqual(trial['no_action_retry_recoveries'], 1)
+        self.assertEqual(trial['no_action_retry_failures'], 0)
         self.assertEqual(trial['verified_cases'], 1)
         self.assertTrue(trial['exact_final'])
+
+    def test_wrong_stage_actions_are_rejected_without_environment_changes(self):
+        fake = RecursiveFakeJan()
+        wrong = [False]
+        def repeat_child(method, url, cfg, payload=None):
+            if payload and not wrong[0] and 'RECURSIVE STAGE=escrow' in payload['messages'][0]['content']:
+                wrong[0] = True
+                answer = json.dumps({'action': 'rebuild_index', 'token': 'WRONG'})
+                return {'choices': [{'message': {'content': answer}, 'finish_reason': 'stop'}],
+                        'usage': {'prompt_tokens': 70, 'completion_tokens': 30}}
+            return fake(method, url, cfg, payload)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', repeat_child):
+            trial = tb.run_trap_trial('recursive', 17, 1, self.cfg(), 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=2, max_actions=32,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertTrue(wrong[0])
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertEqual(trial['out_of_scope_actions'], 1)
+        self.assertEqual(trial['nested_index_attempts'], 1)  # no repeat was applied
+        self.assertEqual(trial['case_breakdown'][0]['stage_scope_rejected'], 1)
+        escrow = next(e for e in trial['recursive_events'][0]['stages'] if e['stage'] == 'escrow')
+        self.assertEqual(escrow['rejected_out_of_scope'], 1)
+
+    def test_scoped_handoffs_do_not_expose_child_documents(self):
+        fake = RecursiveFakeJan()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fake):
+            trial = tb.run_trap_trial('recursive', 17, 1, self.cfg(), 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        root = json.dumps([msgs for msgs in fake.messages_seen
+                           if 'RECURSIVE STAGE=repair' in msgs[0]['content']])
+        self.assertIn('registry/approvals unlocked', root)
+        for forbidden in ('index/shard-a', 'escrow/shard-a', 'recovery/shard-a',
+                          'INDEX SHARD A:', 'RECOVERY SHARD A:'):
+            self.assertNotIn(forbidden, root)
+        for event in trial['recursive_events'][0]['stages']:
+            if event['handoff']:
+                self.assertTrue(event['handoff']['verified'])
+                self.assertNotIn('token', event['handoff'])
+
+    def test_exhausted_no_action_retry_counts_one_simulator_action_per_slot(self):
+        def silent(method, url, cfg, payload=None):
+            return {'choices': [{'message': {'content': ''}, 'finish_reason': 'length'}],
+                    'usage': {'prompt_tokens': 12, 'completion_tokens': 1024}}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', silent):
+            trial = tb.run_trap_trial('branch', 17, 1, self.cfg(), 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=0, max_actions=12)
+        self.assertEqual(trial['verified_cases'], 0)
+        self.assertEqual(trial['total_actions'], 12)
+        self.assertEqual(trial['invalid_actions'], 12)
+        self.assertEqual(trial['no_action_investigation_calls'], 24)
+        self.assertEqual(trial['no_action_retry_attempts'], 12)
+        self.assertEqual(trial['no_action_retry_failures'], 12)
+
+    def test_no_action_recovery_does_not_reduce_action_budget_for_linear_or_branch(self):
+        for mode in ('linear', 'branch'):
+            fake = RecursiveFakeJan()
+            empty = [False]
+            def empty_first(method, url, cfg, payload=None):
+                if payload and not empty[0] and any('SIMULATED REPAIR INCIDENT' in m.get('content','')
+                                                     for m in payload['messages']):
+                    empty[0] = True
+                    return {'choices': [{'message': {'content': ''}, 'finish_reason': 'length'}],
+                            'usage': {'prompt_tokens': 180, 'completion_tokens': 1024}}
+                return fake(method, url, cfg, payload)
+            with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', empty_first):
+                trial = tb.run_trap_trial(mode, 17, 1, self.cfg(), 'mock', 8192,
+                                          Path(tmp), bm, nested_depth=0, max_actions=20,
+                                          recovery_log_lines=8)
+            self.assertTrue(empty[0])
+            self.assertEqual(trial['verified_cases'], 1, trial['error'])
+            self.assertEqual(trial['no_action_retry_attempts'], 1)
+            self.assertEqual(trial['no_action_retry_recoveries'], 1)
+            self.assertEqual(trial['invalid_actions'], 0)
+            self.assertEqual(trial['total_actions'], 12)
 
     def test_cli_opt_in_and_archive_rejected(self):
         args=bm.arguments(['--scenario','repair','--tasks','1','--repeats','1',
