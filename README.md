@@ -1,3 +1,22 @@
+# Evidence-gated repairs and reproducible context-pressure experiment
+
+**Simulator rule update:** every repair now requires the model to inspect all five authoritative documents: `registry/releases`, `registry/approvals`, `network/aliases`, `network/routes`, and `security/certificates`, even when `--pressure-records 0`. Correct guesses without evidence are rejected and counted as `authority_blocked`. This changes the task protocol relative to older runs; do not compare pass rates across simulator-rule versions without noting the difference. `results.json` now includes `simulator_rules_version=2` and `mandatory_authority_inspection=true`.
+
+**Live local model pressure comparison:** `checkpoint_stress.py` runs two Qwen/llama.cpp experiments with the *same model, case seed, evidence and action limits*, in independently launched model-server processes. Only the recursive checkpoint threshold changes. The script does not inject arbitrary padding or fake evidence; it reports when no checkpoint fired rather than claiming success.
+
+```bash
+cd ~/Documents/Github/Context-Branch
+python3 checkpoint_stress.py
+```
+
+This defaults to 4,096 context tokens, 1 plausible extra record per evidence source, 8 recovery and nested log lines, 40 actions, and checkpoint thresholds **0 (off)** vs **0.50 (on)**. Override with e.g. `--context-limit 6144 --pressure-records 3 --max-actions 48 --checkpoint-threshold 0.55`. The GGUF path comes from ignored `local_model.json`; `--llama-model` can override it.
+
+The script creates `data/benchmarks/pressure-study-<UTC timestamp>/off`, `.../on`, and `comparison.json`. A successful proof requires a **confirmed context overflow with checkpointing off**, a **checkpoint actually created with it on**, and a **verified final repair** in the checkpoint-on run. If both succeed or no checkpoint is created, the result is **inconclusive about necessity**, not a failure of the code. A checkpoint may also legitimately report that the unique required evidence cannot fit.
+
+Offline regression tests also simulate a hard 4,096-token API limit and have the same *model double* repeatedly inspect authentic simulator documents in each arm. This tests checkpoint reconstruction and the actual error path but **is not a Qwen performance measurement**. Run with `python3 -m unittest discover -s tests -q`.
+
+---
+
 # v1.4.4 — pressure-aware recursive checkpoints and failure snapshots
 
 Recursive repair stages can now **restart their private conversation before exhausting its context window**. The controller estimates upcoming prompt size, using actual API prompt-token counts when available. At the configured pressure threshold it rebuilds that stage's message list from:
