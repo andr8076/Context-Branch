@@ -727,7 +727,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "scenario", "trap_density", "trap_log_lines", "max_actions",
         "total_actions", "verified_cases", "invalid_actions", "wrong_repairs",
         "no_action_investigation_calls", "empty_investigation_replies",
-        "recursive_branch_count", "recursive_max_depth", "recursive_stage_successes", "recursive_stage_failures",
+        "recursive_branch_count", "recursive_context_count", "recursive_max_depth", "recursive_stage_successes", "recursive_stage_failures",
         "decoy_documents_opened", "trap_waste_chars",
         "recovery_log_lines", "recovery_completed", "recovery_attempts",
         "recovery_failures", "recovery_blocked", "recovery_shard_views", "forced_evidence_chars",
