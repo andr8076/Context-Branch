@@ -69,6 +69,30 @@ approaches the context budget. On HTTP errors, the benchmark now provides a
 sanitized cause if llama.cpp explicitly reports context overflow. For other
 HTTP 400 errors, consult the actual response in the `server_logs/` directory.
 
+## v1.2: final-report reliability and the first real multi-repair comparison
+
+A Qwen3.5 thinking model may use its entire output allowance for reasoning on a simple final report. The benchmark now gives final reports a separate **2048-token** allowance (investigation actions stay at 1024), requests `reasoning_effort=none` for simple acknowledgement/report calls only, and retries one time if the model returns an empty/truncated final report. This per-request hint is not guaranteed to work on every llama.cpp version. Every attempt is measured; strict pass still requires a correct model-produced JSON report.
+
+**First, verify the revised final-report behavior:**
+
+```bash
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --smoke --nested-depth 0 --pressure-records 0 \
+  --recovery-log-lines 8 --context-limit 8192
+```
+
+**Then test three incidents per mode** (summarized actually compacts after two):
+
+```bash
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --tasks 3 --repeats 1 --nested-depth 0 \
+  --pressure-records 0 --recovery-log-lines 8 --context-limit 16384
+```
+
+If your build rejects the per-request reasoning setting, add `--report-reasoning auto`. You may explicitly choose the output cap with `--final-output-tokens 2048` or disable retries with `--final-retries 0`. Increasing the final cap consumes some of the same context capacity, so reduce pressure or increase context cautiously. Check `results.json` → `trials[].calls[]` for `visible_output_chars`, `reasoning_output_chars`, `reasoning_tokens`, `requested_reasoning_effort` and `finish_reason`. Thinking *can* be hidden even when the API does not report separate reasoning tokens.
+
+The additional `compiled_report` field is assembled by the benchmark after verifying repairs in its simulator. It is **not** scored as a successful *model* final report; it simply lets you see whether repair work was completed even when the AI's JSON failed.
+
 ## 5. Longer run (three competitors)
 
 ```bash
