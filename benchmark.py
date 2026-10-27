@@ -583,6 +583,8 @@ def arguments(argv=None):
     parser.add_argument("--modes", choices=("linear", "summarized", "branch", "recursive"),
                         nargs="+", default=["linear", "summarized", "branch"],
                         help="Competitors to run; add recursive for controlled nested branching (repair only)")
+    parser.add_argument("--no-action-retries", type=int, default=1,
+                        help="Retry invalid/empty investigation JSON action before spending a simulator action (0-2; default 1)")
     parser.add_argument("--recursive-max-depth", type=int, default=3,
                         help="Maximum child levels in controlled recursive mode (0-3, default 3)")
     parser.add_argument("--tasks", type=int, nargs="+", default=None, help="Archive: 3 6 8; repair: 1 2 4 by default")
@@ -663,6 +665,8 @@ def arguments(argv=None):
         parser.error("--modes must not contain duplicates")
     if "recursive" in args.modes and args.scenario != "repair":
         parser.error("--modes recursive is supported only for --scenario repair")
+    if not 0 <= args.no_action_retries <= 2:
+        parser.error("--no-action-retries must be 0-2")
     if not 0 <= args.recursive_max_depth <= 3:
         parser.error("--recursive-max-depth must be 0-3")
     if args.records < 2 or args.repeats < 1 or not args.tasks or any(n < 1 for n in args.tasks):
@@ -702,6 +706,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "mandatory_recovery": args.scenario == "repair",
                   "max_actions": args.max_actions if args.scenario == "repair" else None,
                   "modes": args.modes, "recursive_max_depth": args.recursive_max_depth,
+                  "no_action_retries": args.no_action_retries,
                   "summary_every": args.summary_every, "summary_max_chars": args.summary_max_chars,
                   "summary_output_tokens": args.summary_output_tokens,
                   "summary_retries": args.summary_retries,
@@ -727,6 +732,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "scenario", "trap_density", "trap_log_lines", "max_actions",
         "total_actions", "verified_cases", "invalid_actions", "wrong_repairs",
         "no_action_investigation_calls", "empty_investigation_replies",
+        "no_action_retry_attempts", "no_action_retry_recoveries", "no_action_retry_failures", "out_of_scope_actions",
         "recursive_branch_count", "recursive_context_count", "recursive_max_depth", "recursive_stage_successes", "recursive_stage_failures",
         "decoy_documents_opened", "trap_waste_chars",
         "recovery_log_lines", "recovery_completed", "recovery_attempts",
@@ -743,7 +749,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         writer.writerows(data)
 
     lines = [
-        "# Context Branch benchmark — four-strategy comparison (v1.3 / scoring v3)", "",
+        "# Context Branch benchmark — stage-scoped recursion and no-action recovery (v1.4.1 / scoring v3))", "",
         f"Scenario: **{args.scenario}** | Repair traps: density={args.trap_density}, "
         f"optional log lines={args.trap_log_lines}, required shard lines={args.recovery_log_lines}, "
         f"nested depth={args.nested_depth}, nested lines={args.nested_log_lines}, "
@@ -796,6 +802,19 @@ def write_files(directory, data, cfg, args, reset_events=None):
                              f"| {sum(r.get('reasoning_only_calls', 0) for r in rows)} |")
     lines += ["", "Final-output retries run against the SAME model history and count toward total inference work. "
               "Compiled/verified outputs (if present) are orchestrator-generated and are NOT counted as model final-report success."]
+    if args.scenario == "repair":
+        lines += ["", "## Stage scope and no-action recovery", "",
+                  "| Tasks | Mode | Rejected wrong-stage actions | No-action responses | Retries | Recovered on retry | Failed retries |",
+                  "|---:|---|---:|---:|---:|---:|---:|"]
+        for n in args.tasks:
+            for mode in args.modes:
+                rows = [r for r in data if r["tasks"] == n and r["mode"] == mode]
+                if rows:
+                    lines.append(f"| {n} | {mode} | {sum(r.get('out_of_scope_actions', 0) for r in rows)} "
+                                 f"| {sum(r.get('no_action_investigation_calls', 0) for r in rows)} "
+                                 f"| {sum(r.get('no_action_retry_attempts', 0) for r in rows)} "
+                                 f"| {sum(r.get('no_action_retry_recoveries', 0) for r in rows)} "
+                                 f"| {sum(r.get('no_action_retry_failures', 0) for r in rows)} |")
     policy = (("fresh dedicated llama.cpp process per trial" if not args.reuse_llama else "reuse dedicated llama.cpp process")
               if args.engine == "llama" else
               "every trial" if args.restart_jan_between_trials else
@@ -1022,6 +1041,7 @@ def main(argv=None):
             print(f"Jan connection error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
     cfg["_recursive_max_depth"] = args.recursive_max_depth
+    cfg["_no_action_retries"] = args.no_action_retries
     cfg["_final_output_tokens"] = args.final_output_tokens
     cfg["_final_retries"] = args.final_retries
     cfg["_summary_output_tokens"] = args.summary_output_tokens
