@@ -596,6 +596,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "recursive_branch_count": 0, "recursive_context_count": 0,
         "recursive_max_depth": 0, "recursive_stage_successes": 0,
         "recursive_stage_failures": 0, "recursive_events": [],
+        "recursive_checkpoints": 0, "recursive_checkpoint_blocked": 0,
+        "partial_failure": False, "interrupted_batch": None,
         "nested_depth": nested_depth, "nested_log_lines": nested_log_lines,
         "pressure_records": pressure_records, "pressure_detail_chars": pressure_detail_chars,
         "pressure_generated_chars": sum(sum(c["pressure_deltas"].values()) for c in puzzle["cases"]),
@@ -657,6 +659,9 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                     max((e["depth"] for e in recursive_events), default=0))
                 result["recursive_stage_successes"] += sum(e["completed"] for e in recursive_events)
                 result["recursive_stage_failures"] += sum(not e["completed"] for e in recursive_events)
+                result["recursive_checkpoints"] += sum(e.get("context_checkpoints", 0) for e in recursive_events)
+                result["recursive_checkpoint_blocked"] += sum(
+                    bool(e.get("context_checkpoint_blocked")) for e in recursive_events)
             for _ in range(0 if mode == "recursive" else max_actions):
                 phase = "branch_investigate" if mode == "branch" else "parent_investigate"
                 action, answer, retry_stats = request_investigation_action(
@@ -823,6 +828,9 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                     max((e["depth"] for e in recursive_events), default=0))
                 result["recursive_stage_successes"] += sum(e["completed"] for e in recursive_events)
                 result["recursive_stage_failures"] += sum(not e["completed"] for e in recursive_events)
+                result["recursive_checkpoints"] += sum(e.get("context_checkpoints", 0) for e in recursive_events)
+                result["recursive_checkpoint_blocked"] += sum(
+                    bool(e.get("context_checkpoint_blocked")) for e in recursive_events)
                 result["out_of_scope_actions"] += sum(e["rejected_out_of_scope"] for e in recursive_events)
                 result["no_action_investigation_calls"] += retry_stats["no_actions"]
                 result["no_action_retry_attempts"] += retry_stats["retries"]
