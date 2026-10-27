@@ -1,5 +1,6 @@
 """Offline protocol/scoring smoke test. These are NOT model-performance results."""
 import json
+import os
 from pathlib import Path
 import re
 import tempfile
@@ -392,6 +393,56 @@ class ScoringV2Tests(unittest.TestCase):
             self.assertIn('Direct lookups correct / attempted', summary)
             self.assertIn('final_status', csv_file)
             self.assertIn('visible_seals_correct', csv_file)
+
+
+class LocalModelPathTests(unittest.TestCase):
+    """Machine-specific settings must not break default Jan mode or CLI overrides."""
+
+    def test_gguf_path_loaded_from_local_json_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm, "ROOT", Path(tmp)), \
+             patch.dict(os.environ, {"CONTEXT_BRANCH_MODEL": ""}):
+            file = Path(tmp) / "local_model.json"
+            file.write_text(json.dumps({"MODEL_PATH": "/mnt/My Models/Qwen3.5-9B.gguf"}))
+            args = bm.arguments(["--engine", "llama", "--dry-run"])
+            self.assertEqual(args.llama_model, "/mnt/My Models/Qwen3.5-9B.gguf")
+
+    def test_explicit_cli_path_overrides_environment_and_file(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm, "ROOT", Path(tmp)), \
+             patch.dict(os.environ, {"CONTEXT_BRANCH_MODEL": "/models/env.gguf"}):
+            (Path(tmp) / "local_model.json").write_text('{"MODEL_PATH": "/models/file.gguf"}')
+            args = bm.arguments(["--engine", "llama", "--llama-model", "/models/cli.gguf"])
+            self.assertEqual(args.llama_model, "/models/cli.gguf")
+
+    def test_environment_overrides_local_file(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm, "ROOT", Path(tmp)), \
+             patch.dict(os.environ, {"CONTEXT_BRANCH_MODEL": "/models/env.gguf"}):
+            (Path(tmp) / "local_model.json").write_text('{"MODEL_PATH": "/models/file.gguf"}')
+            args = bm.arguments(["--engine", "llama"])
+            self.assertEqual(args.llama_model, "/models/env.gguf")
+
+    def test_missing_or_empty_local_config_requires_path_at_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm, "ROOT", Path(tmp)), \
+             patch.dict(os.environ, {"CONTEXT_BRANCH_MODEL": ""}):
+            self.assertIsNone(bm.arguments(["--engine", "llama"]).llama_model)
+            (Path(tmp) / "local_model.json").write_text('{"MODEL_PATH": ""}')
+            self.assertIsNone(bm.arguments(["--engine", "llama"]).llama_model)
+
+    def test_invalid_config_fails_clearly_but_jan_ignores_it(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm, "ROOT", Path(tmp)), \
+             patch.dict(os.environ, {"CONTEXT_BRANCH_MODEL": ""}):
+            file = Path(tmp) / "local_model.json"
+            file.write_text('{"MODEL_PATH": 5}')
+            with self.assertRaises(SystemExit) as err:
+                bm.arguments(["--engine", "llama"])
+            self.assertEqual(err.exception.code, 2)
+            self.assertIsNone(bm.arguments(["--engine", "jan"]).llama_model)
+            self.assertEqual(bm.arguments(["--engine", "llama",
+                                           "--llama-model", "/models/override.gguf"]).llama_model,
+                             "/models/override.gguf")
+            file.write_text("{broken json")
+            with self.assertRaises(SystemExit) as err:
+                bm.arguments(["--engine", "llama"])
+            self.assertEqual(err.exception.code, 2)
 
 
 class ReportingTests(unittest.TestCase):
