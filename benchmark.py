@@ -101,6 +101,9 @@ class Trace:
             "elapsed_seconds": None, "prompt_tokens": None,
             "completion_tokens": None, "completion_est_tokens": None,
             "requested_max_tokens": payload.get("max_tokens"), "finish_reason": None, "error": None,
+            "requested_reasoning_effort": payload.get("reasoning_effort"),
+            "visible_output_chars": None, "reasoning_output_chars": None,
+            "reasoning_tokens": None, "empty_visible_output": None,
         }
         try:
             response = self.api(method, url, cfg, payload)
@@ -110,6 +113,18 @@ class Trace:
             choice = (response.get("choices") or [{}])[0]
             message = choice.get("message") or {}
             row["finish_reason"] = choice.get("finish_reason")
+            content = message.get("content") or ""
+            if isinstance(content, list):
+                content = "".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
+            reason = message.get("reasoning_content") or ""
+            if isinstance(reason, list):
+                reason = "".join(str(x.get("text", "")) for x in reason if isinstance(x, dict))
+            row["visible_output_chars"] = len(str(content))
+            row["reasoning_output_chars"] = len(str(reason))
+            # Some servers report reasoning tokens but omit the reasoning text.
+            details = usage.get("completion_tokens_details") or {}
+            row["reasoning_tokens"] = details.get("reasoning_tokens") if isinstance(details, dict) else None
+            row["empty_visible_output"] = not bool(str(content).strip())
             row["completion_est_tokens"] = approximate_tokens(message)
             return response
         except Exception as exc:
@@ -131,7 +146,12 @@ class Trace:
             "total_processed_tokens": total_prompt + total_completion,
             "token_counts_exact_from_api": actual_usage,
             "api_calls": len(self.calls), "api_error_calls": sum(bool(r["error"]) for r in self.calls),
-            "length_stops": sum(r["finish_reason"] == "length" for r in self.calls)
+            "length_stops": sum(r["finish_reason"] == "length" for r in self.calls),
+            "empty_visible_calls": sum(r["empty_visible_output"] is True for r in self.calls),
+            "reported_reasoning_tokens": sum(r["reasoning_tokens"] or 0 for r in self.calls),
+            "reasoning_only_calls": sum(r["empty_visible_output"] is True and
+                ((r["reasoning_output_chars"] or 0) > 0 or (r["reasoning_tokens"] or 0) > 0)
+                for r in self.calls),
         }
 
 
@@ -306,12 +326,49 @@ def classify_exception(exc):
     return 'api_or_runtime_error'
 
 
-def call_parent(cfg, model, messages):
-    result = bc.chat(cfg, model, messages)
+def call_parent(cfg, model, messages, *, reporting=False, final=False):
+    # Reporting is deliberately separate from the model's investigative policy.
+    # No-thinking is requested only for simple ACK/final JSON calls. Backends
+    # may ignore reasoning_effort; recorded output diagnostics reveal that.
+    request_cfg = cfg
+    if final and cfg.get("_final_output_tokens") is not None:
+        request_cfg = dict(cfg)
+        request_cfg["max_output_tokens"] = cfg["_final_output_tokens"]
+    effort = cfg.get("_report_reasoning_effort") if reporting else None
+    result = bc.chat(request_cfg, model, messages, reasoning_effort=effort)
     content = result.get("content") or ""
     if isinstance(content, list):
         content = "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
     return str(content)
+
+
+def model_final_report(cfg, model, messages, trace, expected, mission, control):
+    """Score the model's actual report; retry only unfinished output.
+
+    Retries use the *same* accumulated conversation, never oracle answers,
+    and their inference work is included in token/time measurements.
+    """
+    trace.phase = "parent_final"
+    final = call_parent(cfg, model, messages, reporting=True, final=True)
+    first = score_final_report(final, expected, mission, control, trace.calls[-1])
+    attempts = 1
+    scored = first
+    max_retries = cfg.get("_final_retries", 0)
+    while (not scored["exact_final"] and attempts <= max_retries and
+           (scored["final_output_truncation"] != "none" or not final.strip())):
+        trace.phase = "parent_final_retry"
+        retry_messages = messages + [{"role": "user", "content": (
+            "The final report was not completed. Output ONLY the requested compact "
+            "JSON object immediately. No analysis or commentary. Retain the original "
+            "mission_id and control_code and all verified seals in their original batches.")}]
+        final = call_parent(cfg, model, retry_messages, reporting=True, final=True)
+        attempts += 1
+        scored = score_final_report(final, expected, mission, control, trace.calls[-1])
+    scored["final_attempts"] = attempts
+    scored["final_first_status"] = first["final_status"]
+    scored["final_recovered_on_retry"] = attempts > 1 and scored["exact_final"]
+    scored["raw_final_excerpt"] = final[:1500]
+    return scored
 
 
 SUMMARY_REQUEST = (
@@ -405,7 +462,7 @@ def run_trial(mode, seed, tasks, records, cfg, model, context_limit, save_dir,
                               "result": isolated.get("result"), "caveats": isolated.get("caveats")}
                 messages.append({"role": "user", "content": "Isolated lookup finished. Keep this compact outcome for the final report: "
                                  + json.dumps(compressed) + "\nReply ONLY READY; do not output a report yet."})
-                ack = call_parent(cfg, model, messages)
+                ack = call_parent(cfg, model, messages, reporting=True)
                 messages.append({"role": "assistant", "content": ack})
             result["reported_answers"][name] = answer
             result["lookup_breakdown"].append({
@@ -423,15 +480,13 @@ def run_trial(mode, seed, tasks, records, cfg, model, context_limit, save_dir,
                 result["summary_chars_peak"] = max(result["summary_chars_peak"], len(summary))
                 result["summaries"].append({"after_batch": name, "chars": len(summary), "text": summary})
         stage = "final_report"
-        trace.phase = "parent_final"
         messages.append({"role": "user", "content": (
             "FINAL REPORT. Assemble the audit report from the seals obtained in earlier steps. "
             "Give ONLY valid JSON with the exact keys mission_id, control_code, seals. "
             "Use the original instruction's mission and control values. Don't explain."
         )})
-        final = call_parent(cfg, model, messages)
-        result.update(score_final_report(final, expected, puzzle["mission"], puzzle["control"], trace.calls[-1]))
-        result["raw_final_excerpt"] = final[:1500]
+        result.update(model_final_report(cfg, model, messages, trace, expected,
+                                         puzzle["mission"], puzzle["control"]))
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
         result["error_type"] = ("summary_failed" if stage.startswith("summary:") and isinstance(exc, ValueError)
@@ -480,7 +535,11 @@ def arguments(argv=None):
     parser.add_argument("--repeats", type=int, default=2, help="Different seeds per task level (default 2)")
     parser.add_argument("--seed", type=int, default=20261026)
     parser.add_argument("--context-limit", type=int, default=8192, help="Context in tokens: passed to llama-server; for Jan used for reporting only")
-    parser.add_argument("--max-output-tokens", type=int, default=1024, help="Max generated tokens per Jan API call (default: 1024; applies equally to all modes)")
+    parser.add_argument("--max-output-tokens", type=int, default=1024, help="Investigation/summary output cap (default 1024; equal for all modes)")
+    parser.add_argument("--final-output-tokens", type=int, default=2048, help="Output cap for final reporting ONLY (default 2048)")
+    parser.add_argument("--final-retries", type=int, default=1, help="Retries for truncated or empty final report (default 1; retries counted in time/tokens)")
+    parser.add_argument("--report-reasoning", choices=("auto", "none"), default="none",
+                        help="Request no thinking on ACK/final reports with standalone llama.cpp (default none); investigation reasoning stays enabled")
     parser.add_argument("--summary-every", type=int, default=2, help="Summarize history after every N completed lookups, except after the last (default: 2)")
     parser.add_argument("--summary-max-chars", type=int, default=1800, help="Maximum length of each compact memory note (default: 1800 chars)")
     parser.add_argument("--trap-log-lines", type=int, default=32, help="Repair: non-authoritative log lines per trap (default 32; 0-150)")
@@ -520,6 +579,8 @@ def arguments(argv=None):
         args.tasks, args.records, args.repeats = ([3], 12, 1) if args.scenario == "archive" else ([1], 12, 1)
     if not 64 <= args.max_output_tokens <= 4096:
         parser.error("--max-output-tokens must be between 64 and 4096")
+    if not 64 <= args.final_output_tokens <= 4096 or not 0 <= args.final_retries <= 2:
+        parser.error("--final-output-tokens must be 64-4096 and --final-retries 0-2")
     if args.summary_every < 1 or not 100 <= args.summary_max_chars <= 10000:
         parser.error("--summary-every must be >= 1 and --summary-max-chars between 100 and 10000")
     if (not 0 <= args.trap_log_lines <= 150 or not 0 <= args.recovery_log_lines <= 120
@@ -548,9 +609,13 @@ def write_files(directory, data, cfg, args, reset_events=None):
         json.dump({"metadata": {"model": data[0]["model"] if data else "unknown", "tasks": args.tasks,
                   "records": args.records, "repeats": args.repeats, "context_limit": args.context_limit,
                   "token_count_note": "Exact only when token_counts_exact_from_api=true; otherwise heuristic chars/4",
-                  "max_output_tokens": args.max_output_tokens, "seed": args.seed,
+                  "max_output_tokens": args.max_output_tokens,
+                  "final_output_tokens": args.final_output_tokens,
+                  "final_retries": args.final_retries,
+                  "report_reasoning": args.report_reasoning if args.engine == "llama" else "auto",
+                  "seed": args.seed,
                   "scoring_version": 3,
-                  "benchmark_version": "1.1.0", "scenario": args.scenario,
+                  "benchmark_version": "1.2.0", "scenario": args.scenario,
                   "engine": args.engine,
                   "llama_reset_policy": ("reuse" if args.reuse_llama else "fresh_each_trial") if args.engine == "llama" else None,
                   "jan_reset_policy": (("each_trial" if args.restart_jan_between_trials else
@@ -576,12 +641,15 @@ def write_files(directory, data, cfg, args, reset_events=None):
     columns = [
         "mode", "seed", "tasks", "records_per_task", "model", "configured_context_limit", "max_output_tokens",
         "exact_final", "final_status", "final_json_valid", "final_output_truncation", "final_stop_reason",
+        "final_attempts", "final_first_status", "final_recovered_on_retry",
+        "compiled_verified_cases", "compiled_report_complete",
         "mission_ok", "control_ok", "visible_mission_ok", "visible_control_ok",
         "subtask_accuracy", "solved_subtasks", "final_recovered_subtasks", "any_stage_seals_correct",
         "final_seals_correct", "visible_seals_correct", "visible_seals_count", "final_seals_total",
         "peak_main_prompt_tokens", "peak_branch_prompt_tokens", "input_over_limit_risk",
         "total_prompt_tokens", "total_completion_tokens", "total_processed_tokens", "token_counts_exact_from_api",
         "elapsed_seconds", "api_calls", "api_error_calls", "length_stops",
+        "empty_visible_calls", "reasoning_only_calls", "reported_reasoning_tokens",
         "reset_before_trial", "reset_status", "reset_seconds", "reset_method", "reset_memory_before_mb",
         "reset_memory_after_unload_mb", "reset_memory_after_reload_mb",
         "summary_every", "summary_max_chars", "summaries_generated", "summary_chars_peak",
@@ -603,14 +671,15 @@ def write_files(directory, data, cfg, args, reset_events=None):
         writer.writerows(data)
 
     lines = [
-        "# Jan Branch Context benchmark — three-way comparison (v1.0 / scoring v3)", "",
+        "# Context Branch benchmark — three-way comparison (v1.2 / scoring v3)", "",
         f"Scenario: **{args.scenario}** | Repair traps: density={args.trap_density}, "
         f"optional log lines={args.trap_log_lines}, required shard lines={args.recovery_log_lines}, "
         f"nested depth={args.nested_depth}, nested lines={args.nested_log_lines}, "
         f"pressure rows/document={args.pressure_records}, metadata chars/row={args.pressure_detail_chars}, "
         f"max actions={args.max_actions}" if args.scenario == "repair" else "Scenario: archive retrieval", "",
         f"Model: `{data[0]['model'] if data else 'unknown'}` | Configured context: {args.context_limit} | "
-        f"Max output: {args.max_output_tokens} tokens/call | Trials completed/started: {len(data)}", "",
+        f"Investigation output: {args.max_output_tokens} | Final output: {args.final_output_tokens} "
+        f"| Trials completed/started: {len(data)}", "",
         "## Strict correctness and recoverable information", "",
         ("| Tasks | Mode | Valid complete reports | Verified incidents / attempted | " if args.scenario == "repair"
          else "| Tasks | Mode | Valid complete reports | Direct lookups correct / attempted | ")
@@ -631,6 +700,20 @@ def write_files(directory, data, cfg, args, reset_events=None):
                          f"{sum(r['summaries_generated'] for r in rows)} | "
                          f"{avg('peak_main_prompt_tokens')} | {avg('total_processed_tokens')} | "
                          f"{round(sum(r['elapsed_seconds'] for r in rows)/len(rows),1)} |")
+    lines += ["", "## Final-report diagnostics (model-generated reports only)", "",
+              "| Tasks | Mode | First report incomplete | Retried reports | Recovered via retry | Empty-content calls | Reasoning-only calls |",
+              "|---:|---|---:|---:|---:|---:|---:|"]
+    for n in args.tasks:
+        for mode in ("linear", "summarized", "branch"):
+            rows = [row for row in data if row["tasks"] == n and row["mode"] == mode]
+            if rows:
+                lines.append(f"| {n} | {mode} | {sum(r.get('final_first_status', 'success') != 'success' for r in rows)} "
+                             f"| {sum(r.get('final_attempts', 1) > 1 for r in rows)} "
+                             f"| {sum(bool(r.get('final_recovered_on_retry')) for r in rows)} "
+                             f"| {sum(r.get('empty_visible_calls', 0) for r in rows)} "
+                             f"| {sum(r.get('reasoning_only_calls', 0) for r in rows)} |")
+    lines += ["", "Final-output retries run against the SAME model history and count toward total inference work. "
+              "Compiled/verified outputs (if present) are orchestrator-generated and are NOT counted as model final-report success."]
     policy = (("fresh dedicated llama.cpp process per trial" if not args.reuse_llama else "reuse dedicated llama.cpp process")
               if args.engine == "llama" else
               "every trial" if args.restart_jan_between_trials else
@@ -845,6 +928,10 @@ def main(argv=None):
         except Exception as exc:
             print(f"Jan connection error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
+    cfg["_final_output_tokens"] = args.final_output_tokens
+    cfg["_final_retries"] = args.final_retries
+    # Per-request control is best-effort: older llama.cpp builds may ignore it.
+    cfg["_report_reasoning_effort"] = "none" if args.engine == "llama" and args.report_reasoning == "none" else None
     resetter = None
     if args.engine == "jan" and (args.restart_jan_between_trials or args.restart_jan_between_modes or args.check_jan_reset):
         try:
