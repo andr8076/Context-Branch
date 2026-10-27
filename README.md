@@ -1,3 +1,25 @@
+# New in v1.2: reliable reporting diagnostics and multi-repair comparison
+
+The dedicated llama.cpp benchmark now distinguishes **investigation** from **reporting** calls. By default, the investigation still uses normal model reasoning, while ACK and final-report calls request `reasoning_effort=none` (best effort; some older backends ignore the request). Final reports have a separate **2,048-token** cap and get one retry if output is empty or truncated. All requests, including retries, count toward runtime and token totals.
+
+`results.json`, `results.csv`, and `SUMMARY.md` separately expose empty visible responses, optional reported reasoning-token counts, first final-report outcome, final attempts, and retry recovery. The repair scenario also records an *orchestrator-compiled* report derived only from simulated VERIFIED outcomes. **That is not a model-generated report and never counts as strict final success.**
+
+```bash
+# One easy incident across all three methods
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --smoke --nested-depth 0 --pressure-records 0 \
+  --recovery-log-lines 8 --context-limit 8192
+
+# A meaningful comparison: 3 repairs per mode, summarized mode compacts after 2
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --tasks 3 --repeats 1 --nested-depth 0 \
+  --pressure-records 0 --recovery-log-lines 8 --context-limit 16384
+```
+
+`--report-reasoning auto` disables the per-request no-thinking hint if your llama.cpp build rejects or ignores it. `--final-output-tokens 2048` and `--final-retries 1` are configurable. Backend support for per-request reasoning is version/model dependent; the benchmark logs what it *requested*, not proof of compliance.
+
+---
+
 # New in v1.1: dedicated llama.cpp benchmark engine
 
 **Recommended for clean benchmarking:** use `--engine llama` to run a separate
