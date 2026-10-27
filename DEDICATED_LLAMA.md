@@ -1,3 +1,40 @@
+# One-time model path configuration
+
+Set the GGUF model path **once** on this computer, instead of passing `--llama-model "$MODEL"` with every benchmark:
+
+```bash
+cd ~/Documents/Github/Context-Branch
+cp local_model.example.json local_model.json
+nano local_model.json
+```
+
+Edit the `MODEL_PATH` variable to the **full path of your GGUF file** (including `.gguf`). For example:
+
+```json
+{
+  "MODEL_PATH": "/absolute/path/to/Qwen3.5-9B.gguf"
+}
+```
+
+The `local_model.json` file is Git-ignored so `git pull` won't overwrite your path. Spaces in file paths are supported. After saving, check the configuration without launching a server:
+
+```bash
+python3 benchmark.py --engine llama --check-llama-server
+```
+
+Your normal commands can now omit `--llama-model` entirely:
+
+```bash
+python3 benchmark.py --engine llama --scenario repair \
+  --modes branch recursive --tasks 1 --repeats 1 \
+  --context-limit 8192 --nested-depth 2 --nested-log-lines 8 \
+  --recovery-log-lines 8 --pressure-records 0 --max-actions 32
+```
+
+Priority when multiple paths are provided: **`--llama-model` argument → `CONTEXT_BRANCH_MODEL` environment variable → `MODEL_PATH` in `local_model.json`**. Jan mode is unaffected. You can override the configured model for one run with `--llama-model "/another/model.gguf"`.
+
+---
+
 ## v1.4.1: rerun the recursive handoff comparison
 
 ```bash
