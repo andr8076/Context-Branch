@@ -202,9 +202,10 @@ def create_trap_puzzle(seed, tasks, trap_log_lines=32, trap_density=2, recovery_
                 "5. STAGED routes are never valid, even if their certificates are valid.\n"
                 "6. Apply repair with exact release, route, certificate identifiers; then VERIFY.\n"
                 "Archived quick fixes, logs, and timestamp guesses have NO authority."
-                + ("\n7. EVIDENCE CHECK: inspect all five authoritative documents before submitting a repair: "
-                   "registry/releases, registry/approvals, network/aliases, network/routes, "
-                   "security/certificates. Unread evidence blocks repair." if pressure_records else "")
+                "\n7. EVIDENCE CHECK (ALWAYS REQUIRED): before submitting any repair, inspect "
+                "ALL FIVE authoritative documents for this incident: registry/releases, "
+                "registry/approvals, network/aliases, network/routes, security/certificates. "
+                "Unread evidence blocks repair regardless of pressure settings."
             ),
             "registry/releases": "RELEASE INVENTORY (not approval evidence):\n" + "\n".join(ordered_releases),
             "registry/approvals": "SIGNED-RELEASE LEDGER (authoritative):\n" + "\n".join(approvals),
@@ -490,11 +491,12 @@ class RepairSimulator:
             if not self.recovery_completed:
                 self.recovery_blocked += 1
                 text, label = "REPAIR BLOCKED: signed-release ledger is locked. Recover CURRENT shards first.", "repair_blocked"
-            elif self.case.get("pressure_records", 0) and len(self.authority_views) != 5:
+            elif len(self.authority_views) != 5:
                 self.authority_blocked += 1
                 text, label = (
-                    "REPAIR BLOCKED: read all five authoritative evidence documents "
-                    "(releases, approvals, aliases, routes, certificates) before repair.",
+                    "REPAIR BLOCKED: all five authoritative evidence documents must be inspected "
+                    "(registry/releases, registry/approvals, network/aliases, network/routes, "
+                    "security/certificates), regardless of pressure-record settings.",
                     "authority_unread")
             elif submitted == self.case["expected_repair"]:
                 self.applied = True
