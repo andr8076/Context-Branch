@@ -3,7 +3,7 @@
 Keep these three goals in scope while testing the architecture. They are separate
 experiments so improvements in one cannot disguise regressions in another.
 
-## 1. Recursive context branching — v1.4 (implemented as a controlled benchmark)
+## 1. Recursive context branching — v1.4.1 (controlled benchmark with strict stage handoffs)
 
 - **Current mechanism:** `--scenario repair --modes ... recursive` runs a
   benchmark-selected dependency tree: root repair → recovery → escrow → index.
@@ -20,6 +20,8 @@ experiments so improvements in one cannot disguise regressions in another.
 - **Next validation:** run the same seeded nested repair with `branch` and
   `recursive` at 8192 tokens. Repeat across several seeds. A branch that fails
   must not be labeled successful merely because its parent stayed small.
+
+**v1.4.1 completed:** stage-specific read/action allowlists, verified child-to-parent environment-state receipts, no child history sharing, and bounded no-action inference retry. A real Qwen rerun remains necessary.
 
 ## 2. Autonomous branch decisions — next (not implemented)
 
