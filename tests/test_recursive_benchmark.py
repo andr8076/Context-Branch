@@ -238,6 +238,103 @@ class RecursiveContextTests(unittest.TestCase):
             self.assertEqual(trial['invalid_actions'], 0)
             self.assertEqual(trial['total_actions'], 12)
 
+    def test_stage_start_only_initial_inspections_are_lightweight(self):
+        cfg = self.cfg()
+        cfg.update({'_stage_start_inspects': 2, '_stage_start_output_tokens': 192,
+                    '_stage_start_reasoning_effort': 'none'})
+        fake = RecursiveFakeJan()
+        observed = []
+        def spy(method, url, conf, payload=None):
+            if payload and 'RECURSIVE STAGE=' in payload['messages'][0]['content']:
+                stage = re.search(r'RECURSIVE STAGE=(\\w+)', payload['messages'][0]['content']).group(1)
+                observed.append((stage, payload['max_tokens'], payload.get('reasoning_effort')))
+            return fake(method, url, conf, payload)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', spy):
+            trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertEqual(trial['stage_start_calls'], 8)
+        self.assertEqual(trial['stage_start_empty_visible_calls'], 0)
+        self.assertGreater(trial['stage_start_total_tokens'], 0)
+        self.assertGreater(trial['stage_start_inference_seconds'], -1)
+        for stage in ('index', 'escrow', 'recovery', 'repair'):
+            calls = [pair[1:] for pair in observed if pair[0] == stage]
+            self.assertGreater(len(calls), 2, stage)
+            self.assertEqual(calls[:2], [(192, 'none'), (192, 'none')], stage)
+            self.assertTrue(all(c == (1024, None) for c in calls[2:]), stage)
+        for ev in trial['recursive_events'][0]['stages']:
+            self.assertEqual(ev['stage_start_inspections'], 2)
+            self.assertFalse(ev['stage_start_disabled'])
+
+    def test_stage_start_opt_out_is_identical_to_normal_reasoning(self):
+        cfg = self.cfg()
+        cfg.update({'_stage_start_inspects': 0, '_stage_start_output_tokens': 192,
+                    '_stage_start_reasoning_effort': 'none'})
+        fake = RecursiveFakeJan()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fake):
+            trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertEqual(trial['stage_start_calls'], 0)
+        self.assertTrue(all(v == 1024 for v in fake.limits
+                            if isinstance(v, int) and v != 2048))
+
+    def test_noninspect_action_disables_stage_start_before_complex_work(self):
+        cfg = self.cfg()
+        cfg.update({'_stage_start_inspects': 2, '_stage_start_output_tokens': 192,
+                    '_stage_start_reasoning_effort': 'none'})
+        fake = RecursiveFakeJan()
+        injected = [False]
+        def early_action(method, url, conf, payload=None):
+            if payload and not injected[0] and 'RECURSIVE STAGE=index' in payload['messages'][0]['content']:
+                previously_read_guide = any('{"action": "inspect", "path": "guide/index"}' in
+                                            m.get('content', '') for m in payload['messages'])
+                if previously_read_guide:
+                    injected[0] = True
+                    content = json.dumps({'action':'rebuild_index', 'token':'WRONG'})
+                    return {'choices':[{'message':{'content':content}, 'finish_reason':'stop'}],
+                            'usage':{'prompt_tokens':40,'completion_tokens':15}}
+            return fake(method, url, conf, payload)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', early_action):
+            trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertTrue(injected[0])
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        index = next(e for e in trial['recursive_events'][0]['stages'] if e['stage'] == 'index')
+        self.assertTrue(index['stage_start_disabled'])
+        self.assertEqual(index['stage_start_inspections'], 1)
+        self.assertEqual(trial['stage_start_calls'], 7)
+
+    def test_stage_start_empty_reply_uses_bounded_recovery(self):
+        cfg = self.cfg()
+        cfg.update({'_stage_start_inspects': 2, '_stage_start_output_tokens': 192,
+                    '_stage_start_reasoning_effort': 'none',
+                    '_no_action_retry_output_tokens': 256,
+                    '_no_action_retry_reasoning_effort': 'none'})
+        fake = RecursiveFakeJan()
+        injected = [False]
+        def empty_first(method, url, conf, payload=None):
+            if (payload and not injected[0] and
+                    'RECURSIVE STAGE=index' in payload['messages'][0]['content']):
+                injected[0] = True
+                return {'choices':[{'message':{'content':''}, 'finish_reason':'length'}],
+                        'usage':{'prompt_tokens':50,'completion_tokens':192}}
+            return fake(method, url, conf, payload)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', empty_first):
+            trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 8192,
+                                      Path(tmp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertTrue(injected[0])
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertEqual(trial['no_action_retry_recoveries'], 1)
+        self.assertEqual(trial['no_action_retry_attempts'], 1)
+        self.assertEqual(trial['stage_start_empty_visible_calls'], 1)
+        self.assertEqual(trial['stage_start_calls'], 8)
+        self.assertEqual(trial['invalid_actions'], 0)
+
     def test_cli_opt_in_and_archive_rejected(self):
         args=bm.arguments(['--scenario','repair','--tasks','1','--repeats','1',
                           '--modes','linear','summarized','branch','recursive'])
