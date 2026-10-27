@@ -292,13 +292,16 @@ def extract_lookup_answer(text):
 
 def classify_exception(exc):
     """Never claim definite context overflow/timeout from ambiguous errors."""
+    if getattr(exc, 'error_kind', None) == 'context_overflow_confirmed':
+        return 'context_overflow_confirmed'
     message = str(exc).lower()
     if any(s in message for s in ('context length', 'context window', 'context capacity', 'context overflow',
                                     'maximum context', 'prompt is too long', 'n_ctx', 'tokens exceed')):
         return 'context_overflow_confirmed'
     if isinstance(exc, TimeoutError) or ('timed out' in message and 'cannot reach' not in message):
         return 'timeout'
-    if 'cannot reach jan api (or request timed out)' in message:
+    if ('cannot reach jan api (or request timed out)' in message or
+        'cannot reach local inference api (or request timed out)' in message):
         return 'connection_or_timeout_unknown'
     return 'api_or_runtime_error'
 
@@ -509,7 +512,7 @@ def arguments(argv=None):
                         help="Only verify model router discovery, without unloading anything or running trials")
     parser.add_argument("--output", type=Path, default=None, help="Result folder; defaults to project/data/benchmarks/<UTC time>")
     parser.add_argument("--dry-run", action="store_true", help="Generate scenarios & validate constraints; no Jan connection")
-    parser.add_argument("--smoke", action="store_true", help="Tiny run: 3 tasks, 12 records, 1 repeat (exercises summarization with default cadence)")
+    parser.add_argument("--smoke", action="store_true", help="One repeat, 3 archive lookups or 1 repair per mode. Repair still uses selected trap/pressure settings.")
     args = parser.parse_args(argv)
     if args.tasks is None:
         args.tasks = [3, 6, 8] if args.scenario == "archive" else [1, 2, 4]
@@ -789,9 +792,16 @@ def main(argv=None):
             print(f"  Required evidence per incident: ~{required_chars//4:,} estimated tokens of text "
                   f"({required_chars:,} chars), largest document ~{largest_doc_chars//4:,} tokens; "
                   f"injected extra chars={sum(puzzle['cases'][0]['pressure_deltas'].values()):,}.", flush=True)
-            if required_chars // 4 > args.context_limit:
-                print("  WARNING: Required evidence alone exceeds the configured context. "
-                      "Branch mode isolates incidents, not nested steps; all modes may fail.", flush=True)
+            estimated_evidence = required_chars // 4
+            # This is intentionally conservative: 4 chars/token is only a rough estimate
+            # and excludes system instructions, actions, chat framing and prior responses.
+            if estimated_evidence + args.max_output_tokens >= args.context_limit * 0.8:
+                print("  WARNING: Mandatory evidence plus reserved output consumes much of the context budget "
+                      f"(~{estimated_evidence:,} + {args.max_output_tokens:,} estimated tokens, "
+                      f"before instructions/history; server limit {args.context_limit:,}). "
+                      "All three modes may hit HTTP 400 inside a single repair. "
+                      "Use smaller --recovery-log-lines / --pressure-records / --nested-depth, "
+                      "or increase --context-limit.", flush=True)
             print(f"Scenario OK: {n} simulated repairs; traps={args.trap_density}, optional lines={args.trap_log_lines}, mandatory shard lines={args.recovery_log_lines}; "
                   f"nested depth={args.nested_depth}, nested lines={args.nested_log_lines}, "
                   f"pressure records={args.pressure_records}, detail chars={args.pressure_detail_chars}, "
