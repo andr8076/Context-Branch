@@ -439,6 +439,94 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(outcome['total_completion_tokens'] > 2048, True)
         self.assertEqual(outcome['calls'][0]['requested_max_tokens'], 1024)
 
+    def test_empty_summary_retried_with_independent_budget(self):
+        # Reasoning-only response must not be used as a compact memory note.
+        base = SummarizationJan()
+        seen = []
+        summary_calls = 0
+
+        def fake(method, url, cfg, payload=None):
+            nonlocal summary_calls
+            if payload:
+                seen.append(payload)
+                if "PERIODIC CONTEXT COMPACTION" in payload["messages"][-1]["content"]:
+                    summary_calls += 1
+                    if summary_calls == 1:
+                        return {"choices": [{"message": {"content": "", "reasoning_content": "hidden"},
+                                             "finish_reason": "length"}],
+                                "usage": {"prompt_tokens": 600, "completion_tokens": 2048,
+                                          "completion_tokens_details": {"reasoning_tokens": 2048}}}
+            return base(method, url, cfg, payload)
+
+        cfg = self_cfg = dict(bm.bc.DEFAULTS)
+        self_cfg.update({"max_branch_depth": 0, "max_agent_turns": 1, "max_output_tokens": 1024,
+                         "_summary_output_tokens": 2048, "_summary_retries": 1,
+                         "_report_reasoning_effort": "none"})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, "http_json", fake):
+            outcome = bm.run_trial("summarized", 77, 3, 15, cfg, "mock", 8192, Path(tmp))
+        self.assertTrue(outcome["exact_final"], outcome["error"])
+        self.assertEqual(outcome["summaries_generated"], 1)
+        self.assertEqual(outcome["summary_attempts"], 2)
+        self.assertEqual(outcome["summary_retries"], 1)
+        self.assertEqual(outcome["summary_retry_recoveries"], 1)
+        self.assertEqual(outcome["summary_failures"], 0)
+        self.assertEqual(outcome["summary_events"][0]["first_status"], "empty")
+        self.assertEqual(outcome["summary_events"][0]["status"], "success")
+        calls = [c for c in outcome["calls"] if c["phase"].startswith("parent_summary")]
+        self.assertEqual([c["phase"] for c in calls], ["parent_summary", "parent_summary_retry"])
+        self.assertEqual([c["requested_max_tokens"] for c in calls], [2048, 2048])
+        self.assertTrue(all(c["requested_reasoning_effort"] == "none" for c in calls))
+        investigations = [x for x in seen if "INDEPENDENT ARCHIVE LOOKUP" in
+                          x["messages"][-1]["content"]]
+        self.assertTrue(investigations)
+        self.assertTrue(all(x.get("reasoning_effort") is None for x in investigations))
+        self.assertTrue(all(x["max_tokens"] == 1024 for x in investigations))
+
+    def test_nonempty_truncated_summary_is_not_accepted_without_retry(self):
+        base = SummarizationJan()
+        summary_calls = 0
+
+        def fake(method, url, cfg, payload=None):
+            nonlocal summary_calls
+            if payload and "PERIODIC CONTEXT COMPACTION" in payload["messages"][-1]["content"]:
+                summary_calls += 1
+                if summary_calls == 1:
+                    return {"choices": [{"message": {"content": "batch_1=SPARTIAL"},
+                                         "finish_reason": "length"}],
+                            "usage": {"prompt_tokens": 150, "completion_tokens": 2048}}
+            return base(method, url, cfg, payload)
+
+        cfg = dict(bm.bc.DEFAULTS)
+        cfg.update({"max_branch_depth": 0, "max_agent_turns": 1, "max_output_tokens": 1024,
+                    "_summary_output_tokens": 2048, "_summary_retries": 1})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, "http_json", fake):
+            result = bm.run_trial("summarized", 77, 3, 15, cfg, "mock", 8192, Path(tmp))
+        self.assertTrue(result["exact_final"], result["error"])
+        self.assertEqual(result["summary_events"][0]["first_status"], "truncated_confirmed")
+        self.assertTrue(result["summary_events"][0]["recovered_on_retry"])
+        self.assertNotIn("SPARTIAL", result["summaries"][0]["text"])
+
+    def test_unrecoverable_summary_fails_without_synthetic_memory(self):
+        base = SummarizationJan()
+
+        def fake(method, url, cfg, payload=None):
+            if payload and "PERIODIC CONTEXT COMPACTION" in payload["messages"][-1]["content"]:
+                return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                        "usage": {"prompt_tokens": 150, "completion_tokens": 2048}}
+            return base(method, url, cfg, payload)
+
+        cfg = dict(bm.bc.DEFAULTS)
+        cfg.update({"max_branch_depth": 0, "max_agent_turns": 1, "max_output_tokens": 1024,
+                    "_summary_output_tokens": 2048, "_summary_retries": 1})
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, "http_json", fake):
+            result = bm.run_trial("summarized", 77, 3, 15, cfg, "mock", 8192, Path(tmp))
+        self.assertEqual(result["final_status"], "not_attempted")
+        self.assertEqual(result["error_type"], "summary_failed")
+        self.assertEqual(result["summary_attempts"], 2)
+        self.assertEqual(result["summary_retries"], 1)
+        self.assertEqual(result["summary_failures"], 1)
+        self.assertEqual(result["summaries_generated"], 0)
+
     def test_report_mode_preserves_investigation_reasoning(self):
         seen = []
         fake_model = FakeJan()
@@ -467,6 +555,10 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(args.tasks, [3])
         self.assertEqual(args.report_reasoning, 'none')
         self.assertEqual(args.final_output_tokens, 2048)
+        self.assertEqual(args.summary_output_tokens, 2048)
+        self.assertEqual(args.summary_retries, 1)
+        custom = bm.arguments(['--dry-run', '--summary-output-tokens', '3072', '--summary-retries', '0'])
+        self.assertEqual((custom.summary_output_tokens, custom.summary_retries), (3072, 0))
 
 
 if __name__ == '__main__':
