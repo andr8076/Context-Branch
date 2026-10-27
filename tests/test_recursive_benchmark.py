@@ -133,6 +133,32 @@ class RecursiveContextTests(unittest.TestCase):
         self.assertEqual(result['verified_cases'],0)
         self.assertEqual(result['recursive_events'][0]['stages'][-1]['status'],'depth_limit')
 
+    def test_empty_investigation_action_is_measured_not_fabricated(self):
+        fake = RecursiveFakeJan()
+        injected = False
+
+        def maybe_empty(method, url, cfg, payload=None):
+            nonlocal injected
+            if (payload and not injected
+                    and payload['messages'][0]['content'].startswith('RECURSIVE STAGE=')):
+                injected = True
+                return {'choices':[{'message':{'content':'', 'reasoning_content':'hidden reasoning'},
+                                    'finish_reason':'length'}],
+                        'usage':{'prompt_tokens':250, 'completion_tokens':1024,
+                                 'completion_tokens_details':{'reasoning_tokens':1024}}}
+            return fake(method, url, cfg, payload)
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, 'http_json', maybe_empty):
+            trial = tb.run_trap_trial(
+                'recursive', 17, 1, self.cfg(), 'mock', 8192, Path(temp), bm,
+                nested_depth=2, recovery_log_lines=8, nested_log_lines=8)
+        self.assertTrue(injected)
+        self.assertEqual(trial['no_action_investigation_calls'], 1)
+        self.assertEqual(trial['empty_investigation_replies'], 1)
+        self.assertEqual(trial['invalid_actions'], 1)
+        self.assertEqual(trial['verified_cases'], 1)
+        self.assertTrue(trial['exact_final'])
+
     def test_cli_opt_in_and_archive_rejected(self):
         args=bm.arguments(['--scenario','repair','--tasks','1','--repeats','1',
                           '--modes','linear','summarized','branch','recursive'])
