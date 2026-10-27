@@ -5,6 +5,7 @@ persists across private branch conversations; no oracle or child logs pass up.
 """
 from __future__ import annotations
 import re
+import json
 
 STAGE_GOALS = {
     'index': ('rebuild_index', 'Rebuild CURRENT index from the two index shards.'),
@@ -99,17 +100,64 @@ def stage_instruction(stage, depth):
             'Only the simulator can verify success.')
 
 
-def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_depth=3):
+def checkpoint_context(base_context, inspected, last_change):
+    """Rebuild a private conversation from exact, previously observed simulator output.
+
+    No oracle and no generated summary: previous observations remain verbatim.
+    Repeated document inspections are represented only once by path.
+    """
+    context = [dict(m) for m in base_context]
+    context.append({'role': 'user', 'content':
+                    'CONTEXT CHECKPOINT: The following simulator responses were observed '
+                    'earlier in this SAME stage. They are not new tool calls. '
+                    'Already inspected document paths are listed verbatim below. '
+                    'Do not reread them unless needed. Continue ONLY your current stage.'})
+    for path, observation in inspected.items():
+        context.extend((
+            {'role': 'assistant', 'content': json.dumps({'action': 'inspect', 'path': path})},
+            {'role': 'user', 'content': 'PREVIOUS SIMULATOR RESULT for ' + path +
+             ':\n' + observation},
+        ))
+    if last_change is not None:
+        action, observation = last_change
+        context.extend((
+            {'role': 'assistant', 'content': json.dumps(action)},
+            {'role': 'user', 'content': 'PREVIOUS SIMULATOR RESULT:\n' + observation},
+        ))
+    context.append({'role': 'user', 'content':
+                    'All above evidence is from completed simulator calls; continue '
+                    'without replaying completed actions. Output one permitted JSON action.'})
+    return context
+
+
+def estimated_prompt_tokens(bm, messages, last_prompt_tokens=None, last_prompt_estimate=None):
+    """Conservative prompt-size prediction calibrated by last API token count."""
+    estimate = bm.approximate_tokens(messages)
+    if last_prompt_tokens is not None and last_prompt_estimate is not None:
+        estimate = max(estimate, last_prompt_tokens +
+                       max(0, estimate - last_prompt_estimate))
+    return estimate
+
+
+def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_depth=3, context_limit=None):
     """Return (success, events, counters); shared action cap across all stages."""
     from trap_benchmark import request_investigation_action
     events = []
     counters = {'no_actions': 0, 'retries': 0, 'recoveries': 0, 'retry_failures': 0}
+    # Mutable references are retained by Trace if inference fails halfway through a stage.
+    trace.active_recursive_events = events
+    trace.active_recursive_counters = counters
+    checkpoint_threshold = cfg.get('_recursive_checkpoint_threshold', 0)
+    checkpoint_max = cfg.get('_recursive_checkpoint_max', 4)
+    context_limit = context_limit or cfg.get('_context_limit', 8192)
 
     def solve(stage, depth, parent):
         event = {'stage': stage, 'depth': depth, 'parent': parent,
                  'completed': False, 'model_actions': 0, 'status': 'blocked',
                  'rejected_out_of_scope': 0, 'handoff': None,
-                 'stage_start_inspections': 0, 'stage_start_disabled': False}
+                 'stage_start_inspections': 0, 'stage_start_disabled': False,
+                 'context_checkpoints': 0, 'checkpoint_details': [],
+                 'context_checkpoint_blocked': False}
         events.append(event)
         if depth > max_depth:
             event['status'] = 'depth_limit'
@@ -128,6 +176,11 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
                             f'SHARED ENVIRONMENT STATE: {receipt}. '
                             f'Now complete ONLY {stage}. Do not repeat the child investigation. '
                             f'You may inspect ONLY {", ".join(STAGE_PATHS[stage])}.'})
+        original_context = [dict(m) for m in context]
+        inspected = {}  # path -> exact last simulator response, not case['docs'] or oracle
+        last_change = None
+        last_prompt_tokens = None
+        last_prompt_estimate = None
         # Stage opening only requires the guide and first evidence lookup.
         # Ask the MODEL for these actions with a lightweight inference request.
         # All later evidence interpretation and repairs keep full reasoning.
@@ -137,9 +190,42 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
                         and not event['stage_start_disabled'])
             phase = (f'branch_recursive_{depth}_{stage}_stage_start' if starting
                      else f'branch_recursive_{depth}_{stage}')
-            action, answer, info = request_investigation_action(
-                cfg, model, context, trace, bm, phase=phase,
-                max_retries=cfg.get('_no_action_retries', 1))
+            budget = (cfg.get('_stage_start_output_tokens', cfg['max_output_tokens'])
+                      if starting else cfg['max_output_tokens'])
+            predicted = estimated_prompt_tokens(
+                bm, context, last_prompt_tokens, last_prompt_estimate)
+            before_tokens = predicted
+            if (checkpoint_threshold and event['context_checkpoints'] < checkpoint_max
+                    and predicted + budget + 256 >= int(context_limit * checkpoint_threshold)
+                    and (inspected or last_change is not None)):
+                shorter = checkpoint_context(original_context, inspected, last_change)
+                after_tokens = bm.approximate_tokens(shorter)
+                # Do not loop on a checkpoint that cannot actually reduce history.
+                if after_tokens + budget + 256 >= context_limit:
+                    event['context_checkpoint_blocked'] = True
+                    raise RuntimeError('Context checkpoint cannot fit unmodified observed evidence')
+                if after_tokens + 64 < predicted:
+                    context = shorter
+                    event['context_checkpoints'] += 1
+                    event['checkpoint_details'].append(
+                        {'before_est_tokens': before_tokens,
+                         'after_est_tokens': after_tokens,
+                         'documents_preserved': list(inspected),
+                         'retained_change': last_change is not None})
+                    last_prompt_tokens = None
+                    last_prompt_estimate = None
+                    # Following a checkpoint, the branch still has the same environment.
+            request_estimate = bm.approximate_tokens(context)
+            try:
+                action, answer, info = request_investigation_action(
+                    cfg, model, context, trace, bm, phase=phase,
+                    max_retries=cfg.get('_no_action_retries', 1))
+            except Exception:
+                event['status'] = 'inference_error'
+                raise
+            call = trace.calls[-1] if trace.calls else {}
+            last_prompt_tokens = call.get('prompt_tokens')
+            last_prompt_estimate = request_estimate
             counters['no_actions'] += info['no_actions']
             counters['retries'] += info['retries']
             counters['recoveries'] += info['recovered']
@@ -167,6 +253,10 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
                     elif action['path'] == 'guide/policy' and stage == 'repair':
                         observation = stage_policy(case)
             event['model_actions'] += 1
+            if in_scope_inspect:
+                inspected[action['path']] = observation
+            elif action is not None and not (action['action'] == 'inspect'):
+                last_change = (action, observation)
             context.append({'role': 'user', 'content':
                             'SIMULATOR RESULT:\n' + observation +
                             f'\nContinue ONLY {stage}. Output one permitted JSON action.'})
