@@ -342,7 +342,19 @@ class RecursiveContextTests(unittest.TestCase):
                     '_stage_start_inspects': 2,
                     '_stage_start_output_tokens': 256})
         fake = RecursiveFakeJan()
-        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fake):
+        extra_reads = [0]
+        def repeated_read(method, url, conf, payload=None):
+            if payload and 'RECURSIVE STAGE=repair' in payload['messages'][0]['content']:
+                read_guide = any(tb.parse_action(m['content']) == {'action': 'inspect',
+                                  'path': 'guide/index'} for m in payload['messages']
+                                  if m['role'] == 'assistant')
+                if read_guide and extra_reads[0] < 6:
+                    extra_reads[0] += 1
+                    answer = json.dumps({'action':'inspect', 'path':'guide/index'})
+                    return {'choices':[{'message':{'content':answer}, 'finish_reason':'stop'}],
+                            'usage':{'prompt_tokens':90,'completion_tokens':16}}
+            return fake(method, url, conf, payload)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', repeated_read):
             trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 4096,
                                       Path(tmp), bm, nested_depth=2,
                                       recovery_log_lines=8, nested_log_lines=8)
