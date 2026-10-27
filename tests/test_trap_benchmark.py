@@ -201,6 +201,9 @@ class TrapBenchmarkTests(unittest.TestCase):
         sim.step({"action": "inspect", "path": "recovery/shard-a"})
         sim.step({"action": "inspect", "path": "recovery/shard-b"})
         sim.step({"action": "recover", "token": case["recovery_token"]})
+        for doc in ("registry/releases", "registry/approvals", "network/aliases",
+                    "network/routes", "security/certificates"):
+            sim.step({"action": "inspect", "path": doc})
         reply = sim.step({"action": "repair", "release": "REL-BOGUS", "route": "ROUTE-BOGUS", "certificate": "CERT-BOGUS"})
         self.assertIn("REJECTED", reply)
         self.assertGreater(len(reply), 3000)
@@ -221,6 +224,9 @@ class TrapBenchmarkTests(unittest.TestCase):
         sim.step({"action": "inspect", "path": "recovery/shard-a"})
         sim.step({"action": "inspect", "path": "recovery/shard-b"})
         self.assertIn("RECOVERY COMPLETE", sim.step({"action": "recover", "token": case["recovery_token"]}))
+        for doc in ("registry/releases", "registry/approvals", "network/aliases",
+                    "network/routes", "security/certificates"):
+            sim.step({"action": "inspect", "path": doc})
         self.assertIn("APPLIED", sim.step({"action": "repair", **repair}))
         self.assertFalse(sim.verified)
         self.assertIn(case["seal"], sim.step({"action": "verify"}))
@@ -261,7 +267,7 @@ class TrapBenchmarkTests(unittest.TestCase):
             sim.step({"action": "inspect", "path": f"recovery/shard-{slot}"})
         self.assertIn("RECOVERY COMPLETE", sim.step({
             "action": "recover", "token": case["recovery_token"]}))
-        self.assertIn("REPAIR BLOCKED: read all five", sim.step({
+        self.assertIn("REPAIR BLOCKED: all five", sim.step({
             "action": "repair", **case["expected_repair"]}))
         self.assertEqual(sim.authority_blocked, 1)
         for path in ("registry/releases", "registry/approvals", "network/aliases",
@@ -431,6 +437,9 @@ class TrapBenchmarkTests(unittest.TestCase):
             self.assertIn("RECOVERY REJECTED", sim.step({"action": "recover", "token": "WRONG"}))
             self.assertIn("RECOVERY COMPLETE", sim.step({"action": "recover", "token": case["recovery_token"]}))
             self.assertIn("SIGNED-RELEASE LEDGER", sim.step({"action": "inspect", "path": "registry/approvals"}))
+            for doc in ("registry/releases", "network/aliases",
+                        "network/routes", "security/certificates"):
+                sim.step({"action": "inspect", "path": doc})
             self.assertIn("APPLIED", sim.step({"action": "repair", **case["expected_repair"]}))
             self.assertIn("VERIFIED", sim.step({"action": "verify"}))
             self.assertEqual(sim.recovery_failures, 3)
@@ -513,6 +522,9 @@ class TrapBenchmarkTests(unittest.TestCase):
         for path in ("recovery/shard-a", "recovery/shard-b"):
             self.assertIn("RECOVERY SHARD", sim.step({"action": "inspect", "path": path}))
         self.assertIn("RECOVERY COMPLETE", sim.step({"action": "recover", "token": case["recovery_token"]}))
+        for doc in ("registry/releases", "registry/approvals", "network/aliases",
+                    "network/routes", "security/certificates"):
+            sim.step({"action": "inspect", "path": doc})
         self.assertIn("APPLIED", sim.step({"action": "repair", **case["expected_repair"]}))
         self.assertIn("VERIFIED", sim.step({"action": "verify"}))
         self.assertEqual(sim.nested_completed, {"index", "escrow"})
