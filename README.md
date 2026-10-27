@@ -1,3 +1,28 @@
+# v1.4.1 — stricter recursion handoffs and no-action recovery
+
+After the first live Qwen recursive benchmark repeated completed index/escrow work, recursive stages now have **enforced action and document allowlists**, not just advice in a general prompt. Each stage sees only its own part of \`guide/index\` and its permitted documents. Out-of-scope actions are rejected by the simulator without applying their effects, and are counted against the shared action budget. This does not alter the simulator's authoritative facts.
+
+Verified handoffs now state exactly what environment state the child unlocked (for example, "index rebuilt; escrow shards unlocked"). Ancestors receive **no child transcripts, shard fragments, or oracle repair answers**. Each stage still runs in a private inference context, and all stages operate on the same simulator state.
+
+Any benchmark competitor in \`--scenario repair\` can retry an empty/malformed/non-action investigation response once before consuming one simulator action. Change this with \`--no-action-retries 0..2\` (default 1). Retries cost *real inference time and tokens*, and metrics include \`no_action_retry_attempts\`, \`no_action_retry_recoveries\`, \`no_action_retry_failures\` and \`out_of_scope_actions\`. If all retries fail, the model still consumes one invalid simulator action. It cannot loop without bounds.
+
+\`\`\`bash
+cd ~/Documents/Github/Context-Branch
+git pull --ff-only
+
+# Repeat the original branch-versus-recursive experiment on Qwen
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --modes branch recursive \
+  --tasks 1 --repeats 1 --seed 20261026 \
+  --context-limit 8192 --nested-depth 2 \
+  --nested-log-lines 8 --recovery-log-lines 8 \
+  --pressure-records 0 --max-actions 32 --no-action-retries 1
+\`\`\`
+
+**Next goal:** autonomous model-controlled branch selection. v1.4.1 remains controlled recursion; its changes must first be checked with a live Qwen run. Offline scripted-agent tests are not evidence of real-model accuracy.
+
+---
+
 # v1.4 — controlled recursive context branching
 
 A fourth, **opt-in** benchmark competitor, `recursive`, now splits a single
