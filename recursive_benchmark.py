@@ -108,7 +108,8 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
     def solve(stage, depth, parent):
         event = {'stage': stage, 'depth': depth, 'parent': parent,
                  'completed': False, 'model_actions': 0, 'status': 'blocked',
-                 'rejected_out_of_scope': 0, 'handoff': None}
+                 'rejected_out_of_scope': 0, 'handoff': None,
+                 'stage_start_inspections': 0, 'stage_start_disabled': False}
         events.append(event)
         if depth > max_depth:
             event['status'] = 'depth_limit'
@@ -127,16 +128,32 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
                             f'SHARED ENVIRONMENT STATE: {receipt}. '
                             f'Now complete ONLY {stage}. Do not repeat the child investigation. '
                             f'You may inspect ONLY {", ".join(STAGE_PATHS[stage])}.'})
+        # Stage opening only requires the guide and first evidence lookup.
+        # Ask the MODEL for these actions with a lightweight inference request.
+        # All later evidence interpretation and repairs keep full reasoning.
+        stage_start_limit = cfg.get('_stage_start_inspects', 0)
         while sim.actions < max_actions and not stage_done(stage, sim):
+            starting = (event['stage_start_inspections'] < stage_start_limit
+                        and not event['stage_start_disabled'])
+            phase = (f'branch_recursive_{depth}_{stage}_stage_start' if starting
+                     else f'branch_recursive_{depth}_{stage}')
             action, answer, info = request_investigation_action(
-                cfg, model, context, trace, bm,
-                phase=f'branch_recursive_{depth}_{stage}',
+                cfg, model, context, trace, bm, phase=phase,
                 max_retries=cfg.get('_no_action_retries', 1))
             counters['no_actions'] += info['no_actions']
             counters['retries'] += info['retries']
             counters['recoveries'] += info['recovered']
             counters['retry_failures'] += info['failed']
             context.append({'role': 'assistant', 'content': answer})
+            in_scope_inspect = (action is not None and action['action'] == 'inspect'
+                                and action.get('path') in STAGE_PATHS[stage])
+            if starting:
+                if in_scope_inspect:
+                    event['stage_start_inspections'] += 1
+                else:
+                    # Do not apply the cheap policy to complex or invalid actions.
+                    # The action still gets handled normally by the simulator.
+                    event['stage_start_disabled'] = True
             if action and (action['action'] not in STAGE_ACTIONS[stage] or
                            (action['action'] == 'inspect' and action.get('path') not in STAGE_PATHS[stage])):
                 event['rejected_out_of_scope'] += 1
