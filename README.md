@@ -1,3 +1,26 @@
+# New in v1.3: robust model-written summaries
+
+The **summarized** competitor now uses the same lightweight reporting policy as the final report. On standalone llama.cpp, periodic compaction requests ask for `reasoning_effort=none` (best effort), have a separate **2,048-token** generation budget, and are retried once if the first answer is empty or explicitly/suspected truncated. Investigation reasoning remains enabled.
+
+Use `--summary-output-tokens 2048`, `--summary-retries 1`, `--summary-max-chars 1800` and `--report-reasoning none` (the defaults for standalone mode). The size limit on the **retained memory** remains separate from the generation-token allowance. A completely produced summary that exceeds the memory budget still fails instead of silently trimming or inventing facts. If both requests fail, the trial is still marked `summary_failed`.
+
+`results.json` now records the first summary status, actual attempt count, retry recovery and model-call diagnostics; `results.csv` and `SUMMARY.md` expose counts. Every retry counts toward inference tokens and wall-clock time. The summarizer only sees the model's observed conversation, never the benchmark answer key; the original mission instructions are preserved unchanged.
+
+```bash
+cd ~/Documents/Github/Context-Branch
+git pull --ff-only
+
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --tasks 3 --repeats 1 \
+  --context-limit 16384 --nested-depth 0 \
+  --pressure-records 0 --recovery-log-lines 8 \
+  --summary-output-tokens 2048 --summary-retries 1
+```
+
+**Evidence caveat:** Offline regression tests cover these mechanics using fake inference responses. Real model behavior, including whether llama.cpp honors the no-reasoning hint, requires a fresh live benchmark.
+
+---
+
 # New in v1.2: reliable reporting diagnostics and multi-repair comparison
 
 The dedicated llama.cpp benchmark now distinguishes **investigation** from **reporting** calls. By default, the investigation still uses normal model reasoning, while ACK and final-report calls request `reasoning_effort=none` (best effort; some older backends ignore the request). Final reports have a separate **2,048-token** cap and get one retry if output is empty or truncated. All requests, including retries, count toward runtime and token totals.
