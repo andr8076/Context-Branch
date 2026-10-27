@@ -374,6 +374,13 @@ def classify_exception(exc):
 
 def call_parent(cfg, model, messages, *, reporting=False, final=False, summary=False,
                 no_action_retry=False):
+    # In the repair benchmark, Trace.phase marks recovery attempts explicitly.
+    # Recognize them without changing the virtual simulator's request protocol.
+    # Report/summary retries have different phases and must not be mistaken for actions.
+    phase = bc.http_json.phase if isinstance(bc.http_json, Trace) else ""
+    no_action_retry = no_action_retry or (phase.endswith("_retry") and
+        (phase.startswith("branch_recursive_") or phase in
+         ("branch_investigate_retry", "parent_investigate_retry")))
     # Preserve investigative reasoning. ACK, final report and compaction are
     # lightweight reporting tasks, so they may request no hidden reasoning.
     # This is best-effort: older inference servers may ignore the hint.
