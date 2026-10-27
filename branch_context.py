@@ -82,6 +82,50 @@ def config():
     return values
 
 
+class LocalAPIError(RuntimeError):
+    """Sanitized inference-server failure; never includes submitted prompts."""
+
+    def __init__(self, status, reason, kind="api_or_runtime_error"):
+        self.status_code = status
+        self.error_kind = kind
+        super().__init__(f"Local inference API returned HTTP {status}: {reason}")
+
+
+def _safe_api_error(ex):
+    """Classify a server response without disclosing its arbitrary error text.
+
+    Some server errors can echo request content (including private prompts).
+    Read a bounded body and only emit a predefined, non-secret diagnosis.
+    """
+    try:
+        raw = ex.read(4096).decode("utf-8", "replace")
+        parsed = json.loads(raw)
+        error = parsed.get("error", parsed) if isinstance(parsed, dict) else {}
+        if isinstance(error, dict):
+            description = str(error.get("message", ""))
+        elif isinstance(error, str):
+            description = error
+        else:
+            description = ""
+        message = description.lower()
+    except (OSError, UnicodeError, ValueError):
+        message = ""
+    if (any(word in message for word in ("context size", "context length", "context window", "context limit", "n_ctx", "kv cache", "context capacity"))
+            or ("token" in message and any(word in message for word in ("exceed", "too long", "too large", "not enough", "maximum")))):
+        return ("context budget exceeded; prompt and reserved generation tokens must fit within --context-limit. "
+                "Reduce repair evidence or increase --context-limit.", "context_overflow_confirmed")
+    if "model" in message and any(word in message for word in ("not found", "unknown", "invalid")):
+        return ("model ID rejected; verify /v1/models and the requested model.", "api_or_runtime_error")
+    if "json" in message and "invalid" in message:
+        return ("request JSON rejected; check server logs for the rejected field.", "api_or_runtime_error")
+    if ex.code == 400:
+        return ("request rejected; check the dedicated llama-server log in data/benchmarks/.../server_logs/ "
+                "for the precise cause (often context capacity or an unsupported parameter).", "api_or_runtime_error")
+    if ex.code in (401, 403):
+        return ("authentication rejected; check the configured inference endpoint and credentials.", "api_or_runtime_error")
+    return ("server rejected request; check its local server logs.", "api_or_runtime_error")
+
+
 def http_json(method, url, cfg, payload=None):
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if cfg["api_key"]:
@@ -92,10 +136,10 @@ def http_json(method, url, cfg, payload=None):
         with urlopen(req, timeout=cfg["request_timeout_seconds"]) as reply:
             return json.load(reply)
     except HTTPError as ex:
-        # Avoid echoing server responses: proxies could echo prompts/secrets.
-        raise RuntimeError(f"Jan API returned HTTP {ex.code}. Check model ID and API key.") from ex
+        reason, kind = _safe_api_error(ex)
+        raise LocalAPIError(ex.code, reason, kind) from ex
     except (URLError, TimeoutError) as ex:
-        raise RuntimeError("Cannot reach Jan API (or request timed out). Start Jan's Local API Server and check its model/timeout settings.") from ex
+        raise RuntimeError("Cannot reach local inference API (or request timed out). Check server health, address and timeout settings.") from ex
 
 
 def chosen_model(cfg):
