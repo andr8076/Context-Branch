@@ -152,9 +152,11 @@ def chosen_model(cfg):
     return ids[0]
 
 
-def chat(cfg, model, messages, tools=None):
+def chat(cfg, model, messages, tools=None, reasoning_effort=None):
     payload = {"model": model, "messages": messages,
                "stream": False, "max_tokens": cfg["max_output_tokens"], "temperature": 0.2}
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
