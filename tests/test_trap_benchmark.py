@@ -328,6 +328,44 @@ class TrapBenchmarkTests(unittest.TestCase):
         self.assertEqual(outputs[1]["summaries_generated"], 1)
         self.assertTrue(all(v == 1024 for v in fake.limits))
 
+    def test_repair_summary_empty_then_retry_succeeds(self):
+        # Regression: hidden reasoning previously consumed all summary output
+        # tokens, halting an otherwise correctly solved repair run.
+        scripted = DeliberateFakeJan()
+        summary_seen = 0
+        seen = []
+
+        def fake(method, url, cfg, payload=None):
+            nonlocal summary_seen
+            if payload:
+                seen.append(payload)
+                if "PERIODIC CONTEXT COMPACTION for simulated repair" in payload["messages"][-1]["content"]:
+                    summary_seen += 1
+                    if summary_seen == 1:
+                        return {"choices": [{"message": {"content": "", "reasoning_content": "hidden"},
+                                             "finish_reason": "length"}],
+                                "usage": {"prompt_tokens": 800, "completion_tokens": 2048,
+                                          "completion_tokens_details": {"reasoning_tokens": 2048}}}
+            return scripted(method, url, cfg, payload)
+
+        cfg = self.cfg()
+        cfg["_summary_output_tokens"] = 2048
+        cfg["_summary_retries"] = 1
+        cfg["_report_reasoning_effort"] = "none"
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, "http_json", fake):
+            result = tb.run_trap_trial("summarized", 17, 3, cfg, "fake-model", 8192, Path(tmp), bm,
+                                       summary_every=2, nested_depth=0)
+        self.assertEqual(result["verified_cases"], 3)
+        self.assertTrue(result["exact_final"], result["error"])
+        self.assertEqual(result["summaries_generated"], 1)
+        self.assertEqual(result["summary_attempts"], 2)
+        self.assertEqual(result["summary_retry_recoveries"], 1)
+        summary_api_calls = [c for c in seen
+                             if "PERIODIC CONTEXT COMPACTION" in c["messages"][-1]["content"]]
+        self.assertEqual(len(summary_api_calls), 2)
+        self.assertTrue(all(c["max_tokens"] == 2048 for c in summary_api_calls))
+        self.assertTrue(all(c.get("reasoning_effort") == "none" for c in summary_api_calls))
+
     def test_branch_isolation_and_summary_compaction(self):
         fake = DeliberateFakeJan()
         with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, "http_json", fake):
