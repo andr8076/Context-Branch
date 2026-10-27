@@ -580,6 +580,11 @@ def arguments(argv=None):
     parser.add_argument("--check-llama-server", action="store_true", help="Validate binary and model without starting the server or running trials")
     parser.add_argument("--reuse-llama", action="store_true", help="Opt out of fresh llama-server between trials (by default each trial uses a NEW process)")
     parser.add_argument("--scenario", choices=("archive", "repair"), default="archive", help="Archive lookups (legacy) or stateful repair traps (new)")
+    parser.add_argument("--modes", choices=("linear", "summarized", "branch", "recursive"),
+                        nargs="+", default=["linear", "summarized", "branch"],
+                        help="Competitors to run; add recursive for controlled nested branching (repair only)")
+    parser.add_argument("--recursive-max-depth", type=int, default=3,
+                        help="Maximum child levels in controlled recursive mode (0-3, default 3)")
     parser.add_argument("--tasks", type=int, nargs="+", default=None, help="Archive: 3 6 8; repair: 1 2 4 by default")
     parser.add_argument("--records", type=int, default=65, help="Rows in each archive (default 65)")
     parser.add_argument("--repeats", type=int, default=2, help="Different seeds per task level (default 2)")
@@ -654,6 +659,12 @@ def arguments(argv=None):
             args.jan_router_url = jan_reset.validate_router_url(args.jan_router_url)
         except jan_reset.ResetError as ex:
             parser.error(str(ex))
+    if len(set(args.modes)) != len(args.modes):
+        parser.error("--modes must not contain duplicates")
+    if "recursive" in args.modes and args.scenario != "repair":
+        parser.error("--modes recursive is supported only for --scenario repair")
+    if not 0 <= args.recursive_max_depth <= 3:
+        parser.error("--recursive-max-depth must be 0-3")
     if args.records < 2 or args.repeats < 1 or not args.tasks or any(n < 1 for n in args.tasks):
         parser.error("--tasks, --records, and --repeats must be positive (records >= 2)")
     return args
@@ -690,7 +701,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "pressure_detail_chars": args.pressure_detail_chars if args.scenario == "repair" else None,
                   "mandatory_recovery": args.scenario == "repair",
                   "max_actions": args.max_actions if args.scenario == "repair" else None,
-                  "modes": ["linear", "summarized", "branch"],
+                  "modes": args.modes, "recursive_max_depth": args.recursive_max_depth,
                   "summary_every": args.summary_every, "summary_max_chars": args.summary_max_chars,
                   "summary_output_tokens": args.summary_output_tokens,
                   "summary_retries": args.summary_retries,
@@ -715,6 +726,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "error_type", "failed_phase", "error",
         "scenario", "trap_density", "trap_log_lines", "max_actions",
         "total_actions", "verified_cases", "invalid_actions", "wrong_repairs",
+        "recursive_branch_count", "recursive_max_depth", "recursive_stage_successes", "recursive_stage_failures",
         "decoy_documents_opened", "trap_waste_chars",
         "recovery_log_lines", "recovery_completed", "recovery_attempts",
         "recovery_failures", "recovery_blocked", "recovery_shard_views", "forced_evidence_chars",
@@ -730,7 +742,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         writer.writerows(data)
 
     lines = [
-        "# Context Branch benchmark — three-way comparison (v1.3 / scoring v3)", "",
+        "# Context Branch benchmark — four-strategy comparison (v1.3 / scoring v3)", "",
         f"Scenario: **{args.scenario}** | Repair traps: density={args.trap_density}, "
         f"optional log lines={args.trap_log_lines}, required shard lines={args.recovery_log_lines}, "
         f"nested depth={args.nested_depth}, nested lines={args.nested_log_lines}, "
@@ -746,7 +758,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for n in args.tasks:
-        for mode in ("linear", "summarized", "branch"):
+        for mode in args.modes:
             rows = [r for r in data if r["tasks"] == n and r["mode"] == mode]
             if not rows:
                 continue
@@ -773,7 +785,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
               "| Tasks | Mode | First report incomplete | Retried reports | Recovered via retry | Empty-content calls | Reasoning-only calls |",
               "|---:|---|---:|---:|---:|---:|---:|"]
     for n in args.tasks:
-        for mode in ("linear", "summarized", "branch"):
+        for mode in args.modes:
             rows = [row for row in data if row["tasks"] == n and row["mode"] == mode]
             if rows:
                 lines.append(f"| {n} | {mode} | {sum(r.get('final_first_status', 'success') != 'success' for r in rows)} "
@@ -801,7 +813,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "| Tasks | Mode | Verified cases | Model actions | Wrong repairs | Decoy docs read | Trap output chars |",
                   "|---:|---|---:|---:|---:|---:|---:|"]
         for n in args.tasks:
-            for mode in ("linear", "summarized", "branch"):
+            for mode in args.modes:
                 rows = [r for r in data if r["tasks"] == n and r["mode"] == mode]
                 if rows:
                     lines.append(f"| {n} | {mode} | {sum(r['verified_cases'] for r in rows)}/{n * len(rows)} | "
@@ -816,7 +828,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "| Tasks | Mode | Unlocked cases | Shards read | Recovery attempts | Bad recovery | Blocked actions | Required evidence chars |",
                   "|---:|---|---:|---:|---:|---:|---:|---:|"]
         for n in args.tasks:
-            for mode in ("linear", "summarized", "branch"):
+            for mode in args.modes:
                 rows = [r for r in data if r["tasks"] == n and r["mode"] == mode]
                 if rows:
                     lines.append(f"| {n} | {mode} | {sum(r.get('recovery_completed', 0) for r in rows)}/{n * len(rows)} | "
@@ -834,7 +846,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                       "| Tasks | Mode | Index rebuilt | Escrow unlocked | Nested shards read | Nested evidence chars | Nested blocked | Failed index / escrow attempts |",
                       "|---:|---|---:|---:|---:|---:|---:|---:|"]
             for n in args.tasks:
-                for mode in ("linear", "summarized", "branch"):
+                for mode in args.modes:
                     rows = [r for r in data if r["tasks"] == n and r["mode"] == mode]
                     if rows:
                         lines.append(f"| {n} | {mode} | {sum(r.get('nested_index_completed', 0) for r in rows)} | "
@@ -855,7 +867,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "| Tasks | Mode | Extra chars generated | Extra chars actually viewed | Authority documents read | Authority evidence chars | Attempts blocked (unread evidence) |",
                   "|---:|---|---:|---:|---:|---:|---:|"]
         for n in args.tasks:
-            for mode in ("linear", "summarized", "branch"):
+            for mode in args.modes:
                 rows = [r for r in data if r["tasks"] == n and r["mode"] == mode]
                 if rows:
                     lines.append(f"| {n} | {mode} | {sum(r.get('pressure_generated_chars', 0) for r in rows)} | "
@@ -864,7 +876,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{sum(r.get('authority_evidence_chars', 0) for r in rows)} | "
                                  f"{sum(r.get('authority_blocked', 0) for r in rows)} |")
         lines += ["", "**Context-pressure caveat:** The benchmark does not rewind inside a repair; "
-                  "nested stages share a context even in branch mode. Very high pressure may exhaust "
+                  "nested stages share a context in ordinary branch mode, but recursive mode isolates each prerequisite. Very high pressure may exhaust "
                   "all modes. API token usage and actual truncation behavior depend on Jan.", ""]
         lines += ["", "A repair is counted as **verified** only after the AI successfully submits a policy-valid "
                   "release/route/certificate triple AND requests verification. A plausible written answer is not enough. "
@@ -880,7 +892,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "| Tasks | Mode | Outcome | Trials |", "|---:|---|---|---:|",
     ]
     for n in args.tasks:
-        for mode in ("linear", "summarized", "branch"):
+        for mode in args.modes:
             rows = [r for r in data if r["tasks"] == n and r["mode"] == mode]
             if not rows:
                 continue
@@ -998,6 +1010,7 @@ def main(argv=None):
         except Exception as exc:
             print(f"Jan connection error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
+    cfg["_recursive_max_depth"] = args.recursive_max_depth
     cfg["_final_output_tokens"] = args.final_output_tokens
     cfg["_final_retries"] = args.final_retries
     cfg["_summary_output_tokens"] = args.summary_output_tokens
@@ -1033,7 +1046,7 @@ def main(argv=None):
             managed_server.log_dir = output / "server_logs"
         for n, seed in combos:
             # Rotate the three competitors to limit warm-up and ordering bias.
-            ordered = ("linear", "summarized", "branch")
+            ordered = tuple(args.modes)
             offset = ((seed - args.seed - n * 313) // 10007) % len(ordered)
             modes = ordered[offset:] + ordered[:offset]
             for mode in modes:
