@@ -116,12 +116,12 @@ def checkpoint_context(base_context, inspected, last_change):
                  'not new tool actions):']
         for path, observation in inspected.items():
             cache.extend(('PATH: ' + path, observation))
-        context.append({'role': 'user', 'content': '\\n'.join(cache)})
+        context.append({'role': 'user', 'content': '\n'.join(cache)})
     if last_change is not None:
         action, observation = last_change
         context.extend((
             {'role': 'assistant', 'content': json.dumps(action)},
-            {'role': 'user', 'content': 'LAST ACTION RESULT:\\n' + observation},
+            {'role': 'user', 'content': 'LAST ACTION RESULT:\n' + observation},
         ))
     context.append({'role': 'user', 'content':
                     'Use the observed evidence above. Do not repeat completed '
