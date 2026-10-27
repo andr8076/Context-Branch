@@ -458,8 +458,8 @@ class ReportingTests(unittest.TestCase):
                                           "completion_tokens_details": {"reasoning_tokens": 2048}}}
             return base(method, url, cfg, payload)
 
-        cfg = self_cfg = dict(bm.bc.DEFAULTS)
-        self_cfg.update({"max_branch_depth": 0, "max_agent_turns": 1, "max_output_tokens": 1024,
+        cfg = dict(bm.bc.DEFAULTS)
+        cfg.update({"max_branch_depth": 0, "max_agent_turns": 1, "max_output_tokens": 1024,
                          "_summary_output_tokens": 2048, "_summary_retries": 1,
                          "_report_reasoning_effort": "none"})
         with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, "http_json", fake):
