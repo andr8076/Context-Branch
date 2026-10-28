@@ -156,7 +156,8 @@ python3 checkpoint_stress.py
 ```
 
 This measures the controlled recursive repair benchmark, which has its own
-simulator/action protocol. It does not measure these MCP run budgets or autonomous
-delegation decisions. Keep the two results separate. Evaluating the benefit of
-context isolation still needs repeated live runs and a matching stage-plan
-baseline; model-chosen branching remains a later benchmark milestone.
+simulator/action protocol. It does not measure these MCP run budgets. The repair
+benchmark's separate `autonomous` arm measures model-chosen delegation; the
+installed MCP runner remains a distinct live integration. Keep the two results
+separate. Evaluating the benefit of context isolation still needs repeated live
+runs and a matching stage-plan baseline.

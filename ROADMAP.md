@@ -7,8 +7,9 @@ model-reported handoffs. See [RUNTIME.md](RUNTIME.md) for settings and validatio
 
 Next: validate the runtime against the local Jan model; measure context isolation
 against a matched single-conversation stage plan across repeated live runs; then
-evaluate model-chosen branch decisions. The repair benchmark still selects its
-own dependency tree. Earlier milestone notes below describe their release scope.
+evaluate the new model-chosen delegation arm. The repair benchmark now contains
+both controlled recursion and an opt-in autonomous mode; neither is evidence of
+live Qwen behavior until run against the local model.
 
 ---
 
@@ -36,7 +37,8 @@ python3 benchmark.py --engine llama --scenario repair \
   --stage-start-inspects 2 --recursive-checkpoint-threshold 0.78
 ```
 
-No live Qwen improvement is claimed until this configuration is run. Autonomous branching is still a separate future milestone.
+No live Qwen improvement is claimed until this configuration is run. Autonomous
+branching has a separate benchmark arm and still needs live validation.
 
 ---
 
@@ -87,17 +89,32 @@ experiments so improvements in one cannot disguise regressions in another.
 
 **v1.4.1 completed:** stage-specific read/action allowlists, verified child-to-parent environment-state receipts, no child history sharing, and bounded no-action inference retry. A real Qwen rerun remains necessary.
 
-## 2. Autonomous branch decisions — next (not implemented)
+## 2. Autonomous branch decisions — benchmark slice implemented; live validation next
 
-- Let the local model choose **whether**, **when**, and **what** to delegate.
-  It should be free to continue in place and should explain only the minimal
-  input needed by a child (not its entire conversation).
-- Use an explicit delegate action with bounded depth, a maximum number of
-  children, a shared token/action budget, and a cycle/duplicate-subtask guard.
-- Keep simulator validation and environment state outside chat context.
-  Do not leak answers from the benchmark oracle or inject a correct branch plan.
-- Benchmark decisions against both always-linear and controlled recursion.
-  Measure unnecessary branches and missed opportunities, not just successes.
+- The opt-in `autonomous` repair mode lets the model choose **whether**, **when**,
+  and **what** to delegate with an explicit `delegate` action. The root may also
+  continue in place.
+- Delegated stages use private contexts and return only simulator-verified state
+  receipts. Depth, child count, shared action budget, lower-level ordering,
+  shared prompt/completion token budget, duplicate targets and cycles are
+  enforced by the harness.
+- Results record accepted/rejected/unnecessary delegations, missed opportunities,
+  branch count, context count, decisions and maximum depth. No benchmark oracle
+  or child transcript is injected into a parent.
+- Compare `linear`, `branch`, `recursive` and `autonomous` on the same seeds.
+  Offline scripted agents validate plumbing only; repeated live Qwen runs are
+  required before judging model behavior.
+
+Example:
+
+```bash
+python3 benchmark.py --engine llama --scenario repair \
+  --modes branch recursive autonomous --tasks 1 --repeats 3 \
+  --seed 20261026 --context-limit 8192 --nested-depth 2 \
+  --nested-log-lines 8 --recovery-log-lines 8 \
+  --pressure-records 0 --max-actions 32 \
+  --autonomous-max-children 8
+```
 
 ## 3. Investigation responses with no usable action — bounded recovery implemented
 

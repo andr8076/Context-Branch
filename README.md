@@ -70,7 +70,8 @@ python3 benchmark.py --engine llama --scenario repair \
   --stage-start-inspects 2 --recursive-checkpoint-threshold 0.78
 ```
 
-No live Qwen improvement is claimed until this configuration is run. Autonomous branching is still a separate future milestone.
+No live Qwen improvement is claimed until this configuration is run. Autonomous
+branching has a separate benchmark arm and still needs live validation.
 
 ---
 
@@ -154,7 +155,7 @@ python3 benchmark.py --engine llama --llama-model "$MODEL" \
   --pressure-records 0 --max-actions 32 --no-action-retries 1
 ```
 
-**Next goal:** autonomous model-controlled branch selection. v1.4.1 remains controlled recursion; its changes must first be checked with a live Qwen run. Offline scripted-agent tests are not evidence of real-model accuracy.
+**Next goal:** live validation of autonomous model-controlled branch selection. The opt-in `autonomous` repair arm now lets the model emit `delegate` actions or continue locally; depth, child count, shared action budget, duplicate/cycle guards and verified-only handoffs remain controller-enforced. Offline scripted-agent tests validate plumbing, not real-model accuracy.
 
 ---
 
@@ -198,11 +199,23 @@ the CSV includes spawned children, context count, peak recursion depth and stage
 outcomes. `no_action_investigation_calls` and `empty_investigation_replies`
 track the next reliability issue without silently changing how actions are scored.
 
-**Scope:** This is controlled *benchmark* recursion, not autonomous model-
-chosen delegation or recursive tool calls inside Jan. Offline simulator tests
+**Scope:** `recursive` is controlled *benchmark* recursion. The separate
+`autonomous` repair arm lets the model choose explicit lower-level delegation
+mid-incident and returns only verified simulator receipts. Neither arm operates
+real files, browsers, shell commands or credentials, and offline simulator tests
 prove plumbing and integrity but not real GPU/model accuracy. See
-[ROADMAP.md](ROADMAP.md) for all three development goals: recursive branching,
-autonomous branching, and no-action investigation recovery.
+[ROADMAP.md](ROADMAP.md) for the remaining live-validation work.
+
+```bash
+# Compare controlled and model-selected delegation on identical incidents
+python3 benchmark.py --engine llama --llama-model "$MODEL" \
+  --scenario repair --modes branch recursive autonomous \
+  --tasks 1 --repeats 3 --seed 20261026 \
+  --context-limit 8192 --nested-depth 2 \
+  --nested-log-lines 8 --recovery-log-lines 8 \
+  --pressure-records 0 --max-actions 32 \
+  --autonomous-max-children 8
+```
 
 ---
 
@@ -383,7 +396,7 @@ Examples:
 python3 benchmark.py --scenario repair --tasks 1 2 4 --dry-run \
   --pressure-records 4 --pressure-detail-chars 48
 
-# Smoke test: all three modes, one repair each
+# Smoke test: default modes, one repair each
 python3 benchmark.py --scenario repair --smoke
 
 # Main comparison with moderate pressure
@@ -397,7 +410,7 @@ python3 benchmark.py --scenario repair --tasks 1 2 4 --repeats 3 \
   --max-actions 32 --context-limit 8192
 ```
 
-**Integrity rules:** All three modes see the exact same seeded incident and extra rows. Pressure records are *not* operative instructions. The correct repair, recovery tokens, and verification seals are unchanged when you vary the pressure settings for the same seed. Pressure-enabled cases also require the agent to inspect all five authoritative sources before a repair can be accepted. Successful repairs still require actual `repair` and `verify` actions.
+**Integrity rules:** All selected modes see the exact same seeded incident and extra rows. Pressure records are *not* operative instructions. The correct repair, recovery tokens, and verification seals are unchanged when you vary the pressure settings for the same seed. Pressure-enabled cases also require the agent to inspect all five authoritative sources before a repair can be accepted. Successful repairs still require actual `repair` and `verify` actions.
 
 `results.csv`, `results.json`, and `SUMMARY.md` now include `pressure_generated_chars`, `pressure_evidence_chars` (actually viewed, uniquely per document), `authority_docs_viewed`, `authority_evidence_chars`, and `authority_blocked`. Dry runs estimate mandatory evidence size and warn when required text alone likely exceeds `--context-limit`.
 
@@ -464,7 +477,7 @@ There are now **two benchmark scenarios**, each comparing three strategies using
 
 The new `--scenario repair` is an **interactive stateful simulator**, not a static question. The model must inspect records, resolve contradictions, select a valid configuration, apply a **virtual** repair, and run `verify`. The simulator intentionally supplies misleading historical notes, old console shortcuts, unusable routes, conflicting release approvals, expired certificates, and noisy logs. A wrong repair generates a substantial log detour instead of giving the solution. Each case varies; the same repair cannot always be reused.
 
-**New in v0.7:** Every incident starts with a LOCKED authorization ledger. The model must inspect two noisy recovery shards, identify the *current* incident's fragments among misleading historical entries, combine the fragments in a randomized order, and submit a `recover` action. Until this is done, the simulator will refuse even an otherwise correct repair. This forces real investigative reading in **all three modes**, independently of whether they choose to inspect optional decoys.
+**New in v0.7:** Every incident starts with a LOCKED authorization ledger. The model must inspect two noisy recovery shards, identify the *current* incident's fragments among misleading historical entries, combine the fragments in a randomized order, and submit a `recover` action. Until this is done, the simulator will refuse even an otherwise correct repair. This forces real investigative reading in **all selected modes**, independently of whether they choose to inspect optional decoys.
 
 The volume of required noise is controlled separately with `--recovery-log-lines` (default 36 per shard). The results distinguish required evidence from wasted optional detours; they record recovered cases, recovery attempts, failed recovery actions, blocked actions, shard reads, and required evidence characters.
 
