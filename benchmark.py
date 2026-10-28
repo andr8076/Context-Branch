@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Reproducible Jan benchmark: archive lookups or interactive gated repair traps.
 
-Three controlled context modes: linear, periodic summaries and isolated branches.
-No autonomous branch selection is implied. Offline tests mock Jan, not its reasoning.
+Context modes include linear, periodic summaries, isolated branches, controlled
+recursion and an opt-in model-directed autonomous delegation arm. Offline tests
+mock Jan, not its reasoning.
 """
 from __future__ import annotations
 
@@ -654,9 +655,9 @@ def arguments(argv=None):
     parser.add_argument("--check-llama-server", action="store_true", help="Validate binary and model without starting the server or running trials")
     parser.add_argument("--reuse-llama", action="store_true", help="Opt out of fresh llama-server between trials (by default each trial uses a NEW process)")
     parser.add_argument("--scenario", choices=("archive", "repair"), default="archive", help="Archive lookups (legacy) or stateful repair traps (new)")
-    parser.add_argument("--modes", choices=("linear", "summarized", "branch", "recursive"),
+    parser.add_argument("--modes", choices=("linear", "summarized", "branch", "recursive", "autonomous"),
                         nargs="+", default=["linear", "summarized", "branch"],
-                        help="Competitors to run; add recursive for controlled nested branching (repair only)")
+                        help="Competitors to run; add recursive or autonomous nested branching (repair only)")
     parser.add_argument("--no-action-retries", type=int, default=1,
                         help="Retry invalid/empty investigation JSON action before spending a simulator action (0-2; default 1)")
     parser.add_argument("--no-action-retry-output-tokens", type=int, default=256,
@@ -674,7 +675,11 @@ def arguments(argv=None):
     parser.add_argument("--recursive-checkpoint-max", type=int, default=4,
                         help="Maximum evidence-preserving context checkpoints per recursive stage (0-12, default 4)")
     parser.add_argument("--recursive-max-depth", type=int, default=3,
-                        help="Maximum child levels in controlled recursive mode (0-3, default 3)")
+                        help="Maximum child levels in recursive/autonomous mode (0-3, default 3)")
+    parser.add_argument("--autonomous-max-children", type=int, default=8,
+                        help="Autonomous mode: maximum accepted child branches per incident (1-16, default 8)")
+    parser.add_argument("--autonomous-max-tokens", type=int, default=50000,
+                        help="Autonomous mode: shared prompt+completion token budget per incident (1024-200000, default 50000)")
     parser.add_argument("--tasks", type=int, nargs="+", default=None, help="Archive: 3 6 8; repair: 1 2 4 by default")
     parser.add_argument("--records", type=int, default=65, help="Rows in each archive (default 65)")
     parser.add_argument("--repeats", type=int, default=2, help="Different seeds per task level (default 2)")
@@ -756,8 +761,8 @@ def arguments(argv=None):
             parser.error(str(ex))
     if len(set(args.modes)) != len(args.modes):
         parser.error("--modes must not contain duplicates")
-    if "recursive" in args.modes and args.scenario != "repair":
-        parser.error("--modes recursive is supported only for --scenario repair")
+    if any(mode in args.modes for mode in ("recursive", "autonomous")) and args.scenario != "repair":
+        parser.error("--modes recursive/autonomous are supported only for --scenario repair")
     if not 0 <= args.no_action_retries <= 2:
         parser.error("--no-action-retries must be 0-2")
     if not 64 <= args.no_action_retry_output_tokens <= 4096:
@@ -772,6 +777,10 @@ def arguments(argv=None):
         parser.error("--recursive-checkpoint-max must be 0-12")
     if not 0 <= args.recursive_max_depth <= 3:
         parser.error("--recursive-max-depth must be 0-3")
+    if not 1 <= args.autonomous_max_children <= 16:
+        parser.error("--autonomous-max-children must be 1-16")
+    if not 1024 <= args.autonomous_max_tokens <= 200000:
+        parser.error("--autonomous-max-tokens must be 1024-200000")
     if args.records < 2 or args.repeats < 1 or not args.tasks or any(n < 1 for n in args.tasks):
         parser.error("--tasks, --records, and --repeats must be positive (records >= 2)")
     return args
@@ -811,6 +820,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "mandatory_recovery": args.scenario == "repair",
                   "max_actions": args.max_actions if args.scenario == "repair" else None,
                   "modes": args.modes, "recursive_max_depth": args.recursive_max_depth,
+                  "autonomous_max_children": args.autonomous_max_children,
+                  "autonomous_max_tokens": args.autonomous_max_tokens,
                   "recursive_checkpoint_threshold": args.recursive_checkpoint_threshold,
                   "recursive_checkpoint_max": args.recursive_checkpoint_max,
                   "stage_start_inspects": args.stage_start_inspects,
@@ -846,6 +857,11 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "partial_failure", "interrupted_batch",
         "recursive_checkpoints", "recursive_checkpoint_blocked",
         "recursive_checkpoint_compactions", "recursive_checkpoint_block_reasons",
+        "autonomous_delegate_attempts", "autonomous_delegations", "autonomous_delegate_rejections",
+        "autonomous_duplicate_delegations", "autonomous_unnecessary_delegations",
+        "autonomous_missed_opportunities", "autonomous_decisions",
+        "autonomous_tokens_used", "autonomous_token_budget",
+        "autonomous_branch_count", "autonomous_context_count", "autonomous_max_depth",
         "no_action_investigation_calls", "empty_investigation_replies",
         "no_action_retry_attempts", "no_action_retry_recoveries", "no_action_retry_failures", "out_of_scope_actions",
         "stage_start_calls", "stage_start_inference_seconds",
@@ -1044,6 +1060,26 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{sum(r.get('recursive_checkpoint_compactions', 0) for r in rows)} | "
                                  f"{sum(r.get('recursive_checkpoint_blocked', 0) for r in rows)} | "
                                  f"{', '.join(reasons) if reasons else '—'} |")
+        if "autonomous" in args.modes:
+            lines += ["", "## Autonomous delegation diagnostics", "",
+                      "The autonomous arm lets the model emit `delegate` actions. The harness validates "
+                      "stage availability, lower-level ordering, depth, child count, duplicate work and "
+                      "verified-only handoffs. A child transcript or simulator oracle never returns to its parent.", "",
+                      "| Tasks | Delegate attempts | Accepted branches | Rejections | Duplicate targets | Unnecessary targets | Missed opportunities | Decisions | Tokens / budget | Max depth |",
+                      "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+            for n in args.tasks:
+                rows = [r for r in data if r["tasks"] == n and r["mode"] == "autonomous"]
+                if rows:
+                    lines.append(f"| {n} | {sum(r.get('autonomous_delegate_attempts', 0) for r in rows)} | "
+                                 f"{sum(r.get('autonomous_delegations', 0) for r in rows)} | "
+                                 f"{sum(r.get('autonomous_delegate_rejections', 0) for r in rows)} | "
+                                 f"{sum(r.get('autonomous_duplicate_delegations', 0) for r in rows)} | "
+                                 f"{sum(r.get('autonomous_unnecessary_delegations', 0) for r in rows)} | "
+                                 f"{sum(r.get('autonomous_missed_opportunities', 0) for r in rows)} | "
+                                 f"{sum(r.get('autonomous_decisions', 0) for r in rows)} | "
+                                 f"{sum(r.get('autonomous_tokens_used', 0) for r in rows)} / "
+                                 f"{max((r.get('autonomous_token_budget', 0) for r in rows), default=0)} | "
+                                 f"{max((r.get('autonomous_max_depth', 0) for r in rows), default=0)} |")
         lines += ["", "A repair is counted as **verified** only after the AI successfully submits a policy-valid "
                   "release/route/certificate triple AND requests verification. A plausible written answer is not enough. "
                   "Wrong repairs return noisy simulator logs, costing context; decoy documents also add context. "
@@ -1087,17 +1123,17 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "- `summary_failed`: the summary stayed empty, truncated, or oversized after its retry allowance.",
         "", "**Token counts:** Actual Jan API `usage` when provided; otherwise rough chars/4 estimates, "
         "not tokenizer counts. Avoid comparing estimated and measured values as equivalent.",
-        "**Fairness:** Same model, seed, synthetic cases, final-answer criteria, and output cap across three modes. "
+        "**Fairness:** Same model, seed, synthetic cases, final-answer criteria, and output cap across selected modes. "
         "Summarization uses real extra Jan inference calls, counted in time and token totals. The same original "
-        "instructions are protected in all three modes; summarized mode must retain the seals in its model-written notes. "
-        "Model sampling can still vary; compare multiple seeds/repeats. Branch selection is controlled, not autonomous.",
+        "instructions are protected in all selected modes; summarized mode must retain the seals in its model-written notes. "
+        "Model sampling can still vary; compare multiple seeds/repeats. The autonomous arm records model-selected delegation separately from controlled recursion.",
         "**Modes:** linear retains entire history; summarized periodically replaces old steps with a note "
         "written by the same model; branch isolates each case and returns an outcome. "
         f"Summarized cadence: every {args.summary_every} lookups, memory budget {args.summary_max_chars} characters. "
         f"Summary cap: {args.summary_output_tokens} tokens; retry allowance: {args.summary_retries}. "
         "Summaries, retry events and per-call traces are in results.json.\n",
         "**Limitations:** Repair scenario uses a VIRTUAL simulator, not real files, browser actions, shell, or credentials. "
-        "Branching is selected by benchmark orchestration, not autonomously. Nested dependencies happen INSIDE each case's active context (the harness does not spawn nested branches for them). No tool inheritance or real Jan UI/MCP tool-selection evaluation. "
+        "The autonomous arm evaluates model-selected delegation inside this simulator; it does not prove real Jan UI/MCP tool selection or external side effects. Controlled recursion remains benchmark-selected. "
         "A server may silently truncate oversized inputs.",
         "", "The CSV contains all per-trial outcome and score fields. The JSON additionally records per-call finish reasons and per-batch judgments.",
     ]
@@ -1131,7 +1167,7 @@ def main(argv=None):
                 print("  WARNING: Mandatory evidence plus reserved output consumes much of the context budget "
                       f"(~{estimated_evidence:,} + {args.max_output_tokens:,} estimated tokens, "
                       f"before instructions/history; server limit {args.context_limit:,}). "
-                      "All three modes may hit HTTP 400 inside a single repair. "
+                      "All selected modes may hit HTTP 400 inside a single repair. "
                       "Use smaller --recovery-log-lines / --pressure-records / --nested-depth, "
                       "or increase --context-limit.", flush=True)
             print(f"Scenario OK: {n} simulated repairs; traps={args.trap_density}, optional lines={args.trap_log_lines}, mandatory shard lines={args.recovery_log_lines}; "
@@ -1179,6 +1215,8 @@ def main(argv=None):
             print(f"Jan connection error: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 2
     cfg["_recursive_max_depth"] = args.recursive_max_depth
+    cfg["_autonomous_max_children"] = args.autonomous_max_children
+    cfg["_autonomous_max_tokens"] = args.autonomous_max_tokens
     cfg["_recursive_checkpoint_threshold"] = args.recursive_checkpoint_threshold
     cfg["_recursive_checkpoint_max"] = args.recursive_checkpoint_max
     cfg["_context_limit"] = args.context_limit

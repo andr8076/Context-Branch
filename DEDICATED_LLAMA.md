@@ -47,7 +47,9 @@ python3 benchmark.py --engine llama --llama-model "$MODEL" \
 
 Recursive child tasks are restricted to their own document paths and actions. Verified child handoffs describe the unlocked simulator state, not the child transcript. Empty or invalid JSON investigation replies get one additional model call before the simulator charges an invalid action. The additional token/time overhead is always measured.
 
-This is a controlled test with the same scenario seed. It is not yet autonomous branching, and new live Qwen results are needed.
+This is a controlled test with the same scenario seed. Add `autonomous` to the
+repair `--modes` list to let the model emit explicit delegation actions; new live
+Qwen results are still needed before drawing performance conclusions.
 
 ---
 
@@ -65,9 +67,10 @@ This compares one context per repair with independent contexts for its nested
 index, escrow, recovery and final repair stages. The dedicated llama-server
 is restarted between each trial as before. Each recursive stage operates on
 a common virtual simulator but does not inherit another stage's conversation.
-This controlled approach tests the mechanism, **not** autonomous model
-branch-selection. Include `--modes linear summarized branch recursive` for a
-four-way test; use at least `--tasks 3` to exercise summarized mode.
+The `recursive` arm tests controlled stage splitting; the separate `autonomous`
+arm tests model-selected delegation under the same simulator and action budget.
+Include `--modes linear summarized branch recursive autonomous` for a five-way
+test; use at least `--tasks 3` to exercise summarized mode.
 
 See [ROADMAP.md](ROADMAP.md) for the additional goals: autonomous branching
 and handling investigation calls that consume tokens without an action.
@@ -237,3 +240,4 @@ The same Qwen GGUF can be used, but Jan Desktop's bundled llama.cpp version,
 chat template, GPU settings and inference sampler can differ from the standalone
 Arch package. Therefore compare all three competitors **within the same new
 benchmark run**; don't assume wall-clock or token parity with older Jan results.
+

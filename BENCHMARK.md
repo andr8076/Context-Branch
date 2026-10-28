@@ -41,7 +41,8 @@ python3 benchmark.py --engine llama --scenario repair \
   --stage-start-inspects 2 --recursive-checkpoint-threshold 0.78
 ```
 
-No live Qwen improvement is claimed until this configuration is run. Autonomous branching is still a separate future milestone.
+No live Qwen improvement is claimed until this configuration is run. Autonomous
+branching has a separate benchmark arm and still needs live validation.
 
 ---
 
@@ -69,11 +70,14 @@ Results from scripted agents or GitHub Actions validate plumbing, **not** live Q
 
 ## v1.4.1 controlled-recursion scope and no-action rules
 
-- The controlled recursive solver gives each stage a stage-specific protocol and a filtered view of the *existing visible* `guide/index`; index/escrow/recovery/repair cannot read another stage's shards or execute its completion action. The simulator rejects wrong-stage actions before executing them and records `stage_scope_rejected`. Rejecting an out-of-scope action still consumes one shared action budget slot.
+- The controlled recursive solver gives each stage a stage-specific protocol and a filtered view of the *existing visible* `guide/index`; index/escrow/recovery/repair cannot read another stage's shards or execute its completion action. The simulator rejects wrong-stage actions before executing them and records `stage_scope_rejected`. Rejecting an out-of-scope action still consumes one shared action budget slot. The autonomous solver keeps the root free to continue locally and validates each model-emitted `delegate` action before starting a scoped child.
 - After each verified child, its parent receives the stage name, a simulator-verified completion flag, and an explicit environment change (e.g. `registry/approvals unlocked`). Parent contexts never receive child investigation messages, tokens, or benchmark oracle answers.
-- All four repair modes use the same configurable `--no-action-retries` (0–2, default 1). When a model produces empty/malformed/unusable JSON, the harness makes a bounded additional inference request with a brief reminder. This additional request counts in API calls, tokens, and elapsed time, but **doesn't call the simulator or spend a simulator action until a valid action is produced or all attempts fail**.
+- All repair modes use the same configurable `--no-action-retries` (0–2, default 1). When a model produces empty/malformed/unusable JSON, the harness makes a bounded additional inference request. This additional request counts in API calls, tokens, and elapsed time, but **doesn't call the simulator or spend a simulator action until a valid action is produced or all attempts fail**.
 - The run records `no_action_investigation_calls` (unusable generations), `no_action_retry_attempts` (actual retry requests), `no_action_retry_recoveries`, `no_action_retry_failures`, `out_of_scope_actions`, and per-stage `rejected_out_of_scope`. `empty_investigation_replies` includes retry calls.
-- These changes are benchmark orchestration, **not** autonomous branch selection and do not claim a successful live Qwen benchmark. Inspect totals across all branches and inference retries when comparing modes.
+- These changes are benchmark orchestration. The separate `autonomous` arm now
+  evaluates model-emitted delegation decisions, but does not claim a successful
+  live Qwen benchmark. Inspect totals across all branches and inference retries
+  when comparing modes.
 
 ---
 
@@ -88,7 +92,8 @@ delegation based on public dependency depth; the model does not autonomously
 choose branches. No oracle repair solutions are supplied in prompts.
 
 Use `--scenario repair --modes linear summarized branch recursive` to enable
-four competitors. The default remains the original three. Supported recursion
+four competitors. Add `autonomous` for model-selected delegation; the default
+remains the original three. Supported recursion
 depth limit: `--recursive-max-depth 0..3`. At `--nested-depth 2`, the
 full chain needs depth 3; lower limits are scored as blocked rather than
 implicitly skipping dependencies. In `archive` mode, recursive is unsupported.
@@ -104,9 +109,9 @@ text from investigation requests. No-action recovery is a **separate future
 feature**, not silently activated here.
 
 Testing: mocked-model benchmarks exercise dependency gating, branch isolation,
-shared state, action cap and a synthetic per-context overflow. A passing
-mock-model test says nothing definitive about your local Qwen model. See
-[ROADMAP.md](ROADMAP.md) for recursive, autonomous and no-action goals.
+shared state, action cap, model-selected delegation and a synthetic per-context
+overflow. A passing mock-model test says nothing definitive about your local
+Qwen model. See [ROADMAP.md](ROADMAP.md) for the remaining live validation.
 
 ---
 
@@ -266,7 +271,12 @@ python3 benchmark.py --scenario repair --tasks 1 2 4 --nested-depth 0
 
 At depth 2, a direct solution requires about **18 simulated model decisions**, plus any false starts. The default maximum is now **32** actions per incident; supported range is 12–80. `--nested-log-lines` is bounded 0–120. The old `--recovery-log-lines` remains 0–120.
 
-**Research limitation:** The benchmark still isolates contexts **at incident boundaries only**. These nested prerequisites run *inside each incident's active context*. It does **not** yet test autonomous mid-incident creation of nested subbranches, and the real local model may fail if that child context becomes full. The smoke/automated tests use simulated agents; real performance needs a live Jan benchmark run.
+**Research limitation:** The controlled `recursive` arm isolates contexts at
+stage boundaries selected by the harness. The `autonomous` arm now tests
+model-emitted mid-incident delegation with isolated child contexts, but the
+simulator is still virtual and the real local model may fail if a child context
+becomes full. The smoke/automated tests use simulated agents; real performance
+needs a live Jan/llama benchmark run.
 
 ---
 
@@ -312,7 +322,7 @@ Additionally:
 - Same model, case seeds, evidence, action rules, per-call output cap, and per-incident action budget across **linear**, **summarized**, and **branch** modes. Each run starts with an independent simulator state.
 - Each mode makes its own decisions from the observations it has been shown; neither prompts nor simulated tools reveal the known correct repair. The benchmark applies/validates chosen actions deterministically.
 - Linear mode retains all case-specific actions and bulky observations. Summarized mode asks the same model to compact completed cases every `--summary-every` cases. Branch mode starts a fresh separate model conversation per case; only one outcome enters the parent's history.
-- The benchmark orchestrates branch selection **by case boundary**; it does not test automatic or recursive branching inside a case. Mandatory investigations remain inside each isolated branch (they are not spun off as separate nested branches). A branch can still fill its *own* context, which is an important failure to report.
+- `branch` isolates at case boundaries, `recursive` uses harness-selected stage branches, and `autonomous` tests model-selected mid-incident delegation. Mandatory investigations remain inside the active simulator, and a branch can still fill its *own* context, which is an important failure to report.
 - `verified_cases` / `tasks` is the primary problem-solving metric. A strictly correct final JSON with mission/control IDs and all verified seals is the additional end-to-end success condition.
 - `recovery_completed`, `recovery_attempts`, `recovery_failures`, `recovery_blocked`, `recovery_shard_views`, `forced_evidence_chars` measure mandatory investigative steps, separately from optional traps.
 - `wrong_repairs`, `decoy_documents_opened`, `trap_waste_chars`, `invalid_actions`, `total_actions` expose optional detour and recovery cost. `trap_waste_chars` is simulator-output characters, **not** actual token counts. Overall model token usage and parent/branch context pressure remain separate measurements.
@@ -370,7 +380,7 @@ Open a terminal inside this directory.
 # Verify that test scenarios fit the branch's per-task input limit (no Jan connection)
 python3 benchmark.py --dry-run
 
-# Small live check (3 side tasks, 12 records, 1 repeat; all three modes, including compaction)
+# Small live check (3 side tasks, 12 records, 1 repeat; default modes, including compaction)
 python3 benchmark.py --smoke
 
 # Main benchmark (3, 6, 8 side tasks; 65 records per task; 2 different seeds per level)
@@ -380,7 +390,7 @@ python3 benchmark.py --tasks 3 6 8 --records 65 --repeats 2 --context-limit 8192
 python3 benchmark.py --tasks 3 6 8 --records 65 --repeats 5 --context-limit 8192
 ```
 
-The benchmark now requests **1,024 generated tokens per API call by default**, instead of the previous hard cap of 350. To use another limit, add `--max-output-tokens 1536` (range 64–4096). The same cap applies to all three modes, including summarization calls. If Jan uses an 8,192-token context window, remember that the prompt and generated output must fit within the model/backend limit; increasing the output budget does not increase context capacity.
+The benchmark now requests **1,024 generated tokens per API call by default**, instead of the previous hard cap of 350. To use another limit, add `--max-output-tokens 1536` (range 64–4096). The same cap applies to all selected modes, including summarization calls. If Jan uses an 8,192-token context window, the prompt and generated output must fit within the model/backend limit; increasing the output budget does not increase context capacity.
 
 The default summarizes after **every 2 completed lookups**, except after the final lookup, and requires each note to fit in **1,800 characters**. Tune this policy with `--summary-every 2 --summary-max-chars 1800`. An empty or oversized note is recorded as a summarization failure; it is not silently corrected with ground truth. All model-generated notes are recorded in `results.json`. Note that model summarization may itself fail if the existing context has already grown beyond Jan's limit.
 
@@ -392,7 +402,7 @@ For the first real benchmark, use **2 repeats**. If results look meaningful and 
 
 A random but reproducible assignment includes a **mission ID** and a **control code** that must be retained to the end. It contains `N` independent tasks, each providing a table of 65 fake audit records and a target reference ID. The AI must retrieve the corresponding seal from the correct row and preserve it for the final report.
 
-At the end, the AI must output JSON with the original mission ID, original control code and **all** correct seals. We know the ground-truth answers before the AI starts. The same seed is used in all three modes.
+At the end, the AI must output JSON with the original mission ID, original control code and **all** correct seals. We know the ground-truth answers before the AI starts. The same seed is used in all selected modes.
 
 This exercises:
 
@@ -435,7 +445,7 @@ data/benchmarks/<UTC timestamp>/
 | `total_processed_tokens` | Sum of prompt + response tokens across **all** parent AND branch calls. This is work performed, not live VRAM usage. |
 | `elapsed_seconds` | Total wall-clock duration of each test. |
 | `api_calls` | Every completion request, including parent acknowledgements after branches. |
-| `max_output_tokens` | Configured output cap applied equally to all three modes. |
+| `max_output_tokens` | Configured output cap applied equally to all selected modes. |
 | `length_stops` | Number of API calls that ended with `finish_reason=length`, if reported by Jan. |
 | `input_over_limit_risk` | True when Jan reports more prompt tokens than the configured context size. This is only a risk indicator, not proof of an actual overflow. |
 | `error_type`, `failed_phase` | Distinguishes explicit context-overflow messages, definite timeouts, ambiguous connection/timeout errors, and other errors, and identifies where they occurred. |
@@ -464,7 +474,12 @@ Expected trade-off: branching may be **slower and use more total tokens on short
 
 A model can fail the `exact_final` condition for reasons unrelated to context (poor JSON formatting, lookup mistakes). Scoring v3 retains distinct failure causes, correct intermediate answers, and fully visible but incomplete final answers. Read these together.
 
-**Three-way fairness:** All modes use the same model, seeds, test archives, original instructions, final scoring, and output token cap. The summarizer is run by the same model and receives only its visible conversation history, never benchmark ground truth. Its extra model calls count toward token and time totals, and a missing seal in its summary can cause a failed final report. The order of modes rotates between repeats. Branching and summarization are orchestrated by the benchmark, **not** autonomously selected by the model.
+**Fairness:** Selected modes use the same model, seeds, test archives, original
+instructions, final scoring and output cap. The summarizer is run by the same
+model and receives only its visible conversation history, never benchmark ground
+truth. Its extra model calls count toward token and time totals. The order of
+modes rotates between repeats. `branch` and `recursive` are orchestrated by the
+benchmark; `autonomous` records model-selected delegation separately.
 
 ## 6. Offline harness tests
 

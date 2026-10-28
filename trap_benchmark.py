@@ -359,7 +359,7 @@ def parse_action(content):
         parsed = json.loads(text)
     except (ValueError, TypeError):
         return None
-    if isinstance(parsed, dict) and parsed.get("action") in ("inspect", "rebuild_index", "unlock_escrow", "recover", "repair", "verify"):
+    if isinstance(parsed, dict) and parsed.get("action") in ("inspect", "rebuild_index", "unlock_escrow", "recover", "repair", "verify", "delegate"):
         return parsed
     return None
 
@@ -560,13 +560,13 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                    trap_density=2, max_actions=32, recovery_log_lines=36,
                    nested_depth=0, nested_log_lines=14,
                    pressure_records=0, pressure_detail_chars=48):
-    """Compare *identical* interactive simulated cases across three contexts.
+    """Compare *identical* interactive simulated cases across context strategies.
 
     branch: separate conversation per case (benchmark controlled), compact outcome
-    in parent. This exercises branch isolation, not autonomous branch selection or
-    the installed MCP branch_solve tool's capabilities.
+    in parent. recursive: benchmark-selected nested stages. autonomous: the model
+    emits explicit delegate actions and receives only verified child receipts.
     """
-    if mode not in ("linear", "summarized", "branch", "recursive"):
+    if mode not in ("linear", "summarized", "branch", "recursive", "autonomous"):
         raise ValueError(f"Unknown mode {mode}")
     if max_actions < 2:
         raise ValueError("max_actions must be >= 2")
@@ -601,6 +601,19 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "recursive_checkpoints": 0, "recursive_checkpoint_blocked": 0,
         "recursive_checkpoint_compactions": 0,
         "recursive_checkpoint_block_reasons": [],
+        "autonomous_delegate_attempts": 0,
+        "autonomous_delegations": 0,
+        "autonomous_delegate_rejections": 0,
+        "autonomous_duplicate_delegations": 0,
+        "autonomous_unnecessary_delegations": 0,
+        "autonomous_missed_opportunities": 0,
+        "autonomous_decisions": 0,
+        "autonomous_tokens_used": 0,
+        "autonomous_token_budget": cfg.get("_autonomous_max_tokens", 50000),
+        "autonomous_branch_count": 0,
+        "autonomous_context_count": 0,
+        "autonomous_max_depth": 0,
+        "autonomous_events": [],
         "partial_failure": False, "interrupted_batch": None,
         "nested_depth": nested_depth, "nested_log_lines": nested_log_lines,
         "pressure_records": pressure_records, "pressure_detail_chars": pressure_detail_chars,
@@ -636,7 +649,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
             active_sim = sim
             active_case = case
             case_recorded = False
-            if mode in ("branch", "recursive"):
+            if mode in ("branch", "recursive", "autonomous"):
                 # Isolated case history starts here; parent never sees its logs.
                 incident_msgs = [{"role": "system", "content": ACTION_SYSTEM},
                                  {"role": "user", "content": case["intro"]}]
@@ -645,33 +658,51 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 # Same policy for parent and branches, but the parent keeps its previous cases.
                 messages.append({"role": "user", "content": "INCIDENT ACTION PROTOCOL: " + ACTION_SYSTEM})
                 incident_msgs = messages
-            if mode == "recursive":
-                from recursive_benchmark import solve_recursive_case
-                success, recursive_events, retry_stats = solve_recursive_case(
-                    sim, case, cfg, model, trace, bm, max_actions,
-                    max_depth=cfg.get("_recursive_max_depth", 3),
-                    context_limit=context_limit)
+            if mode in ("recursive", "autonomous"):
+                from recursive_benchmark import solve_autonomous_case, solve_recursive_case
+                solver = solve_recursive_case if mode == "recursive" else solve_autonomous_case
+                solver_kwargs = {
+                    "max_depth": cfg.get("_recursive_max_depth", 3),
+                    "context_limit": context_limit,
+                }
+                if mode == "autonomous":
+                    solver_kwargs["max_children"] = cfg.get("_autonomous_max_children", 8)
+                    solver_kwargs["max_tokens"] = cfg.get("_autonomous_max_tokens", 50000)
+                success, nested_events, retry_stats = solver(
+                    sim, case, cfg, model, trace, bm, max_actions, **solver_kwargs)
                 result["no_action_investigation_calls"] += retry_stats["no_actions"]
                 result["no_action_retry_attempts"] += retry_stats["retries"]
                 result["no_action_retry_recoveries"] += retry_stats["recoveries"]
                 result["no_action_retry_failures"] += retry_stats["retry_failures"]
-                result["out_of_scope_actions"] += sum(e["rejected_out_of_scope"] for e in recursive_events)
-                result["recursive_events"].append({"batch": name, "stages": recursive_events})
-                result["recursive_branch_count"] += sum(e["depth"] > 0 for e in recursive_events)
-                result["recursive_context_count"] += len(recursive_events)
-                result["recursive_max_depth"] = max(result["recursive_max_depth"],
-                    max((e["depth"] for e in recursive_events), default=0))
-                result["recursive_stage_successes"] += sum(e["completed"] for e in recursive_events)
-                result["recursive_stage_failures"] += sum(not e["completed"] for e in recursive_events)
-                result["recursive_checkpoints"] += sum(e.get("context_checkpoints", 0) for e in recursive_events)
-                result["recursive_checkpoint_blocked"] += sum(
-                    bool(e.get("context_checkpoint_blocked")) for e in recursive_events)
-                result["recursive_checkpoint_compactions"] += sum(
-                    e.get("context_checkpoint_compactions", 0) for e in recursive_events)
-                result["recursive_checkpoint_block_reasons"].extend(
-                    e["context_checkpoint_block_reason"] for e in recursive_events
-                    if e.get("context_checkpoint_block_reason"))
-            for _ in range(0 if mode == "recursive" else max_actions):
+                if mode == "recursive":
+                    result["out_of_scope_actions"] += sum(e.get("rejected_out_of_scope", 0) for e in nested_events)
+                    result["recursive_events"].append({"batch": name, "stages": nested_events})
+                    result["recursive_branch_count"] += sum(e["depth"] > 0 for e in nested_events)
+                    result["recursive_context_count"] += len(nested_events)
+                    result["recursive_max_depth"] = max(result["recursive_max_depth"],
+                        max((e["depth"] for e in nested_events), default=0))
+                    result["recursive_stage_successes"] += sum(e["completed"] for e in nested_events)
+                    result["recursive_stage_failures"] += sum(not e["completed"] for e in nested_events)
+                    result["recursive_checkpoints"] += sum(e.get("context_checkpoints", 0) for e in nested_events)
+                    result["recursive_checkpoint_blocked"] += sum(
+                        bool(e.get("context_checkpoint_blocked")) for e in nested_events)
+                    result["recursive_checkpoint_compactions"] += sum(
+                        e.get("context_checkpoint_compactions", 0) for e in nested_events)
+                    result["recursive_checkpoint_block_reasons"].extend(
+                        e["context_checkpoint_block_reason"] for e in nested_events
+                        if e.get("context_checkpoint_block_reason"))
+                else:
+                    result["autonomous_events"].append({"batch": name, "stages": nested_events})
+                    for key in ("autonomous_delegate_attempts", "autonomous_delegations",
+                                "autonomous_delegate_rejections", "autonomous_duplicate_delegations",
+                                "autonomous_unnecessary_delegations", "autonomous_missed_opportunities",
+                                "autonomous_decisions", "autonomous_tokens_used", "autonomous_branch_count",
+                                "autonomous_context_count"):
+                        result[key] += retry_stats.get(key, 0)
+                    result["autonomous_max_depth"] = max(
+                        result["autonomous_max_depth"], retry_stats.get("autonomous_max_depth", 0))
+                    result["out_of_scope_actions"] += sum(e.get("rejected_out_of_scope", 0) for e in nested_events)
+            for _ in range(0 if mode in ("recursive", "autonomous") else max_actions):
                 phase = "branch_investigate" if mode == "branch" else "parent_investigate"
                 action, answer, retry_stats = request_investigation_action(
                     cfg, model, incident_msgs, trace, bm, phase=phase,
@@ -742,7 +773,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                                              "events": sim.history,
                                              "expected_repair_debug_only": case["expected_repair"]})
             case_recorded = True
-            if mode in ("branch", "recursive"):
+            if mode in ("branch", "recursive", "autonomous"):
                 # No model call gets the independent case history as part of the parent.
                 trace.phase = "parent_ack"
                 compact = {"batch": name, "status": "verified" if sim.verified else "blocked",
@@ -845,7 +876,24 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 result["recursive_checkpoint_block_reasons"].extend(
                     e["context_checkpoint_block_reason"] for e in recursive_events
                     if e.get("context_checkpoint_block_reason"))
-                result["out_of_scope_actions"] += sum(e["rejected_out_of_scope"] for e in recursive_events)
+                result["out_of_scope_actions"] += sum(e.get("rejected_out_of_scope", 0) for e in recursive_events)
+                result["no_action_investigation_calls"] += retry_stats["no_actions"]
+                result["no_action_retry_attempts"] += retry_stats["retries"]
+                result["no_action_retry_recoveries"] += retry_stats["recoveries"]
+                result["no_action_retry_failures"] += retry_stats["retry_failures"]
+            if mode == "autonomous" and getattr(trace, "active_autonomous_events", None) is not None:
+                autonomous_events = trace.active_autonomous_events
+                retry_stats = trace.active_autonomous_counters
+                result["autonomous_events"].append({"batch": name, "stages": autonomous_events})
+                for key in ("autonomous_delegate_attempts", "autonomous_delegations",
+                            "autonomous_delegate_rejections", "autonomous_duplicate_delegations",
+                            "autonomous_unnecessary_delegations", "autonomous_missed_opportunities",
+                            "autonomous_decisions", "autonomous_tokens_used", "autonomous_branch_count",
+                            "autonomous_context_count"):
+                    result[key] += retry_stats.get(key, 0)
+                result["autonomous_max_depth"] = max(
+                    result["autonomous_max_depth"], retry_stats.get("autonomous_max_depth", 0))
+                result["out_of_scope_actions"] += sum(e.get("rejected_out_of_scope", 0) for e in autonomous_events)
                 result["no_action_investigation_calls"] += retry_stats["no_actions"]
                 result["no_action_retry_attempts"] += retry_stats["retries"]
                 result["no_action_retry_recoveries"] += retry_stats["recoveries"]

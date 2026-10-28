@@ -56,6 +56,72 @@ class RecursiveFakeJan(DeliberateFakeJan):
                 'usage':{'prompt_tokens':len(json.dumps(msgs))//4,'completion_tokens':len(answer)//4}}
 
 
+class AutonomousFakeJan(RecursiveFakeJan):
+    """Fake model that deliberately chooses the dependency delegates."""
+    def __call__(self, method, url, cfg, payload=None):
+        if method == 'GET':
+            return super().__call__(method, url, cfg, payload)
+        msgs = payload['messages']
+        match = re.search(r'AUTONOMOUS STAGE=(index|escrow|recovery|repair)',
+                          msgs[0]['content'])
+        if not match:
+            return super().__call__(method, url, cfg, payload)
+        stage = match.group(1)
+        if len(json.dumps(msgs, ensure_ascii=False)) > self.max_chars:
+            raise RuntimeError('Simulated context capacity exceeded')
+        self.messages_seen.append(json.loads(json.dumps(msgs)))
+        self.limits.append(payload['max_tokens'])
+        already = [tb.parse_action(m['content']) for m in msgs if m['role'] == 'assistant']
+        if stage == 'repair' and not any('DELEGATION COMPLETE: approval ledger recovered' in m.get('content', '')
+                                         for m in msgs):
+            action = {'action': 'delegate', 'stage': 'recovery',
+                      'task': 'Recover the mandatory approvals ledger',
+                      'relevant_context': 'The repair must verify the current approval ledger.'}
+        elif stage == 'recovery' and not any('DELEGATION COMPLETE: escrow unlocked' in m.get('content', '')
+                                            for m in msgs):
+            action = {'action': 'delegate', 'stage': 'escrow',
+                      'task': 'Unlock the escrow prerequisite before recovery',
+                      'relevant_context': 'The recovery shards are gated by escrow.'}
+        elif stage == 'escrow' and not any('DELEGATION COMPLETE: index rebuilt' in m.get('content', '')
+                                           for m in msgs):
+            action = {'action': 'delegate', 'stage': 'index',
+                      'task': 'Rebuild the index prerequisite before unlocking escrow',
+                      'relevant_context': 'The escrow shards are gated by the current index.'}
+        elif 'guide/index' not in [a['path'] for a in already if a and a['action'] == 'inspect']:
+            action = {'action': 'inspect', 'path': 'guide/index'}
+        elif stage in ('index', 'escrow', 'recovery'):
+            read = [a['path'] for a in already if a and a['action'] == 'inspect']
+            for shard in (stage + '/shard-a', stage + '/shard-b'):
+                if shard not in read:
+                    action = {'action': 'inspect', 'path': shard}
+                    break
+            else:
+                if stage in ('index', 'escrow'):
+                    token = self._derive_nested(msgs, stage)
+                    action = {'action': 'rebuild_index' if stage == 'index' else 'unlock_escrow',
+                              'token': token}
+                else:
+                    action = {'action': 'recover', 'token': self._derive_recovery(msgs)}
+        else:
+            read = [a['path'] for a in already if a and a['action'] == 'inspect']
+            required = ('guide/policy', 'registry/releases', 'registry/approvals',
+                        'network/aliases', 'network/routes', 'security/certificates')
+            for doc in required:
+                if doc not in read:
+                    action = {'action': 'inspect', 'path': doc}
+                    break
+            else:
+                if any(a and a['action'] == 'repair' for a in already):
+                    action = {'action': 'verify'}
+                else:
+                    action = {'action': 'repair', **self._derive_repair(msgs)}
+        answer = json.dumps(action)
+        return {'choices': [{'message': {'role': 'assistant', 'content': answer},
+                             'finish_reason': 'stop'}],
+                'usage': {'prompt_tokens': len(json.dumps(msgs)) // 4,
+                          'completion_tokens': len(answer) // 4}}
+
+
 class RecursiveContextTests(unittest.TestCase):
     def cfg(self):
         c=dict(bm.bc.DEFAULTS)
@@ -95,6 +161,84 @@ class RecursiveContextTests(unittest.TestCase):
         self.assertNotIn('INDEX SHARD A:',joined)
         self.assertIn('branch_recursive_3_index',[c['phase'] for c in trial['calls']])
         self.assertIn('branch_recursive_0_repair',[c['phase'] for c in trial['calls']])
+
+    def test_autonomous_model_selected_delegation_uses_verified_handoffs(self):
+        fake = AutonomousFakeJan()
+        with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, 'http_json', fake):
+            trial = tb.run_trap_trial('autonomous', 17, 1, self.cfg(), 'mock', 8192,
+                                      Path(temp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8,
+                                      pressure_records=0)
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertTrue(trial['exact_final'])
+        self.assertEqual(trial['autonomous_delegations'], 3)
+        self.assertEqual(trial['autonomous_delegate_attempts'], 3)
+        self.assertEqual(trial['autonomous_delegate_rejections'], 0)
+        self.assertEqual(trial['autonomous_branch_count'], 3)
+        self.assertEqual(trial['autonomous_context_count'], 4)
+        self.assertEqual(trial['autonomous_max_depth'], 3)
+        self.assertEqual(trial['autonomous_missed_opportunities'], 0)
+        stages = trial['autonomous_events'][0]['stages']
+        self.assertEqual([s['stage'] for s in stages], ['repair', 'recovery', 'escrow', 'index'])
+        root = json.dumps([msgs for msgs in fake.messages_seen
+                           if 'AUTONOMOUS STAGE=repair' in msgs[0]['content']])
+        self.assertIn('DELEGATION COMPLETE: approval ledger recovered', root)
+        self.assertNotIn('RECOVERY SHARD A:', root)
+        self.assertNotIn('INDEX SHARD A:', root)
+
+    def test_autonomous_root_may_continue_without_delegating(self):
+        fake = DeliberateFakeJan()
+        with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, 'http_json', fake):
+            trial = tb.run_trap_trial('autonomous', 17, 1, self.cfg(), 'mock', 8192,
+                                      Path(temp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertTrue(trial['exact_final'])
+        self.assertEqual(trial['autonomous_delegate_attempts'], 0)
+        self.assertEqual(trial['autonomous_delegations'], 0)
+        self.assertEqual(trial['autonomous_missed_opportunities'], 0)
+
+    def test_autonomous_duplicate_and_cycle_delegations_are_rejected(self):
+        fake = AutonomousFakeJan()
+        injected = {'done': False}
+
+        def duplicate_then_normal(method, url, cfg, payload=None):
+            if (payload and not injected['done'] and
+                    'AUTONOMOUS STAGE=repair' in payload['messages'][0]['content']):
+                injected['done'] = True
+                answer = json.dumps({'action': 'delegate', 'stage': 'repair',
+                                     'task': 'Repeat the current repair',
+                                     'relevant_context': ''})
+                return {'choices': [{'message': {'content': answer}, 'finish_reason': 'stop'}],
+                        'usage': {'prompt_tokens': 80, 'completion_tokens': 30}}
+            return fake(method, url, cfg, payload)
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, 'http_json', duplicate_then_normal):
+            trial = tb.run_trap_trial('autonomous', 17, 1, self.cfg(), 'mock', 8192,
+                                      Path(temp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertTrue(injected['done'])
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertGreaterEqual(trial['autonomous_delegate_rejections'], 1)
+        self.assertGreaterEqual(trial['autonomous_unnecessary_delegations'], 1)
+        self.assertTrue(any('cycle or self-delegation' in reason
+                            for stage in trial['autonomous_events'][0]['stages']
+                            for reason in stage['delegation_rejection_reasons']))
+
+    def test_autonomous_shared_token_budget_stops_children_explicitly(self):
+        cfg = self.cfg()
+        cfg['_autonomous_max_tokens'] = 1000
+        fake = AutonomousFakeJan()
+        with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, 'http_json', fake):
+            trial = tb.run_trap_trial('autonomous', 17, 1, cfg, 'mock', 8192,
+                                      Path(temp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8)
+        self.assertEqual(trial['verified_cases'], 0)
+        self.assertFalse(trial['exact_final'])
+        self.assertEqual(trial['autonomous_token_budget'], 1000)
+        self.assertGreaterEqual(trial['autonomous_tokens_used'], 1000)
+        self.assertTrue(any(event['status'] == 'token_budget_exhausted'
+                            for event in trial['autonomous_events'][0]['stages']))
 
     def test_recursive_survives_single_incident_context_pressure(self):
         # Genuine prompts from each stage, but a scripted agent and simplified
