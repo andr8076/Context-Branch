@@ -368,8 +368,9 @@ def extract_lookup_answer(text):
 
 def classify_exception(exc):
     """Never claim definite context overflow/timeout from ambiguous errors."""
-    if getattr(exc, 'error_kind', None) == 'context_overflow_confirmed':
-        return 'context_overflow_confirmed'
+    explicit_kind = getattr(exc, 'error_kind', None)
+    if explicit_kind in ('context_overflow_confirmed', 'context_checkpoint_blocked'):
+        return explicit_kind
     message = str(exc).lower()
     if any(s in message for s in ('context length', 'context window', 'context capacity', 'context overflow',
                                     'maximum context', 'prompt is too long', 'n_ctx', 'tokens exceed')):
@@ -844,6 +845,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "total_actions", "verified_cases", "invalid_actions", "wrong_repairs",
         "partial_failure", "interrupted_batch",
         "recursive_checkpoints", "recursive_checkpoint_blocked",
+        "recursive_checkpoint_compactions", "recursive_checkpoint_block_reasons",
         "no_action_investigation_calls", "empty_investigation_replies",
         "no_action_retry_attempts", "no_action_retry_recoveries", "no_action_retry_failures", "out_of_scope_actions",
         "stage_start_calls", "stage_start_inference_seconds",
@@ -1026,6 +1028,22 @@ def write_files(directory, data, cfg, args, reset_events=None):
         lines += ["", "**Context-pressure caveat:** The benchmark does not rewind inside a repair; "
                   "nested stages share a context in ordinary branch mode, but recursive mode isolates each prerequisite. Very high pressure may exhaust "
                   "all modes. API token usage and actual truncation behavior depend on Jan.", ""]
+        if "recursive" in args.modes:
+            lines += ["", "## Recursive checkpoint diagnostics", "",
+                      "Checkpoint compactions replace only oversized simulator observations that explicitly "
+                      "report a rejected/blocked action with no state change. Ambiguous observations are never "
+                      "discarded; they produce a `context_checkpoint_blocked` safety stop.", "",
+                      "| Tasks | Mode | Checkpoints | Compacted non-mutating observations | Blocked checkpoints | Block reasons |",
+                      "|---:|---|---:|---:|---:|---|"]
+            for n in args.tasks:
+                rows = [r for r in data if r["tasks"] == n and r["mode"] == "recursive"]
+                if rows:
+                    reasons = sorted({reason for r in rows
+                                      for reason in r.get("recursive_checkpoint_block_reasons", [])})
+                    lines.append(f"| {n} | recursive | {sum(r.get('recursive_checkpoints', 0) for r in rows)} | "
+                                 f"{sum(r.get('recursive_checkpoint_compactions', 0) for r in rows)} | "
+                                 f"{sum(r.get('recursive_checkpoint_blocked', 0) for r in rows)} | "
+                                 f"{', '.join(reasons) if reasons else '—'} |")
         lines += ["", "A repair is counted as **verified** only after the AI successfully submits a policy-valid "
                   "release/route/certificate triple AND requests verification. A plausible written answer is not enough. "
                   "Wrong repairs return noisy simulator logs, costing context; decoy documents also add context. "
@@ -1063,6 +1081,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "- `output_truncated_confirmed`: API explicitly reported `finish_reason=length` for an incomplete report.",
         "- `output_truncated_suspected`: incomplete report plus usage at the generation cap; API did not confirm truncation.",
         "- `context_overflow_confirmed`: exception explicitly indicates context overflow.",
+        "- `context_checkpoint_blocked`: checkpoint safety stop; required evidence or an uncompactable state observation could not fit.",
         "- `timeout`: a definitive timeout; `connection_or_timeout_unknown` means the error was ambiguous.",
         "- `not_attempted`: a lookup or summarization failed before the final report request.",
         "- `summary_failed`: the summary stayed empty, truncated, or oversized after its retry allowance.",
