@@ -321,6 +321,11 @@ class TrapBenchmarkTests(unittest.TestCase):
         action = tb.parse_action('{"action":"inspect","target":"guide/index"}')
         self.assertEqual(action['path'], "guide/index")
         self.assertEqual(action['_schema_alias'], "target_to_path")
+        action = tb.parse_action(
+            '{"action":"repair","target":"REL-1234","route":"ROUTE-5678",'
+            '"certificate":"CERT-9012"}')
+        self.assertEqual(action['release'], "REL-1234")
+        self.assertEqual(action['_schema_alias'], "target_to_release")
 
     def test_all_modes_finish_with_evidence_based_fake_agent(self):
         fake = DeliberateFakeJan()

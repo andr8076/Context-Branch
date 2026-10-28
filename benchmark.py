@@ -998,9 +998,10 @@ def write_files(directory, data, cfg, args, reset_events=None):
                     lines.append(f"| {n} | {mode} | {sum(r.get('no_action_investigation_calls', 0) for r in rows)} "
                                  f"| {sum(r.get('empty_investigation_replies', 0) for r in rows)} |")
         lines += ["", "## Action protocol compatibility", "",
-                  "Some local models use `target` instead of the simulator's `path` field for inspect actions. "
-                  "The harness normalizes that one alias and counts each repair here.",
-                  "| Tasks | Mode | `target` → `path` repairs |", "|---:|---|---:|"]
+                  "Some local models use a generic `target` field instead of the simulator's "
+                  "action-specific field names. The harness normalizes recognized target aliases "
+                  "and counts each repair here.",
+                  "| Tasks | Mode | Target-field schema repairs |", "|---:|---|---:|"]
         for n in args.tasks:
             for mode in args.modes:
                 rows = [r for r in data if r["tasks"] == n and r["mode"] == mode]
