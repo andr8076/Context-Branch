@@ -70,6 +70,20 @@ class DeliberateFakeJan:
                 "usage": {"prompt_tokens": len(serialized)//4, "completion_tokens": len(answer)//4}}
 
     def _next_action(self, fragment, visited):
+        focused_child = any("FOCUSED CHILD TASK:" in m.get("content", "")
+                            for m in fragment)
+        if focused_child and any("UNEXPECTED PROBLEM:" in m.get("content", "")
+                                 for m in fragment):
+            if "adaptive/blocker" not in visited:
+                return json.dumps({"action": "inspect", "path": "adaptive/blocker"})
+            blocker = next(
+                m["content"] for m in reversed(fragment)
+                if m.get("content", "").startswith(
+                    "SIMULATOR RESULT:\nADAPTIVE BLOCKER EVIDENCE"))
+            blocker_token = re.search(
+                r'reconciliation_token=(CHECK-[A-Z2-9]+)', blocker).group(1)
+            return json.dumps({"action": "resolve_blocker", "token": blocker_token})
+
         index = next(m["content"] for m in fragment
                      if "SIMULATOR RESULT:\nEvidence cabinet" in m.get("content", ""))
         for stage, success_text, action_name in (
@@ -90,6 +104,14 @@ class DeliberateFakeJan:
         for path in ("registry/approvals", "network/aliases", "network/routes", "security/certificates"):
             if path not in visited:
                 return json.dumps({"action": "inspect", "path": path})
+        resume_points = [i for i, m in enumerate(fragment)
+                         if "ADAPTIVE BRANCH RESUME FROM MARKER:" in m.get("content", "")]
+        if resume_points:
+            resumed_fragment = fragment[resume_points[-1]:]
+            if not any("SIMULATOR RESULT:\nAPPLIED:" in m.get("content", "")
+                       for m in resumed_fragment):
+                return json.dumps({"action": "repair", **self._derive_repair(fragment)})
+            return json.dumps({"action": "verify"})
         branch_start = next((i for i, m in enumerate(fragment)
                              if "FOCUSED CHILD TASK:" in m.get("content", "")), 0)
         branch_fragment = fragment[branch_start:]
@@ -605,7 +627,7 @@ class TrapBenchmarkTests(unittest.TestCase):
             summary = (folder / "SUMMARY.md").read_text()
             rows = json.loads((folder / "results.json").read_text())
             self.assertEqual(rows["metadata"]["scenario"], "repair")
-            self.assertEqual(rows["metadata"]["benchmark_version"], "1.7.0")
+            self.assertEqual(rows["metadata"]["benchmark_version"], "1.8.0")
             self.assertEqual(rows["metadata"]["pressure_records"], 4)
             self.assertEqual(len(rows["trials"]), 3)
             self.assertIn("Repair traps: observable investigation behavior", summary)

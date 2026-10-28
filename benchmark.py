@@ -802,7 +802,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "scoring_version": 3,
                   "simulator_rules_version": 2,
                   "mandatory_authority_inspection": args.scenario == "repair",
-                  "benchmark_version": "1.7.0", "scenario": args.scenario,
+                  "benchmark_version": "1.8.0", "scenario": args.scenario,
                   "engine": args.engine,
                   "llama_reset_policy": ("reuse" if args.reuse_llama else "fresh_each_trial") if args.engine == "llama" else None,
                   "jan_reset_policy": (("each_trial" if args.restart_jan_between_trials else
@@ -870,7 +870,9 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "adaptive_decisions", "adaptive_child_decisions", "adaptive_child_actions",
         "adaptive_parent_prompt_before_marker", "adaptive_parent_prompt_after_resume",
         "adaptive_child_prompt_tokens", "adaptive_child_tokens",
-        "adaptive_child_transcript_leaks",
+        "adaptive_child_transcript_leaks", "adaptive_child_resolutions",
+        "adaptive_post_resume_decisions", "adaptive_post_resume_actions",
+        "adaptive_post_resume_verified",
         "action_schema_alias_repairs",
         "no_action_investigation_calls", "empty_investigation_replies",
         "no_action_retry_attempts", "no_action_retry_recoveries", "no_action_retry_failures", "out_of_scope_actions",
@@ -895,7 +897,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         writer.writerows(data)
 
     lines = [
-        "# Context Branch benchmark — adaptive surprise branches and stage-scoped recovery (v1.7 / scoring v3)", "",
+        "# Context Branch benchmark — adaptive post-resume continuation (v1.8 / scoring v3)", "",
         f"Scenario: **{args.scenario}** | Repair traps: density={args.trap_density}, "
         f"optional log lines={args.trap_log_lines}, required shard lines={args.recovery_log_lines}, "
         f"nested depth={args.nested_depth}, nested lines={args.nested_log_lines}, "
@@ -1104,9 +1106,10 @@ def write_files(directory, data, cfg, args, reset_events=None):
         if "adaptive" in args.modes:
             lines += ["", "## Adaptive surprise-branch diagnostics", "",
                       "The adaptive arm injects one explicit unexpected blocker at the first repair attempt. "
-                      "The controller saves the parent message list at a marker, solves the focused problem in "
-                      "a private child context, and resumes the parent with only a compact receipt. Child "
-                      "transcripts and simulator oracle values must never enter the resumed parent.", "",
+                      "The controller saves the parent message list at a marker, resolves only that blocker in "
+                      "a private child context, and resumes the parent with a compact receipt. The parent must "
+                      "then use its preserved evidence to apply and verify the original repair. Child transcripts "
+                      "and simulator oracle values must never enter the resumed parent.", "",
                       "| Tasks | Surprise triggers | Markers | Child branches | Child failures | Resumes | Child tokens | Parent tokens before/after | Transcript leaks |",
                       "|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
             for n in args.tasks:
@@ -1121,6 +1124,20 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{sum(r.get('adaptive_parent_prompt_before_marker', 0) for r in rows)} / "
                                  f"{sum(r.get('adaptive_parent_prompt_after_resume', 0) for r in rows)} | "
                                  f"{sum(r.get('adaptive_child_transcript_leaks', 0) for r in rows)} |")
+            lines += ["", "### Post-resume continuation proof", "",
+                      "A complete adaptive proof requires a resolved child blocker followed by fresh parent "
+                      "decisions and simulator actions after the marker is restored. Verification must occur "
+                      "in that resumed parent context.", "",
+                      "| Tasks | Blockers resolved by child | Parent decisions after resume | Parent actions after resume | Verified after resume |",
+                      "|---:|---:|---:|---:|---:|"]
+            for n in args.tasks:
+                rows = [r for r in data if r["tasks"] == n and r["mode"] == "adaptive"]
+                if rows:
+                    lines.append(
+                        f"| {n} | {sum(r.get('adaptive_child_resolutions', 0) for r in rows)} | "
+                        f"{sum(r.get('adaptive_post_resume_decisions', 0) for r in rows)} | "
+                        f"{sum(r.get('adaptive_post_resume_actions', 0) for r in rows)} | "
+                        f"{sum(r.get('adaptive_post_resume_verified', 0) for r in rows)} |")
         lines += ["", "A repair is counted as **verified** only after the AI successfully submits a policy-valid "
                   "release/route/certificate triple AND requests verification. A plausible written answer is not enough. "
                   "Wrong repairs return noisy simulator logs, costing context; decoy documents also add context. "
