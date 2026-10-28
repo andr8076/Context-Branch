@@ -895,7 +895,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         writer.writerows(data)
 
     lines = [
-        "# Context Branch benchmark — stage-scoped recursion and no-action recovery (v1.4.1 / scoring v3))", "",
+        "# Context Branch benchmark — adaptive surprise branches and stage-scoped recovery (v1.7 / scoring v3)", "",
         f"Scenario: **{args.scenario}** | Repair traps: density={args.trap_density}, "
         f"optional log lines={args.trap_log_lines}, required shard lines={args.recovery_log_lines}, "
         f"nested depth={args.nested_depth}, nested lines={args.nested_log_lines}, "
