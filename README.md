@@ -1,12 +1,14 @@
 # Context-Branch
 
-## v1.7 — adaptive surprise branches
+## v1.8 — verified parent continuation after an adaptive branch
 
-The opt-in `adaptive` repair benchmark now exercises the original context-branch
-idea: when the simulator reports an unexpected blocker, the controller saves the
-parent conversation at a marker, runs the focused problem in a private child
-context, then resumes the parent with only a compact verified receipt. Child
-transcripts and simulator oracle values never enter the resumed parent.
+The opt-in `adaptive` repair benchmark now proves the full marker → child →
+parent continuation flow. When the simulator reports an unexpected endpoint
+blocker, the controller saves the parent conversation at a marker. A private
+child may inspect only `adaptive/blocker` and clear that gate. The controller
+then restores the exact parent marker with a compact verified receipt. The
+resumed parent must use its preserved evidence to apply and verify the original
+repair. A child can no longer finish the incident itself.
 
 This is distinct from the legacy `autonomous` arm, which lets the model choose
 whether to delegate known prerequisite stages. Use `adaptive` to test marker,
@@ -20,10 +22,11 @@ python3 benchmark.py --engine llama --scenario repair \
   --autonomous-max-tokens 100000
 ```
 
-Results include `adaptive_surprise_triggers`, `adaptive_marker_count`,
-`adaptive_branches`, `adaptive_resumes`, parent prompt size before/after resume,
-child token usage, and transcript-leak diagnostics. Offline tests validate the
-plumbing; a live Qwen run is still needed for performance conclusions.
+Results include `adaptive_child_resolutions`,
+`adaptive_post_resume_decisions`, `adaptive_post_resume_actions`, and
+`adaptive_post_resume_verified`, alongside marker, branch, context-size and
+transcript-isolation diagnostics. A complete proof requires all four continuation
+signals; restoring a message list without a later parent action is insufficient.
 
 **Benchmark safety update:** recursive checkpoint pressure tests now compact only
 explicitly rejected/blocked observations that confirm no state change. Ambiguous
