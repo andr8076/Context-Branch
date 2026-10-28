@@ -240,7 +240,7 @@ class RecursiveContextTests(unittest.TestCase):
         self.assertTrue(any(event['status'] == 'token_budget_exhausted'
                             for event in trial['autonomous_events'][0]['stages']))
 
-    def test_adaptive_surprise_creates_marker_private_child_and_resume(self):
+    def test_adaptive_child_resolves_blocker_and_parent_continues_after_resume(self):
         fake = DeliberateFakeJan()
         cfg = self.cfg()
         cfg['_autonomous_max_tokens'] = 100000
@@ -257,24 +257,47 @@ class RecursiveContextTests(unittest.TestCase):
         self.assertEqual(trial['adaptive_branches'], 1)
         self.assertEqual(trial['adaptive_branch_failures'], 0)
         self.assertEqual(trial['adaptive_resumes'], 1)
+        self.assertEqual(trial['adaptive_child_resolutions'], 1)
+        self.assertGreaterEqual(trial['adaptive_post_resume_decisions'], 2)
+        self.assertGreaterEqual(trial['adaptive_post_resume_actions'], 2)
+        self.assertEqual(trial['adaptive_post_resume_verified'], 1)
         self.assertEqual(trial['adaptive_child_transcript_leaks'], 0)
         self.assertGreater(trial['adaptive_child_tokens'], 0)
         event = trial['adaptive_events'][0]['events']
         self.assertTrue(event[0]['marker_created'])
         self.assertTrue(event[0]['resumed'])
+        self.assertTrue(event[0]['child_resolved_blocker'])
+        self.assertGreaterEqual(event[0]['post_resume_decisions'], 2)
+        self.assertGreaterEqual(event[0]['post_resume_actions'], 2)
+        self.assertTrue(event[0]['post_resume_verified'])
         self.assertTrue(event[1]['completed'])
+        self.assertTrue(event[1]['blocker_resolved'])
+        self.assertFalse(event[1]['incident_verified_in_child'])
         root_inputs = json.dumps([
             messages for messages in fake.messages_seen
             if messages and 'ADAPTIVE ROOT CONTEXT' in messages[0].get('content', '')
         ])
         self.assertNotIn('ADAPTIVE CHILD CONTEXT', root_inputs)
         self.assertNotIn('FOCUSED CHILD TASK', root_inputs)
+        self.assertIn('ADAPTIVE BRANCH RESUME FROM MARKER', root_inputs)
+        resumed_root_inputs = [
+            messages for messages in fake.messages_seen
+            if messages and 'ADAPTIVE ROOT CONTEXT' in messages[0].get('content', '')
+            and any('ADAPTIVE BRANCH RESUME FROM MARKER' in m.get('content', '')
+                    for m in messages)
+        ]
+        self.assertTrue(resumed_root_inputs)
+        self.assertTrue(any('RELEASE INVENTORY' in json.dumps(messages)
+                            for messages in resumed_root_inputs))
         child_inputs = json.dumps([
             messages for messages in fake.messages_seen
             if messages and 'ADAPTIVE CHILD CONTEXT' in messages[0].get('content', '')
         ])
         self.assertIn('UNEXPECTED PROBLEM:', child_inputs)
         self.assertIn('SIMULATOR RESULT:', child_inputs)
+        blocker_token = re.search(
+            r'reconciliation_token=(CHECK-[A-Z2-9]+)', child_inputs).group(1)
+        self.assertNotIn(blocker_token, root_inputs)
 
     def test_recursive_survives_single_incident_context_pressure(self):
         # Genuine prompts from each stage, but a scripted agent and simplified
