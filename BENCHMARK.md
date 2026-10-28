@@ -272,11 +272,32 @@ python3 benchmark.py --scenario repair --tasks 1 2 4 --nested-depth 0
 At depth 2, a direct solution requires about **18 simulated model decisions**, plus any false starts. The default maximum is now **32** actions per incident; supported range is 12–80. `--nested-log-lines` is bounded 0–120. The old `--recovery-log-lines` remains 0–120.
 
 **Research limitation:** The controlled `recursive` arm isolates contexts at
-stage boundaries selected by the harness. The `autonomous` arm now tests
-model-emitted mid-incident delegation with isolated child contexts, but the
-simulator is still virtual and the real local model may fail if a child context
-becomes full. The smoke/automated tests use simulated agents; real performance
-needs a live Jan/llama benchmark run.
+stage boundaries selected by the harness. The legacy `autonomous` arm tests
+model-emitted delegation of known stages. The `adaptive` arm tests an explicit
+unexpected blocker, parent marker, isolated child, and compact parent resume.
+The simulator is still virtual and the real local model may fail if a child
+context becomes full. The smoke/automated tests use simulated agents; real
+performance needs a live Jan/llama benchmark run.
+
+### Adaptive surprise-branch arm
+
+Run the original side-problem flow with:
+
+```bash
+python3 benchmark.py --engine llama --scenario repair \
+  --modes adaptive --tasks 1 --repeats 3 --seed 20261026 \
+  --context-limit 8192 --nested-depth 2 --nested-log-lines 8 \
+  --recovery-log-lines 8 --pressure-records 0 --max-actions 48 \
+  --autonomous-max-tokens 100000
+```
+
+The simulator emits one explicit `UNEXPECTED PROBLEM` result at the first repair
+attempt. The controller preserves the parent's message list as a marker, gives
+the child only the incident and blocker, and resumes the parent with a compact
+verified receipt. `results.json` records marker creation, child work, parent
+prompt estimates before/after resume, and transcript-leak checks. This is
+separate from the legacy `autonomous` arm; it does not use a precomputed
+dependency tree or require the model to emit a `delegate` action.
 
 ---
 

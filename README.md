@@ -1,4 +1,29 @@
-# v1.5 — bounded Jan branches and reliable resumes
+# Context-Branch
+
+## v1.7 — adaptive surprise branches
+
+The opt-in `adaptive` repair benchmark now exercises the original context-branch
+idea: when the simulator reports an unexpected blocker, the controller saves the
+parent conversation at a marker, runs the focused problem in a private child
+context, then resumes the parent with only a compact verified receipt. Child
+transcripts and simulator oracle values never enter the resumed parent.
+
+This is distinct from the legacy `autonomous` arm, which lets the model choose
+whether to delegate known prerequisite stages. Use `adaptive` to test marker,
+child, and snap-back behavior:
+
+```bash
+python3 benchmark.py --engine llama --scenario repair \
+  --modes adaptive --tasks 1 --repeats 3 --seed 20261026 \
+  --context-limit 8192 --nested-depth 2 --nested-log-lines 8 \
+  --recovery-log-lines 8 --pressure-records 0 --max-actions 48 \
+  --autonomous-max-tokens 100000
+```
+
+Results include `adaptive_surprise_triggers`, `adaptive_marker_count`,
+`adaptive_branches`, `adaptive_resumes`, parent prompt size before/after resume,
+child token usage, and transcript-leak diagnostics. Offline tests validate the
+plumbing; a live Qwen run is still needed for performance conclusions.
 
 **Benchmark safety update:** recursive checkpoint pressure tests now compact only
 explicitly rejected/blocked observations that confirm no state change. Ambiguous
@@ -155,7 +180,10 @@ python3 benchmark.py --engine llama --llama-model "$MODEL" \
   --pressure-records 0 --max-actions 32 --no-action-retries 1
 ```
 
-**Next goal:** live validation of autonomous model-controlled branch selection. The opt-in `autonomous` repair arm now lets the model emit `delegate` actions or continue locally; depth, child count, shared action budget, duplicate/cycle guards and verified-only handoffs remain controller-enforced. Offline scripted-agent tests validate plumbing, not real-model accuracy.
+**Next goal:** live validation of adaptive marker-and-resume branching. The opt-in
+`adaptive` arm creates a private child only after an explicit unexpected blocker,
+then resumes the parent from its saved marker with a verified receipt. The older
+`autonomous` arm remains a separate model-selected delegation experiment.
 
 ---
 
@@ -199,17 +227,18 @@ the CSV includes spawned children, context count, peak recursion depth and stage
 outcomes. `no_action_investigation_calls` and `empty_investigation_replies`
 track the next reliability issue without silently changing how actions are scored.
 
-**Scope:** `recursive` is controlled *benchmark* recursion. The separate
+**Scope:** `recursive` is controlled *benchmark* recursion. The legacy
 `autonomous` repair arm lets the model choose explicit lower-level delegation
-mid-incident and returns only verified simulator receipts. Neither arm operates
-real files, browsers, shell commands or credentials, and offline simulator tests
-prove plumbing and integrity but not real GPU/model accuracy. See
-[ROADMAP.md](ROADMAP.md) for the remaining live-validation work.
+mid-incident. The `adaptive` arm tests the original unexpected-problem marker,
+private child, and parent-resume flow. Neither arm operates real files, browsers,
+shell commands or credentials, and offline simulator tests prove plumbing and
+integrity but not real GPU/model accuracy. See [ROADMAP.md](ROADMAP.md) for the
+remaining live-validation work.
 
 ```bash
-# Compare controlled and model-selected delegation on identical incidents
+# Compare controlled, legacy model-selected, and adaptive branching
 python3 benchmark.py --engine llama --llama-model "$MODEL" \
-  --scenario repair --modes branch recursive autonomous \
+  --scenario repair --modes branch recursive autonomous adaptive \
   --tasks 1 --repeats 3 --seed 20261026 \
   --context-limit 8192 --nested-depth 2 \
   --nested-log-lines 8 --recovery-log-lines 8 \

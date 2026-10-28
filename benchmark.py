@@ -2,8 +2,8 @@
 """Reproducible Jan benchmark: archive lookups or interactive gated repair traps.
 
 Context modes include linear, periodic summaries, isolated branches, controlled
-recursion and an opt-in model-directed autonomous delegation arm. Offline tests
-mock Jan, not its reasoning.
+recursion, legacy model-directed delegation and adaptive surprise-triggered
+branch/resume. Offline tests mock Jan, not its reasoning.
 """
 from __future__ import annotations
 
@@ -655,9 +655,9 @@ def arguments(argv=None):
     parser.add_argument("--check-llama-server", action="store_true", help="Validate binary and model without starting the server or running trials")
     parser.add_argument("--reuse-llama", action="store_true", help="Opt out of fresh llama-server between trials (by default each trial uses a NEW process)")
     parser.add_argument("--scenario", choices=("archive", "repair"), default="archive", help="Archive lookups (legacy) or stateful repair traps (new)")
-    parser.add_argument("--modes", choices=("linear", "summarized", "branch", "recursive", "autonomous"),
+    parser.add_argument("--modes", choices=("linear", "summarized", "branch", "recursive", "autonomous", "adaptive"),
                         nargs="+", default=["linear", "summarized", "branch"],
-                        help="Competitors to run; add recursive or autonomous nested branching (repair only)")
+                        help="Competitors to run; add recursive, autonomous or adaptive branching (repair only)")
     parser.add_argument("--no-action-retries", type=int, default=1,
                         help="Retry invalid/empty investigation JSON action before spending a simulator action (0-2; default 1)")
     parser.add_argument("--no-action-retry-output-tokens", type=int, default=256,
@@ -678,8 +678,8 @@ def arguments(argv=None):
                         help="Maximum child levels in recursive/autonomous mode (0-3, default 3)")
     parser.add_argument("--autonomous-max-children", type=int, default=8,
                         help="Autonomous mode: maximum accepted child branches per incident (1-16, default 8)")
-    parser.add_argument("--autonomous-max-tokens", type=int, default=50000,
-                        help="Autonomous mode: shared prompt+completion token budget per incident (1024-200000, default 50000)")
+    parser.add_argument("--autonomous-max-tokens", type=int, default=100000,
+                        help="Autonomous/adaptive mode: shared prompt+completion token budget per incident (1024-200000, default 100000)")
     parser.add_argument("--tasks", type=int, nargs="+", default=None, help="Archive: 3 6 8; repair: 1 2 4 by default")
     parser.add_argument("--records", type=int, default=65, help="Rows in each archive (default 65)")
     parser.add_argument("--repeats", type=int, default=2, help="Different seeds per task level (default 2)")
@@ -761,8 +761,8 @@ def arguments(argv=None):
             parser.error(str(ex))
     if len(set(args.modes)) != len(args.modes):
         parser.error("--modes must not contain duplicates")
-    if any(mode in args.modes for mode in ("recursive", "autonomous")) and args.scenario != "repair":
-        parser.error("--modes recursive/autonomous are supported only for --scenario repair")
+    if any(mode in args.modes for mode in ("recursive", "autonomous", "adaptive")) and args.scenario != "repair":
+        parser.error("--modes recursive/autonomous/adaptive are supported only for --scenario repair")
     if not 0 <= args.no_action_retries <= 2:
         parser.error("--no-action-retries must be 0-2")
     if not 64 <= args.no_action_retry_output_tokens <= 4096:
@@ -800,7 +800,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "scoring_version": 3,
                   "simulator_rules_version": 2,
                   "mandatory_authority_inspection": args.scenario == "repair",
-                  "benchmark_version": "1.2.0", "scenario": args.scenario,
+                  "benchmark_version": "1.7.0", "scenario": args.scenario,
                   "engine": args.engine,
                   "llama_reset_policy": ("reuse" if args.reuse_llama else "fresh_each_trial") if args.engine == "llama" else None,
                   "jan_reset_policy": (("each_trial" if args.restart_jan_between_trials else
@@ -822,6 +822,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "modes": args.modes, "recursive_max_depth": args.recursive_max_depth,
                   "autonomous_max_children": args.autonomous_max_children,
                   "autonomous_max_tokens": args.autonomous_max_tokens,
+                  "adaptive_surprise": "adaptive" in args.modes,
                   "recursive_checkpoint_threshold": args.recursive_checkpoint_threshold,
                   "recursive_checkpoint_max": args.recursive_checkpoint_max,
                   "stage_start_inspects": args.stage_start_inspects,
@@ -862,6 +863,12 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "autonomous_missed_opportunities", "autonomous_decisions",
         "autonomous_tokens_used", "autonomous_token_budget",
         "autonomous_branch_count", "autonomous_context_count", "autonomous_max_depth",
+        "adaptive_surprise_triggers", "adaptive_marker_count", "adaptive_branch_attempts",
+        "adaptive_branches", "adaptive_branch_failures", "adaptive_resumes",
+        "adaptive_decisions", "adaptive_child_decisions", "adaptive_child_actions",
+        "adaptive_parent_prompt_before_marker", "adaptive_parent_prompt_after_resume",
+        "adaptive_child_prompt_tokens", "adaptive_child_tokens",
+        "adaptive_child_transcript_leaks",
         "no_action_investigation_calls", "empty_investigation_replies",
         "no_action_retry_attempts", "no_action_retry_recoveries", "no_action_retry_failures", "out_of_scope_actions",
         "stage_start_calls", "stage_start_inference_seconds",
@@ -1080,6 +1087,26 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{sum(r.get('autonomous_tokens_used', 0) for r in rows)} / "
                                  f"{max((r.get('autonomous_token_budget', 0) for r in rows), default=0)} | "
                                  f"{max((r.get('autonomous_max_depth', 0) for r in rows), default=0)} |")
+        if "adaptive" in args.modes:
+            lines += ["", "## Adaptive surprise-branch diagnostics", "",
+                      "The adaptive arm injects one explicit unexpected blocker at the first repair attempt. "
+                      "The controller saves the parent message list at a marker, solves the focused problem in "
+                      "a private child context, and resumes the parent with only a compact receipt. Child "
+                      "transcripts and simulator oracle values must never enter the resumed parent.", "",
+                      "| Tasks | Surprise triggers | Markers | Child branches | Child failures | Resumes | Child tokens | Parent tokens before/after | Transcript leaks |",
+                      "|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+            for n in args.tasks:
+                rows = [r for r in data if r["tasks"] == n and r["mode"] == "adaptive"]
+                if rows:
+                    lines.append(f"| {n} | {sum(r.get('adaptive_surprise_triggers', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_marker_count', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_branches', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_branch_failures', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_resumes', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_child_tokens', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_parent_prompt_before_marker', 0) for r in rows)} / "
+                                 f"{sum(r.get('adaptive_parent_prompt_after_resume', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_child_transcript_leaks', 0) for r in rows)} |")
         lines += ["", "A repair is counted as **verified** only after the AI successfully submits a policy-valid "
                   "release/route/certificate triple AND requests verification. A plausible written answer is not enough. "
                   "Wrong repairs return noisy simulator logs, costing context; decoy documents also add context. "
@@ -1150,7 +1177,8 @@ def main(argv=None):
         else:
             puzzle = create_trap_puzzle(seed, n, args.trap_log_lines, args.trap_density, args.recovery_log_lines,
                                         args.nested_depth, args.nested_log_lines,
-                                        args.pressure_records, args.pressure_detail_chars)
+                                        args.pressure_records, args.pressure_detail_chars,
+                                        adaptive_surprise=("adaptive" in args.modes))
             mandatory_paths = {"registry/releases", "registry/approvals", "network/aliases",
                                "network/routes", "security/certificates"} | {
                                path for path in puzzle["cases"][0]["docs"]

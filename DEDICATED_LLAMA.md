@@ -31,6 +31,22 @@ python3 benchmark.py --engine llama --scenario repair \
   --recovery-log-lines 8 --pressure-records 0 --max-actions 32
 ```
 
+To test the original unexpected-problem marker and snap-back flow, run the
+separate adaptive arm:
+
+```bash
+python3 benchmark.py --engine llama --scenario repair \
+  --modes adaptive --tasks 1 --repeats 3 --seed 20261026 \
+  --context-limit 8192 --nested-depth 2 --nested-log-lines 8 \
+  --recovery-log-lines 8 --pressure-records 0 --max-actions 48 \
+  --autonomous-max-tokens 100000
+```
+
+`adaptive` creates a private child only after the simulator emits an explicit
+unexpected blocker, then resumes the parent from its saved marker. This is
+different from the legacy `autonomous` arm, which tests model-selected
+delegation of known prerequisite stages.
+
 Priority when multiple paths are provided: **`--llama-model` argument → `CONTEXT_BRANCH_MODEL` environment variable → `MODEL_PATH` in `local_model.json`**. Jan mode is unaffected. You can override the configured model for one run with `--llama-model "/another/model.gguf"`.
 
 ---
@@ -48,8 +64,9 @@ python3 benchmark.py --engine llama --llama-model "$MODEL" \
 Recursive child tasks are restricted to their own document paths and actions. Verified child handoffs describe the unlocked simulator state, not the child transcript. Empty or invalid JSON investigation replies get one additional model call before the simulator charges an invalid action. The additional token/time overhead is always measured.
 
 This is a controlled test with the same scenario seed. Add `autonomous` to the
-repair `--modes` list to let the model emit explicit delegation actions; new live
-Qwen results are still needed before drawing performance conclusions.
+repair `--modes` list to let the model emit explicit delegation actions; add
+`adaptive` to test marker/resume behavior. New live Qwen results are still
+needed before drawing performance conclusions.
 
 ---
 
@@ -69,8 +86,10 @@ is restarted between each trial as before. Each recursive stage operates on
 a common virtual simulator but does not inherit another stage's conversation.
 The `recursive` arm tests controlled stage splitting; the separate `autonomous`
 arm tests model-selected delegation under the same simulator and action budget.
-Include `--modes linear summarized branch recursive autonomous` for a five-way
-test; use at least `--tasks 3` to exercise summarized mode.
+The `adaptive` arm tests an unexpected blocker, private child, and parent
+snap-back. Include `--modes linear summarized branch recursive autonomous
+adaptive` for a six-way test; use at least `--tasks 3` to exercise summarized
+mode.
 
 See [ROADMAP.md](ROADMAP.md) for the additional goals: autonomous branching
 and handling investigation calls that consume tokens without an action.
