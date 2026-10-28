@@ -222,7 +222,14 @@ def adaptive_root_instruction():
         'new issue discovered during this task: the controller will preserve a '
         'checkpoint and isolate the focused repair automatically. Do not assume the '
         'child transcript will return; after a resume, use only the compact verified '
-        'receipt and continue from the checkpoint. Never invent a successful repair.')
+        'receipt and continue from the checkpoint. Use these exact field names: '
+        '{"action":"inspect","path":"guide/index"}; '
+        '{"action":"rebuild_index","token":"..."}; '
+        '{"action":"unlock_escrow","token":"..."}; '
+        '{"action":"recover","token":"..."}; '
+        '{"action":"repair","release":"REL-...","route":"ROUTE-...",'
+        '"certificate":"CERT-..."}; or {"action":"verify"}. '
+        'Do not use a generic `target` field. Never invent a successful repair.')
 
 
 def adaptive_child_instruction():
@@ -235,7 +242,9 @@ def adaptive_child_instruction():
         'evidence needed to resolve it, use the normal simulator actions, and apply '
         'and verify the repair if the evidence supports it. Do not ask the parent '
         'for its transcript, do not invent observations, and do not delegate a '
-        'second child. Emit exactly one JSON simulator action per turn.')
+        'second child. Emit exactly one JSON simulator action per turn. Use '
+        'inspect with `path`, repair with `release`, `route`, and `certificate`; '
+        'never substitute a generic `target` field.')
 
 
 def _autonomous_dependency_chain(stage, nested_depth):
