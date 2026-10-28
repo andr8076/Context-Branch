@@ -29,6 +29,68 @@ STAGE_ACTIONS = {
 }
 
 
+class ContextCheckpointBlocked(RuntimeError):
+    """A checkpoint could not fit without discarding unverified evidence.
+
+    This is an intentional safety stop, not a transport or model-server error.
+    Callers can report it separately while retaining the completed stage history.
+    """
+
+    error_kind = 'context_checkpoint_blocked'
+
+    def __init__(self, *, stage, reason, before_est_tokens, after_est_tokens,
+                 context_limit, output_budget, documents_preserved,
+                 change_chars_before=0, change_chars_after=0):
+        self.stage = stage
+        self.reason = reason
+        self.before_est_tokens = before_est_tokens
+        self.after_est_tokens = after_est_tokens
+        self.context_limit = context_limit
+        self.output_budget = output_budget
+        self.documents_preserved = list(documents_preserved)
+        self.change_chars_before = change_chars_before
+        self.change_chars_after = change_chars_after
+        super().__init__(
+            f'Context checkpoint blocked for stage={stage}: {reason}; '
+            f'preserved evidence estimate={after_est_tokens} plus output reserve '
+            f'{output_budget} does not fit context limit {context_limit}')
+
+
+def compact_non_mutating_change(last_change):
+    """Compact only an explicitly rejected/blocked simulator observation.
+
+    Wrong repairs can carry a large diagnostic log even though they changed no
+    state. Keeping that log in every checkpoint can exhaust the context. We do
+    not summarize successful or otherwise ambiguous changes: if those cannot
+    fit, the caller must stop rather than risk losing state evidence.
+    """
+    if last_change is None:
+        return last_change, None
+    action, observation = last_change
+    text = str(observation or '')
+    if len(text) <= 512:
+        return last_change, None
+    first_line = text.splitlines()[0].strip().upper()
+    explicitly_non_mutating = (
+        first_line.startswith(('REJECTED:', 'REPAIR BLOCKED:',
+                               'RECOVERY REJECTED:', 'INDEX REJECTED:',
+                               'ESCROW REJECTED:', 'VERIFY FAILED:'))
+        or 'NO CHANGES WERE APPLIED' in text.upper()
+    )
+    if not explicitly_non_mutating:
+        return last_change, None
+    compact = (
+        'SIMULATOR RESULT: Previous action was explicitly rejected or blocked; '
+        'no verified state change occurred. Re-inspect the required evidence '
+        'before continuing and do not repeat the rejected proposal.'
+    )
+    return (action, compact), {
+        'reason': 'rejected_or_blocked_observation',
+        'before_chars': len(text),
+        'after_chars': len(compact),
+    }
+
+
 def stage_done(stage, sim):
     if stage in ('index', 'escrow'):
         return stage in sim.nested_completed
@@ -155,7 +217,9 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
                  'rejected_out_of_scope': 0, 'handoff': None,
                  'stage_start_inspections': 0, 'stage_start_disabled': False,
                  'context_checkpoints': 0, 'checkpoint_details': [],
-                 'context_checkpoint_blocked': False}
+                 'context_checkpoint_blocked': False,
+                 'context_checkpoint_block_reason': None,
+                 'context_checkpoint_compactions': 0}
         events.append(event)
         if depth > max_depth:
             event['status'] = 'depth_limit'
@@ -199,17 +263,46 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
                 shorter = checkpoint_context(original_context, inspected, last_change)
                 after_tokens = bm.approximate_tokens(shorter)
                 # Do not loop on a checkpoint that cannot actually reduce history.
+                compacted_change = None
+                if after_tokens + budget + 256 >= context_limit:
+                    compacted_last_change, compacted_change = compact_non_mutating_change(last_change)
+                    if compacted_change is not None:
+                        shorter = checkpoint_context(original_context, inspected, compacted_last_change)
+                        after_tokens = bm.approximate_tokens(shorter)
                 if after_tokens + budget + 256 >= context_limit:
                     event['context_checkpoint_blocked'] = True
-                    raise RuntimeError('Context checkpoint cannot fit unmodified observed evidence')
+                    event['context_checkpoint_block_reason'] = (
+                        'uncompactable_change_observation' if last_change is not None else
+                        'unique_evidence_exceeds_budget')
+                    event['status'] = 'context_checkpoint_blocked'
+                    raise ContextCheckpointBlocked(
+                        stage=stage,
+                        reason=event['context_checkpoint_block_reason'],
+                        before_est_tokens=before_tokens,
+                        after_est_tokens=after_tokens,
+                        context_limit=context_limit,
+                        output_budget=budget,
+                        documents_preserved=inspected,
+                        change_chars_before=(compacted_change or {}).get('before_chars',
+                            len(str(last_change[1])) if last_change is not None else 0),
+                        change_chars_after=(compacted_change or {}).get('after_chars',
+                            len(str(last_change[1])) if last_change is not None else 0))
                 if after_tokens + 64 < predicted:
                     context = shorter
                     event['context_checkpoints'] += 1
+                    if compacted_change is not None:
+                        event.setdefault('context_checkpoint_compactions', 0)
+                        event['context_checkpoint_compactions'] += 1
                     event['checkpoint_details'].append(
                         {'before_est_tokens': before_tokens,
                          'after_est_tokens': after_tokens,
                          'documents_preserved': list(inspected),
-                         'retained_change': last_change is not None})
+                         'retained_change': last_change is not None,
+                         'compacted_last_change': compacted_change is not None,
+                         'change_chars_before': (compacted_change or {}).get(
+                             'before_chars', len(str(last_change[1])) if last_change is not None else 0),
+                         'change_chars_after': (compacted_change or {}).get(
+                             'after_chars', len(str(last_change[1])) if last_change is not None else 0)})
                     last_prompt_tokens = None
                     last_prompt_estimate = None
                     # Following a checkpoint, the branch still has the same environment.
@@ -264,3 +357,4 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
 
     success = solve('repair', 0, None)
     return success, events, counters
+

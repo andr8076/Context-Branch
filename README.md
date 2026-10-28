@@ -1,5 +1,12 @@
 # v1.5 — bounded Jan branches and reliable resumes
 
+**Benchmark safety update:** recursive checkpoint pressure tests now compact only
+explicitly rejected/blocked observations that confirm no state change. Ambiguous
+or successful observations are preserved, and an evidence-preserving checkpoint
+that cannot fit is reported as `context_checkpoint_blocked` instead of a generic
+runtime error. The comparison tool distinguishes a robustness win from a safe,
+incomplete stop.
+
 **v1.5.1:** final-response recovery now uses a separate 2,048-token allowance
 instead of the short 256-token tool-action retry cap. Cutoff and reasoning-usage
 diagnostics are returned even when transcript saving is off. Shared budgets still

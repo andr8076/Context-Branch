@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import benchmark as bm
+import recursive_benchmark as rb
 import trap_benchmark as tb
 from test_trap_benchmark import DeliberateFakeJan
 
@@ -435,6 +436,79 @@ class RecursiveContextTests(unittest.TestCase):
                                       recovery_log_lines=8, nested_log_lines=8)
         self.assertEqual(trial['verified_cases'], 1, trial['error'])
         self.assertEqual(trial['recursive_checkpoints'], 0)
+
+    def test_large_rejected_change_is_compacted_without_hiding_state_change(self):
+        action = {'action': 'repair', 'release': 'REL-BAD',
+                  'route': 'ROUTE-BAD', 'certificate': 'CERT-BAD'}
+        noisy = ('REJECTED: proposed repair was not authorized. No changes were applied.\n'
+                 + ('ARCHIVED DIAGNOSTIC NOISE\n' * 500))
+        compacted, metadata = rb.compact_non_mutating_change((action, noisy))
+        self.assertIsNotNone(metadata)
+        self.assertLess(len(compacted[1]), len(noisy))
+        self.assertIn('no verified state change occurred', compacted[1])
+        self.assertNotIn('ARCHIVED DIAGNOSTIC NOISE', compacted[1])
+        self.assertEqual(compacted[0], action)
+
+    def test_large_rejected_change_uses_checkpoint_fallback(self):
+        class RejectOnce(RecursiveFakeJan):
+            def __init__(self):
+                super().__init__(max_chars=1000000)
+                self.rejected = False
+                self.good_sent = False
+
+            def __call__(self, method, url, cfg, payload=None):
+                response = super().__call__(method, url, cfg, payload)
+                if method == 'GET' or not payload:
+                    return response
+                if 'RECURSIVE STAGE=repair' not in payload['messages'][0]['content']:
+                    return response
+                action = tb.parse_action(response['choices'][0]['message'].get('content'))
+                if action and action.get('action') == 'repair' and not self.rejected:
+                    self.rejected = True
+                    bad = {'action': 'repair', 'release': 'REL-BAD',
+                           'route': 'ROUTE-BAD', 'certificate': 'CERT-BAD'}
+                    response['choices'][0]['message']['content'] = json.dumps(bad)
+                elif action and action.get('action') == 'verify' and self.rejected and not self.good_sent:
+                    good = {'action': 'repair', **self._derive_repair(payload['messages'])}
+                    response['choices'][0]['message']['content'] = json.dumps(good)
+                    self.good_sent = True
+                return response
+
+        cfg = self.cfg()
+        cfg.update({'_recursive_checkpoint_threshold': 0.50,
+                    '_recursive_checkpoint_max': 8,
+                    '_stage_start_inspects': 2,
+                    '_stage_start_output_tokens': 256})
+        fake = RejectOnce()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', fake):
+            trial = tb.run_trap_trial('recursive', 17, 1, cfg, 'mock', 3072,
+                                      Path(tmp), bm, nested_depth=2,
+                                      recovery_log_lines=8, nested_log_lines=8,
+                                      pressure_records=1, max_actions=48)
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertTrue(trial['exact_final'], trial['error'])
+        self.assertGreater(trial['recursive_checkpoint_compactions'], 0,
+                           trial['recursive_events'])
+        details = [d for event in trial['recursive_events'][0]['stages']
+                   for d in event['checkpoint_details']]
+        self.assertTrue(any(d['compacted_last_change'] for d in details))
+
+    def test_ambiguous_large_change_is_not_compacted(self):
+        action = {'action': 'repair', 'release': 'REL-OK',
+                  'route': 'ROUTE-OK', 'certificate': 'CERT-OK'}
+        noisy = 'APPLIED: state changed; verify now.\n' + ('DETAIL\n' * 500)
+        unchanged, metadata = rb.compact_non_mutating_change((action, noisy))
+        self.assertIsNone(metadata)
+        self.assertEqual(unchanged[1], noisy)
+
+    def test_checkpoint_block_is_a_first_class_error(self):
+        error = rb.ContextCheckpointBlocked(
+            stage='repair', reason='unique_evidence_exceeds_budget',
+            before_est_tokens=2800, after_est_tokens=2600,
+            context_limit=3072, output_budget=1024,
+            documents_preserved=('guide/index', 'registry/releases'))
+        self.assertEqual(bm.classify_exception(error), 'context_checkpoint_blocked')
+        self.assertIn('repair', str(error))
 
     def test_checkpoint_threshold_argument_validation(self):
         args = bm.arguments(['--scenario','repair','--recursive-checkpoint-threshold','0.76',

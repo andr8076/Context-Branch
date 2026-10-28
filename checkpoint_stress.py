@@ -80,19 +80,33 @@ def run(argv=None):
         "settings_same_except_checkpoint_threshold": True,
         "off": {field: control.get(field) for field in
                 ("verified_cases", "exact_final", "error_type", "recursive_checkpoints",
+                 "recursive_checkpoint_blocked", "recursive_checkpoint_compactions",
+                 "recursive_checkpoint_block_reasons", "final_status", "failed_phase",
                  "authority_docs_viewed", "total_actions", "elapsed_seconds",
                  "total_processed_tokens", "peak_branch_prompt_tokens")},
         "on": {field: treatment.get(field) for field in
                ("verified_cases", "exact_final", "error_type", "recursive_checkpoints",
+                "recursive_checkpoint_blocked", "recursive_checkpoint_compactions",
+                "recursive_checkpoint_block_reasons", "final_status", "failed_phase",
                 "authority_docs_viewed", "total_actions", "elapsed_seconds",
                 "total_processed_tokens", "peak_branch_prompt_tokens")},
     }
+    control_success = control.get("exact_final") and control.get("verified_cases") == 1
+    treatment_success = treatment.get("exact_final") and treatment.get("verified_cases") == 1
     if not treatment.get("recursive_checkpoints"):
         verdict = "INCONCLUSIVE: checkpoint did not activate; increase legitimate workload or adjust context limit."
-    elif (control.get("error_type") == "context_overflow_confirmed" and
-          treatment.get("exact_final") and treatment.get("verified_cases") == 1):
+    elif control.get("error_type") == "context_overflow_confirmed" and treatment_success:
         verdict = "SUCCESSFUL DEMONSTRATION: control overflowed; checkpoint run verified the repair."
-    elif treatment.get("exact_final") and treatment.get("verified_cases") == 1:
+    elif treatment_success and not control_success:
+        verdict = ("CHECKPOINT ROBUSTNESS WIN: checkpoint run completed while control did not; "
+                   f"control outcome={control.get('final_status') or control.get('error_type')}. "
+                   "The cause may be action exhaustion or model variance, not necessarily overflow.")
+    elif (control.get("error_type") == "context_overflow_confirmed" and
+          treatment.get("error_type") == "context_checkpoint_blocked"):
+        verdict = ("SAFE CHECKPOINT BLOCK: control overflowed and checkpointing refused to discard "
+                   "evidence, but the treatment did not complete. Reduce evidence, lower the output "
+                   "reserve, or use a larger context.")
+    elif treatment_success:
         verdict = "CHECKPOINT VERIFIED: it activated and the run completed; control did not prove necessity."
     else:
         verdict = "CHECKPOINT ACTIVATED BUT DID NOT COMPLETE: inspect both traces and stage events."
@@ -106,3 +120,4 @@ def run(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(run())
+
