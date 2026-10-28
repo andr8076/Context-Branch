@@ -1,14 +1,17 @@
-# v1.7 — adaptive surprise branches
+# v1.8 — verified parent continuation
 
 The original autonomous-branching path is now represented by the opt-in
 `adaptive` repair arm. It injects one explicit unexpected blocker at the first
-repair attempt, records the parent's message list as a marker, forks that marker
-into a private child context, and resumes the parent with only a compact verified
-receipt. Results expose surprise triggers, marker creation, child work, parent
-prompt size before/after resume, and transcript-leak checks.
+repair attempt, records the parent's message list as a marker, and forks that
+marker into a private child context. The child resolves only the new blocker.
+The restored parent must then apply and verify the original repair using the
+evidence retained at its marker. Results expose child blocker resolution, parent
+decisions and actions after the resume, final verification in the resumed parent,
+prompt sizes and transcript isolation.
 
-Offline tests cover the complete marker → child → resume path. A live Qwen run
-is still required to measure real model behavior and context savings.
+Offline tests require actual model calls after the resume and fail if the child
+finishes the incident itself. Live Qwen runs are still required to measure
+reliability and context savings.
 
 Example:
 
