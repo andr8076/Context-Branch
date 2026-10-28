@@ -572,7 +572,11 @@ def run_trial(mode, seed, tasks, records, cfg, model, context_limit, save_dir,
                 lookup_status = "correct" if answer == answer_expected else ("wrong" if answer else "missing_or_unreadable")
             else:
                 trace.phase = "branch_lookup"
-                isolated = bc.run_branch(cfg, side_prompt, f"Task: {name}; look up only its requested seal.")
+                # Archive lookups have one generation allowance in every mode.
+                # Runtime-only final/recovery defaults must not give this arm
+                # more output tokens or retries than the other lookup arms.
+                lookup_cfg = dict(cfg, final_output_tokens=cfg["max_output_tokens"], no_action_retries=0)
+                isolated = bc.run_branch(lookup_cfg, side_prompt, f"Task: {name}; look up only its requested seal.")
                 answer = str(isolated.get("result") or "")
                 reason = trace.calls[-1]["finish_reason"] if trace.calls else None
                 lookup_status = "correct" if answer == answer_expected else ("wrong" if answer else "missing_or_unreadable")
@@ -1291,3 +1295,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -46,6 +46,7 @@ DEFAULTS = {
     "model": "auto",
     "request_timeout_seconds": 180,
     "max_output_tokens": 700,
+    "final_output_tokens": 2048,
     "max_agent_turns": 5,
     "max_branch_depth": 2,
     "max_parent_result_chars": 1800,
@@ -80,6 +81,7 @@ def config():
     if u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost", "::1") or u.username or u.password or u.query or u.fragment:
         raise ValueError("For privacy, api_base_url must be an HTTP loopback address (localhost)")
     for name, low, high in (("request_timeout_seconds", 5, 600), ("max_output_tokens", 64, 4096),
+                            ("final_output_tokens", 64, 4096),
                             ("max_agent_turns", 1, 12), ("max_branch_depth", 0, 4),
                             ("max_parent_result_chars", 200, 4000), ("max_context_chars", 400, 16000),
                             ("context_limit_tokens", 1024, 1048576), ("context_safety_tokens", 64, 4096),
@@ -306,6 +308,44 @@ def parse_result(raw):
             "next_step": "Validate this free-form result", "caveats": "Model did not return structured JSON"}
 
 
+def visible_result_text(raw):
+    """Recover only a fully emitted top-level result string from incomplete JSON.
+
+    Do not close strings/objects, borrow nested fields or fabricate omitted keys.
+    This evidence can only be returned as partial, never a successful outcome.
+    """
+    text = re.sub(r"^```(?:json)?\s*", "", (raw or "").strip(), flags=re.I)
+    if not text.startswith("{"):
+        return None
+    decoder = json.JSONDecoder()
+    position = 1
+    try:
+        while position < len(text):
+            while position < len(text) and text[position].isspace():
+                position += 1
+            key, position = decoder.raw_decode(text, position)
+            if not isinstance(key, str):
+                return None
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if position >= len(text) or text[position] != ":":
+                return None
+            position += 1
+            while position < len(text) and text[position].isspace():
+                position += 1
+            value, position = decoder.raw_decode(text, position)
+            if key == "result":
+                return value if isinstance(value, str) else None
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if position >= len(text) or text[position] != ",":
+                return None
+            position += 1
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
 def safe_file(project_root, requested):
     root = Path(project_root).resolve()
     relative = Path(str(requested))
@@ -415,6 +455,7 @@ def format_parent(branch, cfg):
             "subbranches": branch.get("subbranches", []),
             "stop_reason": branch.get("stop_reason"),
             "usage": usage,
+            "response_diagnostics": response_summary(branch.get("runtime", {})),
             "verification": "model_reported; read-only tool observations do not independently verify the conclusion",
             "note": "Branch reasoning was isolated. This note does not restore or modify Jan's main conversation history."}
 
@@ -447,9 +488,18 @@ def usable_reply(answer, tools):
         if not tools or not isinstance(calls, list):
             return False
         ids = [call.get("id") for call in calls if isinstance(call, dict)]
-        return (len(ids) == len(calls) and all(isinstance(i, str) and i for i in ids)
-                and len(set(ids)) == len(ids)
-                and all(isinstance(call.get("function"), dict) for call in calls))
+        valid = (len(ids) == len(calls) and all(isinstance(i, str) and i for i in ids)
+                 and len(set(ids)) == len(ids)
+                 and all(isinstance(call.get("function"), dict) for call in calls))
+        if not valid:
+            return False
+        try:
+            return all(isinstance(call["function"].get("name"), str)
+                       and bool(call["function"]["name"])
+                       and isinstance(json.loads(call["function"].get("arguments") or "{}"), dict)
+                       for call in calls)
+        except (ValueError, TypeError):
+            return False
     data = result_object(message_content(answer))
     return (data is not None and data.get("status") in ("success", "partial", "blocked")
             and all(isinstance(data.get(key), str) for key in
@@ -457,18 +507,99 @@ def usable_reply(answer, tools):
             and bool(data["result"].strip()))
 
 
+def reply_diagnostics(answer, tools, output_cap):
+    usage = getattr(answer, "usage", {})
+    details = usage.get("completion_tokens_details") or {}
+    reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, dict) else None
+    reasoning = answer.get("reasoning_content") or ""
+    if isinstance(reasoning, list):
+        reasoning = "".join(str(part.get("text", "")) for part in reasoning if isinstance(part, dict))
+    content = message_content(answer)
+    finish_reason = getattr(answer, "finish_reason", None)
+    completion_tokens = usage.get("completion_tokens")
+    if usable_reply(answer, tools):
+        status = "tool_call" if answer.get("tool_calls") else "final_result"
+    elif str(finish_reason or "").lower() in ("length", "max_tokens"):
+        status = "output_truncated_confirmed"
+    elif (not finish_reason and type(completion_tokens) is int
+          and completion_tokens >= output_cap - 3):
+        status = "output_truncated_suspected"
+    elif answer.get("tool_calls"):
+        status = "invalid_tool_call"
+    elif not content.strip():
+        status = "empty_visible_output"
+    elif result_object(content) is not None:
+        status = "invalid_final_result"
+    else:
+        status = "malformed_response"
+    return {"response_status": status, "reported_reasoning_tokens": reasoning_tokens,
+            "reasoning_output_chars": len(str(reasoning)),
+            "empty_visible_output": not bool(content.strip()),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": completion_tokens, "finish_reason": finish_reason}
+
+
+def response_summary(metrics):
+    calls = metrics.get("calls") or []
+    if not calls:
+        return {}
+    last = calls[-1]
+    failures = [row.get("response_status") for row in calls
+                if row.get("response_status") not in (None, "tool_call", "final_result")]
+    return {"last_status": last.get("response_status"),
+            "first_failure": failures[0] if failures else None,
+            "finish_reason": last.get("finish_reason"),
+            "output_tokens": last.get("completion_tokens"),
+            "output_cap": last.get("requested_max_tokens"),
+            "reported_reasoning_tokens": last.get("reported_reasoning_tokens"),
+            "reasoning_output_chars": last.get("reasoning_output_chars"),
+            "retry_kind": last.get("retry_kind"),
+            "retry_recoveries": metrics.get("reply_retry_recoveries", 0)}
+
+
+def retry_kind(answer, diagnostics, tools):
+    if not tools or diagnostics.get("response_status", "").startswith("output_truncated"):
+        return "completion"
+    if answer.get("tool_calls"):
+        return "action"
+    content = message_content(answer).strip()
+    if not content or result_object(content) is not None or re.match(
+            r'^\s*(?:```(?:json)?\s*)?\{\s*"(?:status|result|what_changed|next_step|caveats)"\s*:',
+            content, flags=re.I):
+        return "completion"
+    return "action"
+
+
+def unusable_stop_reason(metrics):
+    status = response_summary(metrics).get("last_status", "") or ""
+    return status if status.startswith("output_truncated") else "no_usable_response"
+
+
 def request_branch_reply(cfg, model, messages, tools, budget, metrics):
     """Every initial call, retry and forced final uses the same run ledger."""
     answer = {}
+    diagnostics = {}
+    output_tokens = cfg["max_output_tokens"] if tools else cfg["final_output_tokens"]
     for attempt in range(cfg["no_action_retries"] + 1):
         prompt = messages
-        output_tokens = cfg["max_output_tokens"]
+        kind = None
         if attempt:
-            output_tokens = min(output_tokens, cfg["retry_output_tokens"])
+            kind = retry_kind(answer, diagnostics, tools)
+            if kind == "completion":
+                # A cut-off final result must not receive the smaller action cap.
+                output_tokens = max(output_tokens, cfg["final_output_tokens"])
+                instruction = ("The previous response was empty, incomplete or invalid. "
+                    "Return a permitted tool call if more evidence is needed, otherwise ONLY "
+                    "complete final JSON with status, result, what_changed, next_step and caveats. "
+                    "Keep result brief, include every key, and put essential uncertainty in caveats. "
+                    "Do not repeat analysis or add markdown.")
+            else:
+                output_tokens = min(cfg["max_output_tokens"], cfg["retry_output_tokens"])
+                instruction = ("No valid action was produced. Return one permitted tool call, "
+                    "or a brief complete final JSON object with status, result, what_changed, "
+                    "next_step and caveats. No analysis or markdown.")
             prompt = messages + [{"role": "user", "content":
-                "No usable response was produced. Return a permitted tool call, or ONLY "
-                "complete final JSON with status, result, what_changed, next_step and caveats. "
-                "No analysis or markdown."}]
+                instruction}]
         predicted = budget.predicted_prompt(prompt, tools)
         if predicted + output_tokens + budget.limits["context_safety_tokens"] >= budget.limits["context_limit_tokens"] * 0.78:
             shorter, removed = deduplicate_reads(messages)
@@ -489,7 +620,7 @@ def request_branch_reply(cfg, model, messages, tools, budget, metrics):
         request_cfg = dict(cfg, max_output_tokens=output_tokens,
                            request_timeout_seconds=min(cfg["request_timeout_seconds"], budget.remaining_seconds()))
         metrics["model_calls"] += 1
-        row = {"retry": bool(attempt), "prompt_est_tokens": predicted,
+        row = {"retry": bool(attempt), "retry_kind": kind, "prompt_est_tokens": predicted,
                "requested_max_tokens": output_tokens, "prompt_tokens": None,
                "completion_tokens": None, "finish_reason": None,
                "empty_visible_output": None, "error_type": None}
@@ -498,10 +629,8 @@ def request_branch_reply(cfg, model, messages, tools, budget, metrics):
         try:
             answer = chat(request_cfg, model, prompt, tools)
             usage = getattr(answer, "usage", {})
-            row.update(prompt_tokens=usage.get("prompt_tokens"),
-                       completion_tokens=usage.get("completion_tokens"),
-                       finish_reason=getattr(answer, "finish_reason", None),
-                       empty_visible_output=not bool(message_content(answer).strip()))
+            diagnostics = reply_diagnostics(answer, tools, output_tokens)
+            row.update(diagnostics)
             budget.after_call(reservation, usage)
         except Exception as ex:
             row["error_type"] = type(ex).__name__
@@ -509,6 +638,8 @@ def request_branch_reply(cfg, model, messages, tools, budget, metrics):
         finally:
             row["elapsed_seconds"] = round(budget.elapsed() - started, 3)
         if usable_reply(answer, tools):
+            if attempt:
+                metrics["reply_retry_recoveries"] = metrics.get("reply_retry_recoveries", 0) + 1
             return answer
     return answer
 
@@ -630,7 +761,7 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
             final = content
             messages.append({"role": "assistant", "content": final})
             if not usable_reply(answer, tools):
-                branch["stop_reason"] = "no_usable_response"
+                branch["stop_reason"] = unusable_stop_reason(metrics)
             break
         if final is None:
             messages.append({"role": "user", "content": "Tool budget exhausted. Answer now using ONLY compact final JSON, no more tool use."})
@@ -638,15 +769,23 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
             final = message_content(final_msg)
             messages.append({"role": "assistant", "content": final})
             if not usable_reply(final_msg, None):
-                branch["stop_reason"] = "no_usable_response"
+                branch["stop_reason"] = unusable_stop_reason(metrics)
         outcome = parse_result(final)
+        source = result_object(final)
+        if source is None and branch.get("stop_reason"):
+            visible = visible_result_text(final)
+            if visible is not None:
+                outcome.update(result=visible,
+                               next_step="Retry to obtain the complete structured result",
+                               caveats="Only the fully emitted result text was retained; final JSON was incomplete")
         if branch.get("stop_reason") and outcome["status"] == "success":
             outcome["status"] = "partial"
             outcome["caveats"] += " Response did not match the required tool or final-result protocol."
         if not final.strip():
             outcome.update(status="blocked", result="No usable response after bounded recovery",
                            next_step="Check model output settings or try a smaller side task")
-        if outcome["what_changed"].strip().casefold() not in ("nothing", "none", ""):
+        if (source is not None and isinstance(source.get("what_changed"), str)
+                and source["what_changed"].strip().casefold() not in ("nothing", "none", "")):
             outcome["caveats"] = clip(outcome["caveats"] + " External changes were not verified; branch tools are read-only.", 700)
         outcome["what_changed"] = "Nothing"
         for key, maximum in (("result", 5000), ("what_changed", 700), ("next_step", 1000), ("caveats", 700)):
@@ -742,7 +881,7 @@ def handle_rpc(request):
         requested = (request.get("params") or {}).get("protocolVersion", PROTOCOL)
         return {"jsonrpc": "2.0", "id": rid,
                 "result": {"protocolVersion": requested, "capabilities": {"tools": {"listChanged": False}},
-                           "serverInfo": {"name": "jan-branch-context", "version": "1.5.0"},
+                           "serverInfo": {"name": "jan-branch-context", "version": "1.5.1"},
                            "instructions": "Use branch_solve for isolated side tasks; only short results return. No browser/tools inherited. Do not pass secrets."}}
     if method == "ping":
         return {"jsonrpc": "2.0", "id": rid, "result": {}}

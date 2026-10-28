@@ -191,7 +191,7 @@ class RuntimeTests(unittest.TestCase):
             resumed = b.run_branch(self.cfg, "Continue child", existing_id=child["branch_id"])
         self.assertEqual(resumed["stop_reason"], "run_call_limit")
 
-    def test_empty_reply_recovery_is_short_and_charged_to_shared_budget(self):
+    def test_empty_reply_recovery_has_completion_headroom_and_is_charged_to_shared_budget(self):
         caps = []
 
         def agent(cfg, model, messages, tools=None):
@@ -201,7 +201,7 @@ class RuntimeTests(unittest.TestCase):
         with patch.object(b, "chat", agent):
             result = b.run_branch(self.cfg, "Answer")
         self.assertEqual(result["status"], "success")
-        self.assertEqual(caps, [700, 256])
+        self.assertEqual(caps, [700, 2048])
         self.assertEqual(result["usage"]["model_calls"], 2)
         self.assertEqual(result["usage"]["no_action_retries"], 1)
         self.assertFalse(result["usage"]["token_counts_exact_from_api"])
@@ -335,13 +335,195 @@ class RuntimeTests(unittest.TestCase):
     def test_new_config_defaults_are_compatible_and_invalid_budgets_rejected(self):
         b.CONFIG.write_text('{"model":"test-model"}')
         self.assertEqual(b.config()["max_total_model_calls"], 24)
+        self.assertEqual(b.config()["final_output_tokens"], 2048)
         for key, value in (("max_total_model_calls", True), ("max_total_branches", 0),
                            ("max_total_tokens", -1), ("no_action_retries", 3),
-                           ("context_limit_tokens", 1024)):
+                           ("context_limit_tokens", 1024), ("final_output_tokens", 32),
+                           ("final_output_tokens", True)):
             b.CONFIG.write_text(json.dumps({key: value, "max_output_tokens": 1024}))
             with self.assertRaises(ValueError, msg=key):
                 b.config()
 
+
+class CompletionRecoveryTests(unittest.TestCase):
+    """Exercise the same transport/result contract as the reported local failure."""
+
+    setUp = RuntimeTests.setUp
+
+    @staticmethod
+    def truncated(cap, *, reasoning=False):
+        text = '{"status":"success","result":"Mix powdered sugar with milk until smooth.","'
+        message = {"content": "" if reasoning else text}
+        usage = {"prompt_tokens": 300, "completion_tokens": cap}
+        if reasoning:
+            message["reasoning_content"] = "private reasoning text that must not be saved"
+            usage["completion_tokens_details"] = {"reasoning_tokens": cap}
+        return b.ChatMessage(message, usage, "length")
+
+    def test_truncated_report_uses_larger_completion_allowance_with_tools_still_available(self):
+        caps = []
+
+        def agent(cfg, model, messages, tools=None):
+            cap = cfg["max_output_tokens"]
+            caps.append(cap)
+            if cap < 1200:
+                return self.truncated(cap)
+            self.assertTrue(tools)
+            return b.ChatMessage(final("Mix powdered sugar with milk until smooth."),
+                                 {"prompt_tokens": 350, "completion_tokens": 130}, "stop")
+
+        with patch.object(b, "chat", agent):
+            result = b.run_branch(self.cfg, "Give a simple glaze recipe")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(caps, [700, 2048])
+        self.assertEqual(result["usage"]["model_calls"], 2)
+        self.assertEqual(result["usage"]["total_tokens"], 1480)
+        self.assertEqual(result["response_diagnostics"]["first_failure"], "output_truncated_confirmed")
+        self.assertEqual(result["response_diagnostics"]["last_status"], "final_result")
+        self.assertEqual(result["response_diagnostics"]["retry_kind"], "completion")
+        self.assertEqual(result["response_diagnostics"]["retry_recoveries"], 1)
+
+    def test_reasoning_only_cutoff_can_recover_without_saving_private_reasoning(self):
+        caps = []
+
+        def agent(cfg, model, messages, tools=None):
+            caps.append(cfg["max_output_tokens"])
+            return self.truncated(caps[-1], reasoning=True) if len(caps) == 1 else final()
+
+        with patch.object(b, "chat", agent):
+            result = b.run_branch(self.cfg, "Give a short recipe")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(caps, [700, 2048])
+        saved = b.load_branch(result["branch_id"])
+        first = saved["runtime"]["calls"][0]
+        self.assertEqual(first["reported_reasoning_tokens"], 700)
+        self.assertGreater(first["reasoning_output_chars"], 0)
+        self.assertNotIn("private reasoning text", json.dumps(saved))
+
+    def test_final_only_request_uses_final_allowance_on_first_attempt(self):
+        self.cfg["read_only_project_root"] = ""
+        caps = []
+
+        def agent(cfg, model, messages, tools=None):
+            self.assertFalse(tools)
+            caps.append(cfg["max_output_tokens"])
+            return final()
+
+        with patch.object(b, "chat", agent):
+            result = b.run_branch(self.cfg, "Final answer only")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(caps, [2048])
+
+    def test_forced_final_after_tool_work_uses_its_own_allowance(self):
+        self.cfg.update(max_agent_turns=1, no_action_retries=0)
+        (self.project / "fact.txt").write_text("Verified source text")
+        caps = []
+
+        def agent(cfg, model, messages, tools=None):
+            caps.append(cfg["max_output_tokens"])
+            if tools:
+                return {"content": "", "tool_calls": [tool_call("read", "read_project_file", path="fact.txt")]}
+            self.assertIn("Verified source text", messages[-2]["content"])
+            return final("Source read") if cfg["max_output_tokens"] >= 1200 else self.truncated(cfg["max_output_tokens"])
+
+        with patch.object(b, "chat", agent):
+            result = b.run_branch(self.cfg, "Read the source and report")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(caps, [700, 2048])
+
+    def test_invalid_native_tool_call_keeps_short_action_recovery(self):
+        (self.project / "fact.txt").write_text("Observed")
+        caps = []
+
+        def agent(cfg, model, messages, tools=None):
+            caps.append(cfg["max_output_tokens"])
+            if len(caps) == 1:
+                bad = tool_call("missing", "read_project_file", path="fact.txt")
+                bad.pop("id")
+                return b.ChatMessage({"content": "", "tool_calls": [bad]}, {}, "stop")
+            if len(caps) == 2:
+                return {"content": "", "tool_calls": [tool_call("read", "read_project_file", path="fact.txt")]}
+            return final()
+
+        with patch.object(b, "chat", agent):
+            result = b.run_branch(self.cfg, "Read source")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(caps, [700, 256, 700])
+        self.assertEqual(b.load_branch(result["branch_id"])["runtime"]["calls"][1]["retry_kind"], "action")
+
+    def test_truncated_native_tool_call_does_not_receive_a_smaller_recovery_cap(self):
+        caps = []
+
+        def agent(cfg, model, messages, tools=None):
+            caps.append(cfg["max_output_tokens"])
+            if len(caps) == 1:
+                broken = tool_call("cutoff", "read_project_file", path="fact.txt")
+                broken["function"]["arguments"] = '{"path":"unfinished'
+                return b.ChatMessage({"content": "", "tool_calls": [broken]},
+                                     {"prompt_tokens": 300, "completion_tokens": caps[-1]}, "length")
+            return final()
+
+        with patch.object(b, "chat", agent):
+            result = b.run_branch(self.cfg, "Investigate")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(caps, [700, 2048])
+
+    def test_completion_recovery_never_reduces_a_larger_existing_allowance(self):
+        self.cfg["max_output_tokens"] = 4096
+        caps = []
+
+        def agent(cfg, model, messages, tools=None):
+            caps.append(cfg["max_output_tokens"])
+            return self.truncated(caps[-1]) if len(caps) == 1 else final()
+
+        with patch.object(b, "chat", agent):
+            result = b.run_branch(self.cfg, "Investigate")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(caps, [4096, 4096])
+
+    def test_exhausted_cutoff_retains_only_complete_result_text_as_partial(self):
+        def agent(cfg, model, messages, tools=None):
+            return self.truncated(cfg["max_output_tokens"])
+
+        with patch.object(b, "chat", agent):
+            result = b.run_branch(self.cfg, "Give a recipe")
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["result"], "Mix powdered sugar with milk until smooth.")
+        self.assertEqual(result["stop_reason"], "output_truncated_confirmed")
+        self.assertEqual(result["response_diagnostics"]["output_cap"], 2048)
+        self.assertEqual(result["response_diagnostics"]["retry_recoveries"], 0)
+        self.assertIn("incomplete", result["caveats"])
+        self.assertNotIn("External changes", result["caveats"])
+
+    def test_unclosed_or_nested_result_string_is_never_fabricated(self):
+        self.assertIsNone(b.visible_result_text('{"status":"success","result":"unfinished'))
+        self.assertIsNone(b.visible_result_text('{"nested":{"result":"wrong place"},"caveats":"'))
+        self.assertEqual(b.visible_result_text('{"result":"Fully emitted \\"quote\\"", "'), 'Fully emitted "quote"')
+
+    def test_diagnostics_do_not_claim_truncation_from_json_shape_alone(self):
+        partial = {"content": '{"status":"success","result":"unfinished'}
+        unknown = b.reply_diagnostics(partial, [], 700)
+        self.assertEqual(unknown["response_status"], "malformed_response")
+        suspected = b.reply_diagnostics(b.ChatMessage(partial, {"completion_tokens": 700}, None), [], 700)
+        self.assertEqual(suspected["response_status"], "output_truncated_suspected")
+        stopped = b.reply_diagnostics(b.ChatMessage(partial, {"completion_tokens": 700}, "stop"), [], 700)
+        self.assertEqual(stopped["response_status"], "malformed_response")
+
+    def test_completion_recovery_cannot_bypass_total_token_budget(self):
+        self.cfg["max_total_tokens"] = 2200
+        with patch.object(b, "chat", return_value=self.truncated(700)) as chat:
+            result = b.run_branch(self.cfg, "Recipe")
+        self.assertEqual(chat.call_count, 1)
+        self.assertEqual(result["stop_reason"], "run_token_limit")
+        self.assertEqual(result["usage"]["model_calls"], 1)
+
+    def test_completion_recovery_cannot_bypass_context_budget(self):
+        self.cfg.update(max_output_tokens=128, context_limit_tokens=2048)
+        with patch.object(b, "chat", return_value=self.truncated(128)) as chat:
+            result = b.run_branch(self.cfg, "Recipe")
+        self.assertEqual(chat.call_count, 1)
+        self.assertEqual(result["stop_reason"], "context_budget")
+        self.assertEqual(result["usage"]["model_calls"], 1)
 
 class BudgetAndConversationTests(unittest.TestCase):
     def test_token_usage_reservation_and_reconciliation(self):

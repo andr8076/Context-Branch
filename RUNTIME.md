@@ -1,9 +1,16 @@
-# Jan runtime: v1.5
+# Jan runtime: v1.5.1
 
 The MCP runner now checks the complete conversation before each model request,
 keeps valid tool exchanges across resumes, and uses one persistent budget for a
 root branch and all its descendants. Existing `config.json` files continue to
 work; missing settings use the defaults below.
+
+Version 1.5.1 fixes recovery of empty or unfinished final responses. A short
+tool-action retry and a complete five-field answer need different allowances.
+Final-only requests and forced final reports now use `final_output_tokens`.
+Empty, truncated or malformed final replies retry with at least that allowance
+and never receive less than the preceding request's output cap. Malformed tool
+calls without cutoff evidence still use the short action-retry allowance.
 
 ## Update and check your installation
 
@@ -41,8 +48,9 @@ do not replace a working configuration with the example and lose your API key.
 | `max_total_branches` | 8 | Total branch contexts, including the root |
 | `max_total_tokens` | 50000 | Total prompt and completion tokens processed across the tree |
 | `max_total_seconds` | 600 | Cumulative active runtime, excluding idle time between MCP calls |
+| `final_output_tokens` | 2048 | Generation allowance for final-only requests and final-response recovery |
 | `no_action_retries` | 1 | Additional attempts after an empty or unusable response |
-| `retry_output_tokens` | 256 | Generation cap for recovery; never larger than the ordinary cap |
+| `retry_output_tokens` | 256 | Short action-recovery cap; does not apply to empty/truncated final replies |
 
 The existing `max_agent_turns` and `max_branch_depth` still apply. An identical
 task/context cannot create another child in the same run; a child cannot repeat
@@ -55,6 +63,8 @@ Before an API request, the runner reserves its estimated prompt and full request
 generation allowance. It reconciles that reservation with API-reported usage
 after the response. If usage is missing or a request fails, the unknown portion
 stays conservatively reserved. Failed calls and recovery attempts cost budget.
+The larger final allowance must also fit the remaining context and shared run
+budget; recovery cannot bypass any limit.
 
 Prompt estimation includes tool schemas, UTF-8 content and message overhead. It
 is calibrated upward using actual prompt-token usage when available. This is an
@@ -99,6 +109,17 @@ Every result includes the current shared `usage` and a `stop_reason` when stoppe
 by a limit. `branch_get` reads current ledger usage even if another child has run
 since that branch completed. Other stop reasons include `run_call_limit`,
 `run_branch_limit`, `run_token_limit`, `run_time_limit`, and `no_usable_response`.
+An exhausted cutoff is identified as `output_truncated_confirmed` when the API
+reports a length stop, or `output_truncated_suspected` when usage reaches the cap
+without an explicit stop reason. Incomplete JSON alone does not establish why it
+stopped. Fully emitted top-level result text can be retained as partial evidence;
+missing fields and unfinished strings are never fabricated into a success.
+
+Returned `response_diagnostics` shows the last response status, first failure,
+output cap/usage, finish reason, reported reasoning usage and retry recovery.
+This is available even with transcript saving disabled. If the demo still fails,
+send its output so these fields can distinguish cutoff, malformed output and
+empty visible output. No configuration change is needed to enable these defaults.
 
 The stored branch record's `runtime.calls` contains requested generation caps,
 available API usage, finish reasons, empty-visible-output flags, retry flags,
@@ -110,6 +131,11 @@ transcripts and marks pending calls as not executed.
 `model_reported`; project reads do not independently prove its conclusion.
 Because all branch tools are read-only, `what_changed` is always `Nothing`.
 The parent must verify conclusions and perform any required external actions.
+
+The archive benchmark explicitly keeps the same per-lookup generation allowance
+and zero lookup retries in all modes. MCP-only final/recovery defaults do not
+give its branch arm an extra allowance; benchmark final-report retries remain
+separate and apply under their existing policy.
 
 ## Validation and next experiment
 
