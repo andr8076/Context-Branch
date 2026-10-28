@@ -229,7 +229,9 @@ def adaptive_child_instruction():
     """Private protocol for the focused child created after a surprise blocker."""
     return (
         'ADAPTIVE CHILD CONTEXT. You are an isolated repair branch handling only the '
-        'unexpected problem reported by the parent. Re-inspect the minimum public '
+        'unexpected problem reported by the parent. This branch starts from a private '
+        'copy of the parent marker, so reuse already visible evidence instead of '
+        'repeating work unless the blocker requires it. Re-inspect the minimum public '
         'evidence needed to resolve it, use the normal simulator actions, and apply '
         'and verify the repair if the evidence supports it. Do not ask the parent '
         'for its transcript, do not invent observations, and do not delegate a '
@@ -713,16 +715,22 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     events.append(parent_event)
 
     def run_child(task_text, observed_problem):
-        """Solve only the new problem in an isolated child conversation."""
+        """Solve the new problem in an isolated fork of the parent marker."""
         counters['adaptive_branch_attempts'] += 1
         child_start = len(trace.calls)
-        child_context = [
-            {'role': 'system', 'content': adaptive_child_instruction()},
-            {'role': 'user', 'content': (
-                f'FOCUSED CHILD TASK: {task_text}\n'
-                f'INCIDENT: {case["intro"]}\n'
-                'PARENT CHECKPOINT OBSERVATION:\n' + str(observed_problem)[:2400])},
-        ]
+        # A context branch forks at the marker. The child may use everything the
+        # parent had already seen, but its later messages never enter the parent
+        # again. This is the original context-saving behavior: the parent snaps
+        # back to this exact marker after the side problem is finished.
+        child_context = copy.deepcopy(marker_context or parent_context)
+        if child_context:
+            child_context[0] = {'role': 'system', 'content': adaptive_child_instruction()}
+        child_context.append({'role': 'user', 'content': (
+            f'FOCUSED CHILD TASK: {task_text}\n'
+            f'INCIDENT: {case["intro"]}\n'
+            'PARENT CHECKPOINT OBSERVATION:\n' + str(observed_problem)[:2400] + '\n'
+            'This is a private fork. Reuse the marker evidence, solve the blocker, '
+            'and do not expect child messages to return to the parent.')})
         child_event = {
             'stage': 'unexpected_problem', 'depth': 1, 'parent': 'parent',
             'status': 'running', 'completed': False, 'model_actions': 0,
