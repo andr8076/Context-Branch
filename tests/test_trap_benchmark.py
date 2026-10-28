@@ -317,6 +317,11 @@ class TrapBenchmarkTests(unittest.TestCase):
         self.assertEqual(tb.parse_action('{"action":"repair"}\n{"action":"verify"}'), None)
         self.assertEqual(tb.parse_action('{"action":"inspect","path":"guide/policy"}')['path'], "guide/policy")
 
+    def test_parser_normalizes_qwen_target_alias(self):
+        action = tb.parse_action('{"action":"inspect","target":"guide/index"}')
+        self.assertEqual(action['path'], "guide/index")
+        self.assertEqual(action['_schema_alias'], "target_to_path")
+
     def test_all_modes_finish_with_evidence_based_fake_agent(self):
         fake = DeliberateFakeJan()
         with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, "http_json", fake):

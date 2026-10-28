@@ -114,6 +114,7 @@ class Trace:
     calls: list = field(default_factory=list)
     summary_events: list = field(default_factory=list)
     phase: str = "parent"
+    action_schema_alias_repairs: int = 0
 
     def __call__(self, method, url, cfg, payload=None):
         if method != "POST" or not url.endswith("/chat/completions"):
@@ -209,6 +210,7 @@ class Trace:
             "summary_retry_recoveries": sum(bool(event["recovered_on_retry"]) for event in self.summary_events),
             "summary_failures": sum(event["status"] != "success" for event in self.summary_events),
             "summary_events": list(self.summary_events),
+            "action_schema_alias_repairs": self.action_schema_alias_repairs,
         }
 
 
@@ -869,6 +871,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "adaptive_parent_prompt_before_marker", "adaptive_parent_prompt_after_resume",
         "adaptive_child_prompt_tokens", "adaptive_child_tokens",
         "adaptive_child_transcript_leaks",
+        "action_schema_alias_repairs",
         "no_action_investigation_calls", "empty_investigation_replies",
         "no_action_retry_attempts", "no_action_retry_recoveries", "no_action_retry_failures", "out_of_scope_actions",
         "stage_start_calls", "stage_start_inference_seconds",
@@ -994,6 +997,16 @@ def write_files(directory, data, cfg, args, reset_events=None):
                 if rows:
                     lines.append(f"| {n} | {mode} | {sum(r.get('no_action_investigation_calls', 0) for r in rows)} "
                                  f"| {sum(r.get('empty_investigation_replies', 0) for r in rows)} |")
+        lines += ["", "## Action protocol compatibility", "",
+                  "Some local models use `target` instead of the simulator's `path` field for inspect actions. "
+                  "The harness normalizes that one alias and counts each repair here.",
+                  "| Tasks | Mode | `target` → `path` repairs |", "|---:|---|---:|"]
+        for n in args.tasks:
+            for mode in args.modes:
+                rows = [r for r in data if r["tasks"] == n and r["mode"] == mode]
+                if rows:
+                    lines.append(f"| {n} | {mode} | "
+                                 f"{sum(r.get('action_schema_alias_repairs', 0) for r in rows)} |")
         lines += ["", "## Mandatory recovery investigation", "",
                   "Every incident requires two noisy recovery shards and a correct `recover` action before "
                   "the approvals ledger opens or a repair can be accepted. These reads are necessary work "
