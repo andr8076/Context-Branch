@@ -86,6 +86,7 @@ class BenchmarkTests(unittest.TestCase):
         fake = FakeJan()
         cfg = self.cfg()
         cfg["max_output_tokens"] = 1024
+        cfg["final_output_tokens"] = 4096  # MCP runtime allowance must not change lookup fairness.
         with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, "http_json", fake):
             linear = bm.run_trial("linear", 77, 3, 15, cfg, "fake-local-model", 8192, Path(tmp) / "linear")
             branch = bm.run_trial("branch", 77, 3, 15, cfg, "fake-local-model", 8192, Path(tmp) / "branch")
@@ -96,6 +97,24 @@ class BenchmarkTests(unittest.TestCase):
         for trial in (linear, branch):
             self.assertEqual(trial["max_output_tokens"], 1024)
             self.assertTrue(all(call["requested_max_tokens"] == 1024 for call in trial["calls"]))
+
+    def test_archive_branch_lookup_does_not_receive_runtime_only_retries(self):
+        class EmptyLookup(FakeJan):
+            lookup_calls = 0
+
+            def __call__(self, method, url, cfg, payload=None):
+                if method == "POST" and payload["messages"][0]["content"] == bm.bc.SYSTEM:
+                    self.lookup_calls += 1
+                    return {"choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                            "usage": {"prompt_tokens": 200, "completion_tokens": payload["max_tokens"]}}
+                return super().__call__(method, url, cfg, payload)
+
+        fake = EmptyLookup()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, "http_json", fake):
+            trial = bm.run_trial("branch", 77, 1, 15, self.cfg(), "fake-local-model", 8192, Path(tmp))
+        self.assertFalse(trial["exact_final"])
+        self.assertEqual(fake.lookup_calls, 1)
+        self.assertEqual(trial["api_calls"], 3)
 
     def test_overflow_changes_linear_not_branch(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(bm.bc, 'http_json', FakeJan(max_chars=15500)):
@@ -613,3 +632,4 @@ class ReportingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

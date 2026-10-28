@@ -4,6 +4,7 @@
   "model": "auto",
   "request_timeout_seconds": 180,
   "max_output_tokens": 700,
+  "final_output_tokens": 2048,
   "max_agent_turns": 5,
   "max_branch_depth": 2,
   "max_parent_result_chars": 1800,

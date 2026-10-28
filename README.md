@@ -1,5 +1,10 @@
 # v1.5 — bounded Jan branches and reliable resumes
 
+**v1.5.1:** final-response recovery now uses a separate 2,048-token allowance
+instead of the short 256-token tool-action retry cap. Cutoff and reasoning-usage
+diagnostics are returned even when transcript saving is off. Shared budgets still
+apply, and incomplete JSON never counts as a successful result.
+
 The Jan MCP runner now shares persistent model-call, branch, token and active-time
 limits across an entire branch tree, including later resumes. Complete prompt
 checks include tool schemas and a generation reserve. Repeated read-only results
