@@ -1,3 +1,31 @@
+# v1.7 — adaptive surprise branches
+
+The original autonomous-branching path is now represented by the opt-in
+`adaptive` repair arm. It injects one explicit unexpected blocker at the first
+repair attempt, records the parent's message list as a marker, solves the
+focused problem in a private child context, and resumes the parent with only a
+compact verified receipt. Results expose surprise triggers, marker creation,
+child work, parent prompt size before/after resume, and transcript-leak checks.
+
+Offline tests cover the complete marker → child → resume path. A live Qwen run
+is still required to measure real model behavior and context savings.
+
+Example:
+
+```bash
+python3 benchmark.py --engine llama --scenario repair \
+  --modes adaptive --tasks 1 --repeats 3 --seed 20261026 \
+  --context-limit 8192 --nested-depth 2 --nested-log-lines 8 \
+  --recovery-log-lines 8 --pressure-records 0 --max-actions 48 \
+  --autonomous-max-tokens 100000
+```
+
+The earlier `autonomous` arm remains available as a separate model-selected
+delegation experiment for known prerequisite stages. It should not be treated
+as the original surprise-and-resume milestone.
+
+---
+
 # v1.5 — Jan runtime reliability
 
 Completed in the MCP runner: whole-request budget checks, persistent shared tree
@@ -6,10 +34,10 @@ reads, bounded no-action recovery, real model-list health checks and explicit
 model-reported handoffs. See [RUNTIME.md](RUNTIME.md) for settings and validation.
 
 Next: validate the runtime against the local Jan model; measure context isolation
-against a matched single-conversation stage plan across repeated live runs; then
-evaluate the new model-chosen delegation arm. The repair benchmark now contains
-both controlled recursion and an opt-in autonomous mode; neither is evidence of
-live Qwen behavior until run against the local model.
+against matched single-conversation and adaptive surprise runs across repeated
+live seeds. The repair benchmark contains controlled recursion, legacy
+model-selected delegation, and the adaptive marker/resume arm; none is evidence
+of live Qwen behavior until run against the local model.
 
 ---
 
@@ -89,7 +117,7 @@ experiments so improvements in one cannot disguise regressions in another.
 
 **v1.4.1 completed:** stage-specific read/action allowlists, verified child-to-parent environment-state receipts, no child history sharing, and bounded no-action inference retry. A real Qwen rerun remains necessary.
 
-## 2. Autonomous branch decisions — benchmark slice implemented; live validation next
+## 2. Legacy model-selected delegation — benchmark slice implemented
 
 - The opt-in `autonomous` repair mode lets the model choose **whether**, **when**,
   and **what** to delegate with an explicit `delegate` action. The root may also
@@ -101,7 +129,8 @@ experiments so improvements in one cannot disguise regressions in another.
 - Results record accepted/rejected/unnecessary delegations, missed opportunities,
   branch count, context count, decisions and maximum depth. No benchmark oracle
   or child transcript is injected into a parent.
-- Compare `linear`, `branch`, `recursive` and `autonomous` on the same seeds.
+- This arm is useful for studying whether a model chooses to delegate known
+  prerequisites, but it is not the original surprise-marker-resume design.
   Offline scripted agents validate plumbing only; repeated live Qwen runs are
   required before judging model behavior.
 

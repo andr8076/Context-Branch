@@ -22,9 +22,13 @@ def token(rng, n=5):
 
 
 def create_trap_puzzle(seed, tasks, trap_log_lines=32, trap_density=2, recovery_log_lines=36,
-                       nested_depth=0, nested_log_lines=14, pressure_records=0, pressure_detail_chars=48):
+                       nested_depth=0, nested_log_lines=14, pressure_records=0,
+                       pressure_detail_chars=48, adaptive_surprise=False):
     """Make reproducible cases; expected answers are NOT in the prompts."""
-    if tasks < 1 or not (0 <= trap_log_lines <= 150) or not (1 <= trap_density <= 3) or not (0 <= recovery_log_lines <= 120) or nested_depth not in (0, 1, 2) or not (0 <= nested_log_lines <= 120) or not (0 <= pressure_records <= 160) or not (0 <= pressure_detail_chars <= 256):
+    if (tasks < 1 or not (0 <= trap_log_lines <= 150) or not (1 <= trap_density <= 3)
+            or not (0 <= recovery_log_lines <= 120) or nested_depth not in (0, 1, 2)
+            or not (0 <= nested_log_lines <= 120) or not (0 <= pressure_records <= 160)
+            or not (0 <= pressure_detail_chars <= 256) or type(adaptive_surprise) is not bool):
         raise ValueError("Bad trap benchmark settings")
     rng = random.Random(seed)
     mission, control = "M-" + token(rng, 7), "C-" + token(rng, 10)
@@ -319,6 +323,7 @@ def create_trap_puzzle(seed, tasks, trap_log_lines=32, trap_density=2, recovery_
                       "recovery_nonce": recovery_nonce, "recovery_token": recovery_token,
                       "recovery_order": join_order, "nested": nested, "nested_depth": nested_depth,
                       "pressure_records": pressure_records, "pressure_detail_chars": pressure_detail_chars,
+                      "adaptive_surprise": adaptive_surprise,
                       "pressure_deltas": pressure_deltas})
     return {"mission": mission, "control": control, "cases": cases,
             "brief": ("You are a repair supervisor. You will receive independent simulated incidents. "
@@ -391,6 +396,7 @@ class RepairSimulator:
     pressure_views: set = field(default_factory=set)
     pressure_evidence_chars: int = 0
     authority_blocked: int = 0
+    surprise_triggered: bool = False
     history: list = field(default_factory=list)
 
     def reject_out_of_scope(self, stage, action, paths, actions):
@@ -487,6 +493,24 @@ class RepairSimulator:
                                "Match CURRENT records for the run in guide/index and respect join order.",
                                "recovery_rejected")
         elif action["action"] == "repair":
+            # The adaptive benchmark injects one externally observable blocker
+            # at the first repair attempt.  It changes no simulator state and
+            # gives the parent a real marker/branch opportunity.  The blocker
+            # is deliberately generic: the child must re-inspect evidence and
+            # cannot receive the simulator oracle or the parent's transcript.
+            if self.case.get("adaptive_surprise") and not self.surprise_triggered:
+                self.surprise_triggered = True
+                text, label = (
+                    "UNEXPECTED PROBLEM: the repair endpoint rejected this first attempt "
+                    "because an unanticipated evidence-reconciliation check is required. "
+                    "No changes were applied. Preserve the current parent checkpoint, "
+                    "isolate this focused problem if useful, and resume only after a "
+                    "verified resolution.",
+                    "unexpected_problem",
+                )
+                self.history.append({"action": action, "label": label,
+                                     "observation_chars": len(text)})
+                return text
             submitted = {name: action.get(name) for name in ("release", "route", "certificate")}
             if not self.recovery_completed:
                 self.recovery_blocked += 1
@@ -563,15 +587,17 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
     """Compare *identical* interactive simulated cases across context strategies.
 
     branch: separate conversation per case (benchmark controlled), compact outcome
-    in parent. recursive: benchmark-selected nested stages. autonomous: the model
-    emits explicit delegate actions and receives only verified child receipts.
+    in parent. recursive: benchmark-selected nested stages. autonomous: legacy
+    model-selected delegation of known prerequisites. adaptive: an unexpected
+    simulator blocker creates a parent marker, isolated child, and compact resume.
     """
-    if mode not in ("linear", "summarized", "branch", "recursive", "autonomous"):
+    if mode not in ("linear", "summarized", "branch", "recursive", "autonomous", "adaptive"):
         raise ValueError(f"Unknown mode {mode}")
     if max_actions < 2:
         raise ValueError("max_actions must be >= 2")
     puzzle = create_trap_puzzle(seed, tasks, trap_log_lines, trap_density, recovery_log_lines,
-                                nested_depth, nested_log_lines, pressure_records, pressure_detail_chars)
+                                nested_depth, nested_log_lines, pressure_records,
+                                pressure_detail_chars, adaptive_surprise=(mode == "adaptive"))
     messages = [
         {"role": "system", "content": "Maintain the original audit and preserve verified seals. Follow each incident's JSON tool protocol."},
         {"role": "user", "content": puzzle["brief"]},
@@ -614,6 +640,21 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "autonomous_context_count": 0,
         "autonomous_max_depth": 0,
         "autonomous_events": [],
+        "adaptive_surprise_triggers": 0,
+        "adaptive_marker_count": 0,
+        "adaptive_branch_attempts": 0,
+        "adaptive_branches": 0,
+        "adaptive_branch_failures": 0,
+        "adaptive_resumes": 0,
+        "adaptive_decisions": 0,
+        "adaptive_child_decisions": 0,
+        "adaptive_child_actions": 0,
+        "adaptive_parent_prompt_before_marker": 0,
+        "adaptive_parent_prompt_after_resume": 0,
+        "adaptive_child_prompt_tokens": 0,
+        "adaptive_child_tokens": 0,
+        "adaptive_child_transcript_leaks": 0,
+        "adaptive_events": [],
         "partial_failure": False, "interrupted_batch": None,
         "nested_depth": nested_depth, "nested_log_lines": nested_log_lines,
         "pressure_records": pressure_records, "pressure_detail_chars": pressure_detail_chars,
@@ -649,7 +690,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
             active_sim = sim
             active_case = case
             case_recorded = False
-            if mode in ("branch", "recursive", "autonomous"):
+            if mode in ("branch", "recursive", "autonomous", "adaptive"):
                 # Isolated case history starts here; parent never sees its logs.
                 incident_msgs = [{"role": "system", "content": ACTION_SYSTEM},
                                  {"role": "user", "content": case["intro"]}]
@@ -658,16 +699,21 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 # Same policy for parent and branches, but the parent keeps its previous cases.
                 messages.append({"role": "user", "content": "INCIDENT ACTION PROTOCOL: " + ACTION_SYSTEM})
                 incident_msgs = messages
-            if mode in ("recursive", "autonomous"):
-                from recursive_benchmark import solve_autonomous_case, solve_recursive_case
-                solver = solve_recursive_case if mode == "recursive" else solve_autonomous_case
-                solver_kwargs = {
-                    "max_depth": cfg.get("_recursive_max_depth", 3),
-                    "context_limit": context_limit,
-                }
+            if mode in ("recursive", "autonomous", "adaptive"):
+                from recursive_benchmark import (solve_adaptive_case,
+                                                  solve_autonomous_case,
+                                                  solve_recursive_case)
+                solver = (solve_recursive_case if mode == "recursive" else
+                          solve_autonomous_case if mode == "autonomous" else
+                          solve_adaptive_case)
+                solver_kwargs = {"context_limit": context_limit}
+                if mode in ("recursive", "autonomous"):
+                    solver_kwargs["max_depth"] = cfg.get("_recursive_max_depth", 3)
                 if mode == "autonomous":
                     solver_kwargs["max_children"] = cfg.get("_autonomous_max_children", 8)
-                    solver_kwargs["max_tokens"] = cfg.get("_autonomous_max_tokens", 50000)
+                    solver_kwargs["max_tokens"] = cfg.get("_autonomous_max_tokens", 100000)
+                elif mode == "adaptive":
+                    solver_kwargs["max_tokens"] = cfg.get("_autonomous_max_tokens", 100000)
                 success, nested_events, retry_stats = solver(
                     sim, case, cfg, model, trace, bm, max_actions, **solver_kwargs)
                 result["no_action_investigation_calls"] += retry_stats["no_actions"]
@@ -691,7 +737,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                     result["recursive_checkpoint_block_reasons"].extend(
                         e["context_checkpoint_block_reason"] for e in nested_events
                         if e.get("context_checkpoint_block_reason"))
-                else:
+                elif mode == "autonomous":
                     result["autonomous_events"].append({"batch": name, "stages": nested_events})
                     for key in ("autonomous_delegate_attempts", "autonomous_delegations",
                                 "autonomous_delegate_rejections", "autonomous_duplicate_delegations",
@@ -702,7 +748,20 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                     result["autonomous_max_depth"] = max(
                         result["autonomous_max_depth"], retry_stats.get("autonomous_max_depth", 0))
                     result["out_of_scope_actions"] += sum(e.get("rejected_out_of_scope", 0) for e in nested_events)
-            for _ in range(0 if mode in ("recursive", "autonomous") else max_actions):
+                else:
+                    result["adaptive_events"].append({"batch": name, "events": nested_events})
+                    for key in (
+                            "adaptive_surprise_triggers", "adaptive_marker_count",
+                            "adaptive_branch_attempts", "adaptive_branches",
+                            "adaptive_branch_failures", "adaptive_resumes",
+                            "adaptive_decisions", "adaptive_child_decisions",
+                            "adaptive_child_actions", "adaptive_parent_prompt_before_marker",
+                            "adaptive_parent_prompt_after_resume", "adaptive_child_prompt_tokens",
+                            "adaptive_child_tokens", "adaptive_child_transcript_leaks"):
+                        result[key] += retry_stats.get(key, 0)
+                    result["out_of_scope_actions"] += sum(
+                        e.get("rejected_out_of_scope", 0) for e in nested_events)
+            for _ in range(0 if mode in ("recursive", "autonomous", "adaptive") else max_actions):
                 phase = "branch_investigate" if mode == "branch" else "parent_investigate"
                 action, answer, retry_stats = request_investigation_action(
                     cfg, model, incident_msgs, trace, bm, phase=phase,
@@ -773,7 +832,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                                              "events": sim.history,
                                              "expected_repair_debug_only": case["expected_repair"]})
             case_recorded = True
-            if mode in ("branch", "recursive", "autonomous"):
+            if mode in ("branch", "recursive", "autonomous", "adaptive"):
                 # No model call gets the independent case history as part of the parent.
                 trace.phase = "parent_ack"
                 compact = {"batch": name, "status": "verified" if sim.verified else "blocked",
@@ -898,6 +957,25 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 result["no_action_retry_attempts"] += retry_stats["retries"]
                 result["no_action_retry_recoveries"] += retry_stats["recoveries"]
                 result["no_action_retry_failures"] += retry_stats["retry_failures"]
+            if mode == "adaptive" and getattr(trace, "active_adaptive_events", None) is not None:
+                adaptive_events = trace.active_adaptive_events
+                retry_stats = trace.active_adaptive_counters
+                result["adaptive_events"].append({"batch": name, "events": adaptive_events})
+                for key in (
+                        "adaptive_surprise_triggers", "adaptive_marker_count",
+                        "adaptive_branch_attempts", "adaptive_branches",
+                        "adaptive_branch_failures", "adaptive_resumes",
+                        "adaptive_decisions", "adaptive_child_decisions",
+                        "adaptive_child_actions", "adaptive_parent_prompt_before_marker",
+                        "adaptive_parent_prompt_after_resume", "adaptive_child_prompt_tokens",
+                        "adaptive_child_tokens", "adaptive_child_transcript_leaks"):
+                    result[key] += retry_stats.get(key, 0)
+                result["out_of_scope_actions"] += sum(
+                    e.get("rejected_out_of_scope", 0) for e in adaptive_events)
+                result["no_action_investigation_calls"] += retry_stats["no_actions"]
+                result["no_action_retry_attempts"] += retry_stats["retries"]
+                result["no_action_retry_recoveries"] += retry_stats["recoveries"]
+                result["no_action_retry_failures"] += retry_stats["retry_failures"]
         result["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
         result["error_type"] = ("summary_failed" if stage.startswith("summary:") and isinstance(exc, ValueError)
                                 else bm.classify_exception(exc))
@@ -916,7 +994,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         result["empty_investigation_replies"] = sum(
             r.get("empty_visible_output") is True for r in trace.calls
             if r.get("phase", "").startswith(
-                ("parent_investigate", "branch_investigate", "branch_recursive_")))
+                ("parent_investigate", "branch_investigate", "branch_recursive_",
+                 "adaptive_parent", "branch_adaptive_child")))
         result["calls"] = trace.calls
         result["input_over_limit_risk"] = any(
             r["prompt_tokens"] is not None and r["prompt_tokens"] > context_limit for r in trace.calls)

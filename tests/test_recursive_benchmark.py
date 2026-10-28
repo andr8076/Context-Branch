@@ -240,6 +240,41 @@ class RecursiveContextTests(unittest.TestCase):
         self.assertTrue(any(event['status'] == 'token_budget_exhausted'
                             for event in trial['autonomous_events'][0]['stages']))
 
+    def test_adaptive_surprise_creates_marker_private_child_and_resume(self):
+        fake = DeliberateFakeJan()
+        cfg = self.cfg()
+        cfg['_autonomous_max_tokens'] = 100000
+        with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, 'http_json', fake):
+            trial = tb.run_trap_trial(
+                'adaptive', 17, 1, cfg, 'mock', 8192, Path(temp), bm,
+                nested_depth=2, recovery_log_lines=8, nested_log_lines=8,
+                pressure_records=0, max_actions=48)
+        self.assertEqual(trial['verified_cases'], 1, trial['error'])
+        self.assertTrue(trial['exact_final'])
+        self.assertEqual(trial['adaptive_surprise_triggers'], 1)
+        self.assertEqual(trial['adaptive_marker_count'], 1)
+        self.assertEqual(trial['adaptive_branch_attempts'], 1)
+        self.assertEqual(trial['adaptive_branches'], 1)
+        self.assertEqual(trial['adaptive_branch_failures'], 0)
+        self.assertEqual(trial['adaptive_resumes'], 1)
+        self.assertEqual(trial['adaptive_child_transcript_leaks'], 0)
+        self.assertGreater(trial['adaptive_child_tokens'], 0)
+        event = trial['adaptive_events'][0]['events']
+        self.assertTrue(event[0]['marker_created'])
+        self.assertTrue(event[0]['resumed'])
+        self.assertTrue(event[1]['completed'])
+        root_inputs = json.dumps([
+            messages for messages in fake.messages_seen
+            if messages and 'ADAPTIVE ROOT CONTEXT' in messages[0].get('content', '')
+        ])
+        self.assertNotIn('ADAPTIVE CHILD CONTEXT', root_inputs)
+        self.assertNotIn('FOCUSED CHILD TASK', root_inputs)
+        child_inputs = json.dumps([
+            messages for messages in fake.messages_seen
+            if messages and 'ADAPTIVE CHILD CONTEXT' in messages[0].get('content', '')
+        ])
+        self.assertIn('UNEXPECTED PROBLEM:', child_inputs)
+
     def test_recursive_survives_single_incident_context_pressure(self):
         # Genuine prompts from each stage, but a scripted agent and simplified
         # character/token cap: not empirical Qwen performance.
