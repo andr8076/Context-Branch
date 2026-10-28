@@ -376,6 +376,16 @@ def parse_action(content):
             parsed = dict(parsed)
             parsed["path"] = parsed["target"]
             parsed["_schema_alias"] = "target_to_path"
+        elif parsed.get("action") == "repair" and isinstance(parsed.get("target"), str):
+            target = parsed["target"]
+            field_by_prefix = (("release", "REL-"), ("route", "ROUTE-"),
+                               ("certificate", "CERT-"))
+            for field, prefix in field_by_prefix:
+                if field not in parsed and target.startswith(prefix):
+                    parsed = dict(parsed)
+                    parsed[field] = target
+                    parsed["_schema_alias"] = f"target_to_{field}"
+                    break
         return parsed
     return None
 
