@@ -355,7 +355,13 @@ ACTION_SYSTEM = (
 
 
 def parse_action(content):
-    """Strictly accept a single complete JSON object with a recognized action."""
+    """Accept one complete action and normalize one common field-name alias.
+
+    The simulator protocol calls the inspect field ``path``. Some local models
+    consistently emit the semantically equivalent ``target`` field instead.
+    Normalize that one spelling mismatch while marking the action so the run
+    reports the compatibility repair rather than hiding it.
+    """
     text = str(content or "").strip()
     fenced = re.fullmatch(r"```(?:json)?\s*\n?(.*?)\s*```", text, flags=re.S | re.I)
     if fenced:
@@ -365,6 +371,11 @@ def parse_action(content):
     except (ValueError, TypeError):
         return None
     if isinstance(parsed, dict) and parsed.get("action") in ("inspect", "rebuild_index", "unlock_escrow", "recover", "repair", "verify", "delegate"):
+        if (parsed.get("action") == "inspect" and "path" not in parsed
+                and isinstance(parsed.get("target"), str)):
+            parsed = dict(parsed)
+            parsed["path"] = parsed["target"]
+            parsed["_schema_alias"] = "target_to_path"
         return parsed
     return None
 
@@ -572,6 +583,8 @@ def request_investigation_action(cfg, model, context, trace, bm, *, phase, max_r
         answer = bm.call_parent(cfg, model, prompt)
         action = parse_action(answer)
         if action is not None:
+            if action.get("_schema_alias"):
+                trace.action_schema_alias_repairs += 1
             return action, answer, {"no_actions": no_actions, "retries": attempt,
                                     "recovered": int(attempt > 0), "failed": 0}
         no_actions += 1
