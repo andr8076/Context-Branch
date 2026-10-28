@@ -2,10 +2,10 @@
 
 The original autonomous-branching path is now represented by the opt-in
 `adaptive` repair arm. It injects one explicit unexpected blocker at the first
-repair attempt, records the parent's message list as a marker, solves the
-focused problem in a private child context, and resumes the parent with only a
-compact verified receipt. Results expose surprise triggers, marker creation,
-child work, parent prompt size before/after resume, and transcript-leak checks.
+repair attempt, records the parent's message list as a marker, forks that marker
+into a private child context, and resumes the parent with only a compact verified
+receipt. Results expose surprise triggers, marker creation, child work, parent
+prompt size before/after resume, and transcript-leak checks.
 
 Offline tests cover the complete marker → child → resume path. A live Qwen run
 is still required to measure real model behavior and context savings.

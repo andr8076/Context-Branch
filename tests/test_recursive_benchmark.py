@@ -274,6 +274,7 @@ class RecursiveContextTests(unittest.TestCase):
             if messages and 'ADAPTIVE CHILD CONTEXT' in messages[0].get('content', '')
         ])
         self.assertIn('UNEXPECTED PROBLEM:', child_inputs)
+        self.assertIn('SIMULATOR RESULT:', child_inputs)
 
     def test_recursive_survives_single_incident_context_pressure(self):
         # Genuine prompts from each stage, but a scripted agent and simplified

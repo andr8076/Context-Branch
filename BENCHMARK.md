@@ -292,12 +292,13 @@ python3 benchmark.py --engine llama --scenario repair \
 ```
 
 The simulator emits one explicit `UNEXPECTED PROBLEM` result at the first repair
-attempt. The controller preserves the parent's message list as a marker, gives
-the child only the incident and blocker, and resumes the parent with a compact
-verified receipt. `results.json` records marker creation, child work, parent
-prompt estimates before/after resume, and transcript-leak checks. This is
-separate from the legacy `autonomous` arm; it does not use a precomputed
-dependency tree or require the model to emit a `delegate` action.
+attempt. The controller preserves the parent's message list as a marker, forks
+that marker privately for the child, and resumes the parent with a compact
+verified receipt. Child messages never return to the parent. `results.json`
+records marker creation, child work, parent prompt estimates before/after resume,
+and transcript-leak checks. This is separate from the legacy `autonomous` arm;
+it does not use a precomputed dependency tree or require the model to emit a
+`delegate` action.
 
 ---
 

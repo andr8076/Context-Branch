@@ -47,8 +47,16 @@ class DeliberateFakeJan:
             answer = "READY"
         else:
             # Work only on the most recent incident, to avoid counting old docs.
-            start = max(i for i, m in enumerate(messages)
-                        if "SIMULATED REPAIR INCIDENT batch_" in m.get("content", ""))
+            incident_starts = [i for i, m in enumerate(messages)
+                               if "SIMULATED REPAIR INCIDENT batch_" in m.get("content", "")]
+            # An adaptive child forks the parent's marker and then appends a
+            # focused task containing the incident text again. Keep the marker
+            # evidence in that child instead of treating the focused copy as a
+            # brand-new incident.
+            if any("FOCUSED CHILD TASK:" in m.get("content", "") for m in messages):
+                start = min(incident_starts)
+            else:
+                start = max(incident_starts)
             fragment = messages[start:]
             visited = [a["path"] for m in fragment if m["role"] == "assistant"
                        for a in [tb.parse_action(m["content"])]
@@ -82,10 +90,14 @@ class DeliberateFakeJan:
         for path in ("registry/approvals", "network/aliases", "network/routes", "security/certificates"):
             if path not in visited:
                 return json.dumps({"action": "inspect", "path": path})
+        branch_start = next((i for i, m in enumerate(fragment)
+                             if "FOCUSED CHILD TASK:" in m.get("content", "")), 0)
+        branch_fragment = fragment[branch_start:]
         attempts = sum(bool(tb.parse_action(m["content"]) and
                          tb.parse_action(m["content"])["action"] == "repair")
-                       for m in fragment if m["role"] == "assistant")
-        failures = sum("SIMULATOR RESULT:\nREJECTED:" in m.get("content", "") for m in fragment)
+                       for m in branch_fragment if m["role"] == "assistant")
+        failures = sum("SIMULATOR RESULT:\nREJECTED:" in m.get("content", "")
+                       for m in branch_fragment)
         if attempts <= failures:
             return json.dumps({"action": "repair", **self._derive_repair(fragment)})
         return json.dumps({"action": "verify"})
