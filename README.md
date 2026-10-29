@@ -16,6 +16,23 @@ JSON, CSV and SUMMARY.md expose `adaptive_repeated_recovery_rejections`,
 stops before any surprise, independently of child branch failures. Adaptive parent
 API calls now contribute to `peak_main_prompt_tokens`.
 
+## Context recycling
+
+An adaptive child is allowed to use its own full configured context while it
+investigates a blocker. When it returns, only a verified receipt is appended to
+the saved parent marker; the child's investigation messages are not retained by
+the parent. This recycles the parent's working context for later phases. It does
+not reduce total inference tokens or make a single request exceed the model's
+context limit.
+
+Adaptive results expose `adaptive_child_transcript_tokens_discarded`,
+`adaptive_context_reclaimed_tokens`, and `adaptive_receipt_tokens`. Reclamation
+is an estimate based on the largest observed child prompt and the resumed parent
+prompt, because the controller does not have the model's tokenizer. It measures
+context retained by the parent, not total inference work saved. Per-branch
+values are also stored in `adaptive_events` for stress tests with deliberately
+long child investigations.
+
 ## v1.10 — nested surprises and explicit failure boundaries
 
 Adaptive children can now encounter another unexpected blocker, preserve their

@@ -244,6 +244,33 @@ class AdaptiveGuardTests(unittest.TestCase):
         self.assertEqual(result['adaptive_child_transcript_leaks'], 1)
         self.assertNotIn('LEAKED PRIVATE TRANSCRIPT', json.dumps(fake.messages_seen))
 
+    def test_long_child_context_is_discarded_at_resume(self):
+        class LongChild(NestedFake):
+            remaining = 10
+
+            def __call__(self, method, url, cfg, payload=None):
+                if (method == 'POST' and payload and
+                        'ADAPTIVE CHILD CONTEXT' in payload['messages'][0]['content'] and
+                        'level=1' in payload['messages'][0]['content'] and self.remaining > 0):
+                    self.remaining -= 1
+                    action = {'action': 'inspect', 'path': 'adaptive/blocker'}
+                    answer = json.dumps(action)
+                    self.messages_seen.append(json.loads(json.dumps(payload['messages'])))
+                    self.limits.append(payload['max_tokens'])
+                    return {'choices': [{'message': {'content': answer}, 'finish_reason': 'stop'}],
+                            'usage': {'prompt_tokens': len(json.dumps(payload['messages'])) // 4,
+                                      'completion_tokens': len(answer) // 4}}
+                return super().__call__(method, url, cfg, payload)
+
+        result, _ = self.run_case(LongChild(), _adaptive_surprise_levels=1)
+        self.assertEqual(result['verified_cases'], 1, result['error'])
+        self.assertEqual(result['adaptive_resumes'], 1)
+        self.assertGreater(result['adaptive_child_transcript_tokens_discarded'], 0)
+        self.assertGreater(result['adaptive_context_reclaimed_tokens'], 0)
+        child_event = result['adaptive_events'][0]['events'][1]
+        self.assertGreater(child_event['child_transcript_tokens_discarded'], 0)
+        self.assertGreater(child_event['context_reclaimed_tokens'], 0)
+
 
 if __name__ == '__main__':
     unittest.main()

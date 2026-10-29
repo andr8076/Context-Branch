@@ -910,6 +910,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "adaptive_decisions", "adaptive_child_decisions", "adaptive_child_actions",
         "adaptive_parent_prompt_before_marker", "adaptive_parent_prompt_after_resume",
         "adaptive_child_prompt_tokens", "adaptive_child_tokens",
+        "adaptive_child_transcript_tokens_discarded", "adaptive_context_reclaimed_tokens",
+        "adaptive_receipt_tokens",
         "adaptive_child_transcript_leaks", "adaptive_child_resolutions",
         "adaptive_nested_blocker_failures",
         "adaptive_post_resume_decisions", "adaptive_post_resume_actions",
@@ -1161,8 +1163,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
                       "a private child context, and resumes the parent with a compact receipt. The parent must "
                       "then use its preserved evidence to apply and verify the original repair. Child transcripts "
                       "and simulator oracle values must never enter the resumed parent.", "",
-                      "| Tasks | Surprise triggers | Markers | Child branches | Child failures | Resumes | Child tokens | Parent tokens before/after | Transcript leaks |",
-                      "|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+                      "| Tasks | Surprise triggers | Markers | Child branches | Child failures | Resumes | Child tokens | Discarded child context | Reclaimed parent context | Parent tokens before/after | Receipt tokens | Transcript leaks |",
+                      "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
             for n in args.tasks:
                 rows = [r for r in data if r["tasks"] == n and r["mode"] == "adaptive"]
                 if rows:
@@ -1172,9 +1174,14 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{sum(r.get('adaptive_branch_failures', 0) for r in rows)} | "
                                  f"{sum(r.get('adaptive_resumes', 0) for r in rows)} | "
                                  f"{sum(r.get('adaptive_child_tokens', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_child_transcript_tokens_discarded', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_context_reclaimed_tokens', 0) for r in rows)} | "
                                  f"{sum(r.get('adaptive_parent_prompt_before_marker', 0) for r in rows)} / "
                                  f"{sum(r.get('adaptive_parent_prompt_after_resume', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_receipt_tokens', 0) for r in rows)} | "
                                  f"{sum(r.get('adaptive_child_transcript_leaks', 0) for r in rows)} |")
+            lines += ["", "Context reclamation is an estimate using the largest observed child prompt and the resumed parent prompt. "
+                      "It measures context retained by the parent, not total inference tokens saved."]
             lines += ["", "### Post-resume continuation proof", "",
                       "A complete adaptive proof requires a resolved child blocker followed by fresh parent "
                       "decisions and simulator actions after the marker is restored. Verification must occur "

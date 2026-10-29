@@ -697,6 +697,9 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         'adaptive_child_actions': 0, 'adaptive_parent_prompt_before_marker': 0,
         'adaptive_parent_prompt_after_resume': 0,
         'adaptive_child_prompt_tokens': 0, 'adaptive_child_tokens': 0,
+        'adaptive_child_transcript_tokens_discarded': 0,
+        'adaptive_context_reclaimed_tokens': 0,
+        'adaptive_receipt_tokens': 0,
         'adaptive_child_transcript_leaks': 0, 'adaptive_child_resolutions': 0,
         'adaptive_post_resume_decisions': 0, 'adaptive_post_resume_actions': 0,
         'adaptive_post_resume_verified': 0,
@@ -766,6 +769,9 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         'resumed': False, 'parent_actions': 0, 'child_actions': 0,
         'parent_prompt_before_marker': 0, 'parent_prompt_after_resume': 0,
         'child_prompt_tokens': 0, 'child_tokens': 0,
+        'marker_prompt_tokens': 0, 'resumed_parent_prompt_tokens': 0,
+        'receipt_prompt_tokens': 0, 'child_transcript_tokens_discarded': 0,
+        'context_reclaimed_tokens': 0,
         'child_transcript_exposed': False, 'child_resolved_blocker': False,
         'post_resume_decisions': 0, 'post_resume_actions': 0,
         'post_resume_verified': False,
@@ -790,6 +796,34 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         if correction:
             rebuilt.append({'role': 'user', 'content': correction})
         return rebuilt
+
+    def record_context_reclamation(child_event, marker, resumed, receipt):
+        """Record the context that disappeared at a branch boundary.
+
+        The child is deliberately allowed to grow its own conversation.  The
+        resumed parent contains the marker plus a receipt, not the child's
+        investigation transcript.  This is an estimate based on the largest
+        observed child prompt because the controller does not have the model's
+        tokenizer.  It measures retained-context savings, not total inference
+        tokens saved.
+        """
+        marker_tokens = bm.approximate_tokens(marker)
+        resumed_tokens = bm.approximate_tokens(resumed)
+        receipt_tokens = bm.approximate_tokens([receipt])
+        child_peak = int(child_event.get('prompt_tokens') or 0)
+        discarded = max(0, child_peak - marker_tokens)
+        naive_parent_after_child = child_peak + receipt_tokens
+        reclaimed = max(0, naive_parent_after_child - resumed_tokens)
+        child_event.update({
+            'marker_prompt_tokens': marker_tokens,
+            'resumed_parent_prompt_tokens': resumed_tokens,
+            'receipt_prompt_tokens': receipt_tokens,
+            'child_transcript_tokens_discarded': discarded,
+            'context_reclaimed_tokens': reclaimed,
+        })
+        counters['adaptive_child_transcript_tokens_discarded'] += discarded
+        counters['adaptive_context_reclaimed_tokens'] += reclaimed
+        counters['adaptive_receipt_tokens'] += receipt_tokens
 
     def run_child(task_text, observed_problem, source=None, depth=1):
         """Solve the new problem in an isolated fork of the parent marker."""
@@ -879,8 +913,9 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                     counters['adaptive_surprise_triggers'] += 1
                     counters['adaptive_marker_count'] += 1
                     try:
-                        nested_ok = run_child('Resolve the newly observed nested gate only.', observation,
-                                              nested_marker, depth + 1)
+                        nested_ok, nested_event = run_child(
+                            'Resolve the newly observed nested gate only.', observation,
+                            nested_marker, depth + 1)
                     except AdaptiveStop as exc:
                         if exc.error_kind in {
                                 'branch_depth_limit', 'branch_count_limit',
@@ -898,6 +933,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                         f'{{"action":"resolve_blocker","level":{depth},'
                         f'"token":"{blocker_token}"}}.'}
                     child_context.append(receipt)
+                    record_context_reclamation(
+                        nested_event, nested_marker, child_context, receipt)
                     restored_boundaries[id(child_context)] = (child_context, copy.deepcopy(nested_marker + [receipt]))
                     counters['adaptive_resumes'] += 1
                 child_ok = resolved() and not sim.verified
@@ -916,7 +953,7 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                     'adaptive_child_action_budget_exhausted')
             if depth == 1:
                 parent_event['child_resolved_blocker'] = child_ok
-            return child_ok
+            return child_ok, child_event
         except Exception as exc:
             child_event['status'] = bm.classify_exception(exc)
             child_event['error'] = str(exc)
@@ -1029,7 +1066,7 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                 parent_event['parent_prompt_before_marker'] = after
                 counters['adaptive_parent_prompt_before_marker'] = after
                 parent_event['branch_started'] = True
-                child_ok = run_child(
+                child_ok, child_event = run_child(
                     'Resolve only the unexpected endpoint blocker. Inspect '
                     'adaptive/blocker and submit its exact reconciliation token; '
                     'leave the original route repair for the resumed parent.', observation)
@@ -1049,6 +1086,9 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                        'shared-state changes may persist; inspect the audit events.')
                 )
                 parent_context.append({'role': 'user', 'content': receipt})
+                record_context_reclamation(
+                    child_event, marker_context, parent_context,
+                    {'role': 'user', 'content': receipt})
                 restored_boundaries[id(parent_context)] = (parent_context, copy.deepcopy(
                     marker_context + [{'role': 'user', 'content': receipt}]))
                 parent_event['resumed'] = True
