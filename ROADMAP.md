@@ -1,4 +1,4 @@
-# v1.9 — nested surprise return and truthful stops
+# v1.10 — nested surprise return and truthful stops
 
 Implemented: nested adaptive markers and verified receipts; normal generation
 allowance on adaptive retries; shared request/depth/child/action/work guards;
@@ -6,6 +6,9 @@ estimated capacity checks that preserve evidence; measured marker integrity on
 resumed requests; post-resume action diagnostics; failure-state preservation.
 Adaptive now has its own total processed-token guard (`--adaptive-max-tokens`);
 it is separate from the legacy autonomous budget.
+The simulator validates each blocker before revealing the next level. Failed
+children cannot create a counted parent resume, and repeated scope refusals stop
+as `adaptive_scope_loop` instead of consuming the whole work budget.
 
 Offline regression tests cover two and three nested returns, output inheritance,
 retry cost accounting, scope refusals, transport errors and exhausted guards.
