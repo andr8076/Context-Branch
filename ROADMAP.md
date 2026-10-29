@@ -4,6 +4,8 @@ Implemented: nested adaptive markers and verified receipts; normal generation
 allowance on adaptive retries; shared request/depth/child/action/work guards;
 estimated capacity checks that preserve evidence; measured marker integrity on
 resumed requests; post-resume action diagnostics; failure-state preservation.
+Adaptive now has its own total processed-token guard (`--adaptive-max-tokens`);
+it is separate from the legacy autonomous budget.
 
 Offline regression tests cover two and three nested returns, output inheritance,
 retry cost accounting, scope refusals, transport errors and exhausted guards.
