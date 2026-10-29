@@ -708,7 +708,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     request_count = 0
     max_calls = cfg.get('_adaptive_max_calls', 64)
     max_depth = cfg.get('_adaptive_max_depth', 3)
-    max_children = cfg.get('_autonomous_max_children', 8)
+    max_children = cfg.get('_adaptive_max_children', 8)
+    max_scope_refusals = cfg.get('_adaptive_max_scope_refusals', 3)
     restored_boundaries = {}
 
     def before_request(prompt, owner):
@@ -813,8 +814,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                 f'CHILD SCOPE REFUSED: you are the level-{depth} child. '
                 f'The active task is {path}. Submit exactly '
                 f'{{"action":"resolve_blocker","level":{depth},'
-                f'"token":"{blocker_token}"}}. Do not submit a level-2 action; '
-                'that belongs only to the nested child.')
+                f'"token":"{blocker_token}"}}. Do not submit a different '
+                'blocker level; that belongs only to a nested child.')
         try:
             while (sim.actions < max_actions and tokens_used() < max_tokens
                    and not resolved()):
@@ -837,10 +838,13 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                                      and action.get('path') != path)
                                  or (action.get('action') == 'resolve_blocker'
                                      and action.get('level', 1) != depth)):
-                    observation = sim.reject_out_of_scope('adaptive', action, [path], ['inspect', 'resolve_blocker'])
-                    if action and action.get('action') == 'resolve_blocker' and action.get('level', 1) != depth:
-                        observation = child_scope_instruction()
+                    sim.reject_out_of_scope('adaptive', action, [path], ['inspect', 'resolve_blocker'])
+                    observation = child_scope_instruction()
                     child_event['rejected_out_of_scope'] = child_event.get('rejected_out_of_scope', 0) + 1
+                    if child_event['rejected_out_of_scope'] >= max_scope_refusals:
+                        child_context.append({'role': 'user', 'content':
+                                              'SIMULATOR RESULT:\n' + observation})
+                        raise AdaptiveStop('adaptive_scope_loop')
                 else:
                     observation = sim.step(action)
                     counters['adaptive_child_actions'] += 1
@@ -851,8 +855,17 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                     nested_marker = copy.deepcopy(child_context)
                     counters['adaptive_surprise_triggers'] += 1
                     counters['adaptive_marker_count'] += 1
-                    nested_ok = run_child('Resolve the newly observed nested gate only.', observation,
-                                          nested_marker, depth + 1)
+                    try:
+                        nested_ok = run_child('Resolve the newly observed nested gate only.', observation,
+                                              nested_marker, depth + 1)
+                    except AdaptiveStop as exc:
+                        if exc.error_kind in {
+                                'branch_depth_limit', 'branch_count_limit',
+                                'model_call_budget_exhausted',
+                                'context_capacity_exceeded_estimate',
+                                'token_budget_exhausted'}:
+                            raise
+                        raise AdaptiveStop('nested_child_failed') from exc
                     if not nested_ok:
                         raise AdaptiveStop('nested_child_failed')
                     child_context = copy.deepcopy(nested_marker)
@@ -873,7 +886,11 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
             child_event['blocker_resolved'] = child_ok
             child_event['incident_verified_in_child'] = sim.verified
             counters['adaptive_child_resolutions'] += int(child_ok)
-            counters['adaptive_branch_failures'] += int(not child_ok)
+            if not child_ok:
+                raise AdaptiveStop(
+                    'adaptive_child_token_budget_exhausted'
+                    if tokens_used() >= max_tokens else
+                    'adaptive_child_action_budget_exhausted')
             if depth == 1:
                 parent_event['child_resolved_blocker'] = child_ok
             return child_ok
@@ -962,6 +979,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                     'adaptive/blocker and submit its exact reconciliation token; '
                     'leave the original route repair for the resumed parent.', observation)
                 parent_event['branch_completed'] = child_ok
+                if not child_ok:
+                    raise AdaptiveStop('adaptive_child_action_budget_exhausted')
                 # Snap back to the exact parent checkpoint.  Only this compact
                 # receipt crosses the boundary; child prompts/actions do not.
                 parent_context = copy.deepcopy(marker_context)
