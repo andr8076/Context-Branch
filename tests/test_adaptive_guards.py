@@ -60,6 +60,7 @@ class AdaptiveGuardTests(unittest.TestCase):
         resumed = [m for m in fake.messages_seen if 'NESTED BRANCH RESUME' in json.dumps(m)
                    and 'level=1' in m[0]['content']]
         self.assertTrue(resumed)
+        self.assertIn('level-1 blocker remains active', json.dumps(resumed))
         self.assertNotIn(secret, json.dumps(resumed))
 
     def test_depth_stop_is_explicit_and_not_success(self):
