@@ -375,7 +375,11 @@ def classify_exception(exc):
     if explicit_kind in ('context_overflow_confirmed', 'context_checkpoint_blocked',
                          'context_capacity_exceeded_estimate', 'token_budget_exhausted',
                          'model_call_budget_exhausted', 'branch_depth_limit',
-                         'branch_count_limit', 'nested_child_failed', 'context_isolation_violation'):
+                         'branch_count_limit', 'nested_child_failed',
+                         'adaptive_scope_loop',
+                         'adaptive_child_action_budget_exhausted',
+                         'adaptive_child_token_budget_exhausted',
+                         'context_isolation_violation'):
         return explicit_kind
     message = str(exc).lower()
     if any(s in message for s in ('context length', 'context window', 'context capacity', 'context overflow',
@@ -688,7 +692,7 @@ def arguments(argv=None):
     parser.add_argument("--autonomous-max-children", type=int, default=8,
                         help="Autonomous mode: maximum accepted child branches per incident (1-16, default 8)")
     parser.add_argument("--autonomous-max-tokens", type=int, default=100000,
-                        help="Autonomous/adaptive mode: shared prompt+completion token budget per incident (1024-200000, default 100000)")
+                        help="Autonomous mode: shared prompt+completion token budget per incident (1024-200000, default 100000)")
     parser.add_argument("--tasks", type=int, nargs="+", default=None, help="Archive: 3 6 8; repair: 1 2 4 by default")
     parser.add_argument("--records", type=int, default=65, help="Rows in each archive (default 65)")
     parser.add_argument("--repeats", type=int, default=2, help="Different seeds per task level (default 2)")
@@ -697,10 +701,14 @@ def arguments(argv=None):
     parser.add_argument("--max-output-tokens", type=int, default=1024, help="Investigation output cap (default 1024; equal for all modes)")
     parser.add_argument("--adaptive-max-depth", type=int, choices=range(1, 9), default=3,
                         help="Maximum private surprise branch depth; no per-child token cap")
+    parser.add_argument("--adaptive-max-children", type=int, default=8,
+                        help="Adaptive mode: maximum private surprise branches per incident (1-16, default 8)")
     parser.add_argument("--adaptive-max-calls", type=int, default=64,
                         help="Shared adaptive inference-call guard, including retries")
     parser.add_argument("--adaptive-max-tokens", type=int, default=150000,
                         help="Adaptive tree processed-token guard (default 150000; includes parent and children)")
+    parser.add_argument("--adaptive-max-scope-refusals", type=int, default=3,
+                        help="Adaptive mode: repeated child scope refusals before an explicit stop (1-16, default 3)")
     parser.add_argument("--adaptive-surprise-levels", type=int, choices=range(1, 5), default=1,
                         help="Number of unexpected blocker levels in the adaptive fixture")
     parser.add_argument("--final-output-tokens", type=int, default=2048, help="Output cap for final reporting ONLY (default 2048)")
@@ -800,8 +808,12 @@ def arguments(argv=None):
         parser.error("--autonomous-max-tokens must be 1024-200000")
     if args.adaptive_max_calls < 1:
         parser.error("--adaptive-max-calls must be positive")
+    if not 1 <= args.adaptive_max_children <= 16:
+        parser.error("--adaptive-max-children must be 1-16")
     if not 1024 <= args.adaptive_max_tokens <= 300000:
         parser.error("--adaptive-max-tokens must be 1024-300000")
+    if not 1 <= args.adaptive_max_scope_refusals <= 16:
+        parser.error("--adaptive-max-scope-refusals must be 1-16")
     if args.records < 2 or args.repeats < 1 or not args.tasks or any(n < 1 for n in args.tasks):
         parser.error("--tasks, --records, and --repeats must be positive (records >= 2)")
     return args
@@ -821,10 +833,12 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "scoring_version": 3,
                   "simulator_rules_version": 2,
                   "mandatory_authority_inspection": args.scenario == "repair",
-                  "benchmark_version": "1.9.0", "scenario": args.scenario,
+                  "benchmark_version": "1.10.0", "scenario": args.scenario,
                   "adaptive_max_depth": args.adaptive_max_depth,
+                  "adaptive_max_children": args.adaptive_max_children,
                   "adaptive_max_calls": args.adaptive_max_calls,
                   "adaptive_max_tokens": args.adaptive_max_tokens,
+                  "adaptive_max_scope_refusals": args.adaptive_max_scope_refusals,
                   "adaptive_surprise_levels": args.adaptive_surprise_levels,
                   "adaptive_retry_policy": "inherit_investigation_settings",
                   "engine": args.engine,
@@ -895,6 +909,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "adaptive_parent_prompt_before_marker", "adaptive_parent_prompt_after_resume",
         "adaptive_child_prompt_tokens", "adaptive_child_tokens",
         "adaptive_child_transcript_leaks", "adaptive_child_resolutions",
+        "adaptive_nested_blocker_failures",
         "adaptive_post_resume_decisions", "adaptive_post_resume_actions",
         "adaptive_post_resume_verified",
         "action_schema_alias_repairs",
@@ -1300,8 +1315,10 @@ def main(argv=None):
     cfg["_recursive_max_depth"] = args.recursive_max_depth
     cfg["_autonomous_max_children"] = args.autonomous_max_children
     cfg["_adaptive_max_depth"] = args.adaptive_max_depth
+    cfg["_adaptive_max_children"] = args.adaptive_max_children
     cfg["_adaptive_max_calls"] = args.adaptive_max_calls
     cfg["_adaptive_max_tokens"] = args.adaptive_max_tokens
+    cfg["_adaptive_max_scope_refusals"] = args.adaptive_max_scope_refusals
     cfg["_adaptive_surprise_levels"] = args.adaptive_surprise_levels
     cfg["_autonomous_max_tokens"] = args.autonomous_max_tokens
     cfg["_recursive_checkpoint_threshold"] = args.recursive_checkpoint_threshold

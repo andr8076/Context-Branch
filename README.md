@@ -1,11 +1,17 @@
 # Context-Branch
 
-## v1.9 — nested surprises and explicit work guards
+## v1.10 — nested surprises and explicit failure boundaries
 
 Adaptive children can now encounter another unexpected blocker, preserve their
 own marker, and run a private nested child. Each return restores its enclosing
 marker plus a short verified receipt. The enclosing child must finish its own
 blocker before the original parent continues its repair.
+
+The simulator validates the current blocker token before opening the next nested
+level. A failed child never counts as a parent resume. Repeated out-of-scope
+child actions stop after `--adaptive-max-scope-refusals` and report
+`adaptive_scope_loop`, preserving a truthful partial result instead of spending
+the entire token budget.
 
 Investigation calls **and adaptive retries** retain the normal output allowance
 and reasoning settings. There is no smaller per-child context allowance. Each
@@ -26,13 +32,14 @@ python3 benchmark.py --engine llama --scenario repair \
   --nested-depth 1 --nested-log-lines 4 --recovery-log-lines 4 \
   --pressure-records 0 --max-actions 48 \
   --adaptive-surprise-levels 2 --adaptive-max-depth 3 \
-  --adaptive-max-calls 64 --adaptive-max-tokens 150000 \
-  --autonomous-max-children 8 \
+  --adaptive-max-children 8 --adaptive-max-calls 64 \
+  --adaptive-max-tokens 150000 --adaptive-max-scope-refusals 3 \
   --autonomous-max-tokens 100000
 ```
 
-The depth, child count, action count, model-call count and total processed-token
-settings are configurable work guards shared across the tree. They do not
+The depth, adaptive child count, action count, model-call count, scope-refusal
+count and total processed-token settings are configurable work guards shared
+across the tree. They do not
 reduce each child's window. Token reservation uses prompt estimates; actual API
 usage replaces estimates after each call, so an undercount may overshoot the
 work budget on the last call. Model-call and action guards still bound loops
@@ -40,6 +47,9 @@ when usage is missing. Refused actions consume the action budget.
 
 `results.json` retains per-depth completion/failure events and the parent's
 `post_resume_trace` (action, simulator outcome, verification and prompt estimate).
+`adaptive_nested_blocker_failures` separates rejected nested tokens from failures
+on the outer blocker, so a child cannot appear clean merely because it reached a
+deeper level.
 Adaptive retry costs now appear in the retry totals. Before resumed requests,
 the controller checks that the saved marker plus receipt remains intact; a
 mismatch increments `adaptive_child_transcript_leaks` and stops with

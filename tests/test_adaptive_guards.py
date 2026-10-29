@@ -130,12 +130,48 @@ class AdaptiveGuardTests(unittest.TestCase):
         result, _ = self.run_case(Delegator(), _adaptive_max_tokens=200000)
         self.assertEqual(result['verified_cases'], 0)
         self.assertGreater(result['out_of_scope_actions'], 0)
+        self.assertEqual(result['error_type'], 'adaptive_scope_loop')
         events = result['adaptive_events'][0]['events']
-        self.assertEqual(events[1]['status'], 'action_budget_exhausted')
+        self.assertEqual(events[1]['status'], 'adaptive_scope_loop')
 
     def test_child_count_guard(self):
-        result, _ = self.run_case(_autonomous_max_children=1)
+        result, _ = self.run_case(_adaptive_max_children=1)
         self.assertEqual(result['error_type'], 'branch_count_limit')
+
+    def test_wrong_outer_token_does_not_create_nested_blocker(self):
+        puzzle = tb.create_trap_puzzle(
+            17, 1, 0, 1, 0, 0, 0, 0, 48, adaptive_surprise=True)
+        case = puzzle['cases'][0]
+        case['adaptive_surprise_levels'] = 2
+        case['adaptive_nested_tokens'] = {2: 'CHECK-NESTED'}
+        case['docs']['adaptive/blocker/2'] = 'state=CURRENT reconciliation_token=CHECK-NESTED'
+        sim = tb.RepairSimulator(case)
+        sim.step({'action': 'repair', 'release': 'x', 'route': 'x', 'certificate': 'x'})
+        sim.step({'action': 'inspect', 'path': 'adaptive/blocker'})
+        text = sim.step({'action': 'resolve_blocker', 'level': 1, 'token': 'CHECK-WRONG'})
+        self.assertIn('REJECTED', text)
+        self.assertEqual(sim.adaptive_nested_triggered, set())
+        self.assertEqual(sim.surprise_resolution_failures, 1)
+        self.assertEqual(sim.adaptive_nested_resolution_failures, 0)
+        self.assertEqual(sim.history[-1]['label'], 'adaptive_blocker_rejected')
+
+    def test_failed_child_does_not_count_as_parent_resume(self):
+        class ImmediateFailure(NestedFake):
+            def __call__(self, method, url, cfg, payload=None):
+                if method == 'POST' and 'ADAPTIVE CHILD CONTEXT' in payload['messages'][0]['content']:
+                    answer = '{"action":"delegate"}'
+                else:
+                    answer = '{"action":"repair","release":"REL-X","route":"ROUTE-X","certificate":"CERT-X"}'
+                return {'choices': [{'message': {'content': answer}, 'finish_reason': 'stop'}],
+                        'usage': {'prompt_tokens': 100, 'completion_tokens': 10}}
+
+        result, _ = self.run_case(ImmediateFailure(), _adaptive_surprise_levels=1,
+                                  _adaptive_max_tokens=10000)
+        self.assertEqual(result['error_type'], 'adaptive_scope_loop')
+        self.assertTrue(result['partial_failure'])
+        self.assertEqual(result['adaptive_resumes'], 0)
+        self.assertEqual(result['adaptive_branch_failures'], 1)
+        self.assertFalse(result['adaptive_events'][0]['events'][0]['resumed'])
 
     def test_nested_failure_never_returns_a_success_receipt(self):
         class StuckNested(NestedFake):
