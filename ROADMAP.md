@@ -1,3 +1,22 @@
+# v1.9 — nested surprise return and truthful stops
+
+Implemented: nested adaptive markers and verified receipts; normal generation
+allowance on adaptive retries; shared request/depth/child/action/work guards;
+estimated capacity checks that preserve evidence; measured marker integrity on
+resumed requests; post-resume action diagnostics; failure-state preservation.
+
+Offline regression tests cover two and three nested returns, output inheritance,
+retry cost accounting, scope refusals, transport errors and exhausted guards.
+They establish controller behavior, not Qwen reliability or performance gains.
+
+Next validation: run the two-level example at the top of README once, inspect
+per-depth events and parent continuation, then repeat across independent seeds.
+Next product work: expose the same lifecycle through a client that actually owns
+the parent conversation; give baseline modes identical surprise fixtures before
+making performance claims. MCP-only calls cannot rewind Jan's main chat.
+
+---
+
 # v1.8 — verified parent continuation
 
 The original autonomous-branching path is now represented by the opt-in

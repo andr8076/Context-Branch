@@ -10,6 +10,14 @@ import re
 import json
 import copy
 
+
+class AdaptiveStop(RuntimeError):
+    """An explicit controller stop, retaining all evidence and audit events."""
+
+    def __init__(self, reason):
+        self.error_kind = reason
+        super().__init__(reason)
+
 STAGE_GOALS = {
     'index': ('rebuild_index', 'Rebuild CURRENT index from the two index shards.'),
     'escrow': ('unlock_escrow', 'Unlock escrow from CURRENT escrow shards.'),
@@ -233,7 +241,7 @@ def adaptive_root_instruction():
         'Do not use a generic `target` field. Never invent a successful repair.')
 
 
-def adaptive_child_instruction():
+def adaptive_child_instruction(depth=1):
     """Private protocol for the focused child created after a surprise blocker."""
     return (
         'ADAPTIVE CHILD CONTEXT. You are an isolated branch handling only the '
@@ -243,10 +251,13 @@ def adaptive_child_instruction():
         '{"action":"resolve_blocker","token":"CHECK-..."} with its exact CURRENT '
         'token. This child must resolve only that blocker; the parent will apply and '
         'verify the route repair after resuming. Do not ask the parent '
-        'for its transcript, do not invent observations, and do not delegate a '
-        'second child. Emit exactly one JSON simulator action per turn. Use inspect '
+        'for its transcript or invent observations. A further UNEXPECTED PROBLEM '
+        'creates a nested private branch automatically. After its receipt, retry '
+        'your own blocker resolution. Emit exactly one JSON simulator action per turn. Use inspect '
         'with `path` and resolve_blocker with `token`; never substitute a generic '
-        '`target` field.')
+        '`target` field.').replace('adaptive/blocker',
+            'adaptive/blocker' if depth == 1 else f'adaptive/blocker/{depth}').replace(
+                '"token":"CHECK-..."', f'"token":"CHECK-...","level":{depth}')
 
 
 def _autonomous_dependency_chain(stage, nested_depth):
@@ -694,6 +705,31 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     trace.active_adaptive_counters = counters
     context_limit = context_limit or cfg.get('_context_limit', 8192)
     call_start = len(trace.calls)
+    request_count = 0
+    max_calls = cfg.get('_adaptive_max_calls', 64)
+    max_depth = cfg.get('_adaptive_max_depth', 3)
+    max_children = cfg.get('_autonomous_max_children', 8)
+    restored_boundaries = {}
+
+    def before_request(prompt, owner):
+        nonlocal request_count
+        entry = restored_boundaries.get(id(owner))
+        if entry is not None:
+            _, boundary = entry
+            leaked = prompt[:len(boundary)] != boundary
+            counters['adaptive_child_transcript_leaks'] += int(leaked)
+            if leaked:
+                raise AdaptiveStop('context_isolation_violation')
+        if request_count >= max_calls:
+            raise AdaptiveStop('model_call_budget_exhausted')
+        estimate = bm.approximate_tokens(prompt)
+        reserve = cfg.get('max_output_tokens', 1024)
+        if estimate + reserve > context_limit:
+            raise AdaptiveStop('context_capacity_exceeded_estimate')
+        if tokens_used() + estimate + reserve > max_tokens:
+            raise AdaptiveStop('token_budget_exhausted')
+        request_count += 1
+
 
     def tokens_used():
         total = 0
@@ -731,17 +767,24 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     }
     events.append(parent_event)
 
-    def run_child(task_text, observed_problem):
+    def run_child(task_text, observed_problem, source=None, depth=1):
         """Solve the new problem in an isolated fork of the parent marker."""
         counters['adaptive_branch_attempts'] += 1
+        if depth > max_depth:
+            raise AdaptiveStop('branch_depth_limit')
+        if counters['adaptive_branch_attempts'] > max_children:
+            raise AdaptiveStop('branch_count_limit')
+        counters['adaptive_branches'] += 1
         child_start = len(trace.calls)
         # A context branch forks at the marker. The child may use everything the
         # parent had already seen, but its later messages never enter the parent
         # again. This is the original context-saving behavior: the parent snaps
         # back to this exact marker after the side problem is finished.
-        child_context = copy.deepcopy(marker_context or parent_context)
+        child_context = copy.deepcopy(source if source is not None else marker_context or parent_context)
+        path = 'adaptive/blocker' if depth == 1 else f'adaptive/blocker/{depth}'
         if child_context:
-            child_context[0] = {'role': 'system', 'content': adaptive_child_instruction()}
+            child_context[0] = {'role': 'system', 'content': adaptive_child_instruction(depth) +
+                f' Your scope is ONLY {path}; resolve_blocker must include level={depth}.'}
         child_context.append({'role': 'user', 'content': (
             f'FOCUSED CHILD TASK: {task_text}\n'
             f'INCIDENT: {case["intro"]}\n'
@@ -749,22 +792,27 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
             'This is a private fork. Reuse the marker evidence, solve the blocker, '
             'and do not expect child messages to return to the parent.')})
         child_event = {
-            'stage': 'unexpected_problem', 'depth': 1, 'parent': 'parent',
+            'stage': 'unexpected_problem', 'depth': depth,
+            'parent': 'parent' if depth == 1 else f'blocker_{depth - 1}',
             'status': 'running', 'completed': False, 'model_actions': 0,
             'prompt_tokens': bm.approximate_tokens(child_context),
             'child_transcript_exposed': False, 'blocker_resolved': False,
             'incident_verified_in_child': False,
+            'token_scope': 'subtree_including_nested_children',
         }
         events.append(child_event)
         child_ok = False
+        def resolved():
+            return sim.surprise_resolved if depth == 1 else depth in sim.adaptive_nested_resolved
         try:
             while (sim.actions < max_actions and tokens_used() < max_tokens
-                   and not sim.surprise_resolved):
+                   and not resolved()):
                 trace.phase = 'branch_adaptive_child'
                 action, answer, info = request_investigation_action(
                     cfg, model, child_context, trace, bm,
                     phase='branch_adaptive_child',
-                    max_retries=cfg.get('_no_action_retries', 1))
+                    max_retries=cfg.get('_no_action_retries', 1),
+                    before_request=lambda prompt: before_request(prompt, child_context))
                 counters['no_actions'] += info['no_actions']
                 counters['retries'] += info['retries']
                 counters['recoveries'] += info['recovered']
@@ -772,24 +820,35 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                 counters['adaptive_child_decisions'] += 1
                 child_event['model_actions'] += 1
                 child_context.append({'role': 'assistant', 'content': answer})
-                if action and action.get('action') == 'delegate':
-                    observation = (
-                        'CHILD DELEGATION REFUSED: adaptive surprise branches are '
-                        'single-level; solve the focused problem locally.')
-                elif action and (action.get('action') not in ('inspect', 'resolve_blocker')
+                history_start = len(sim.history)
+                if action and (action.get('action') not in ('inspect', 'resolve_blocker')
                                  or (action.get('action') == 'inspect'
-                                     and action.get('path') != 'adaptive/blocker')):
-                    observation = (
-                        'CHILD SCOPE REFUSED: this branch may only inspect '
-                        'adaptive/blocker and submit resolve_blocker. The parent '
-                        'retains responsibility for the original route repair.')
+                                     and action.get('path') != path)
+                                 or (action.get('action') == 'resolve_blocker'
+                                     and action.get('level', 1) != depth)):
+                    observation = sim.reject_out_of_scope('adaptive', action, [path], ['inspect', 'resolve_blocker'])
+                    child_event['rejected_out_of_scope'] = child_event.get('rejected_out_of_scope', 0) + 1
                 else:
                     observation = sim.step(action)
                     counters['adaptive_child_actions'] += 1
                 child_context.append({'role': 'user', 'content':
                                       'SIMULATOR RESULT:\n' + observation +
                                       '\nContinue the focused child task. JSON action only.'})
-                child_ok = sim.surprise_resolved and not sim.verified
+                if len(sim.history) > history_start and sim.history[-1].get('label') == 'unexpected_problem':
+                    nested_marker = copy.deepcopy(child_context)
+                    counters['adaptive_surprise_triggers'] += 1
+                    counters['adaptive_marker_count'] += 1
+                    nested_ok = run_child('Resolve the newly observed nested gate only.', observation,
+                                          nested_marker, depth + 1)
+                    if not nested_ok:
+                        raise AdaptiveStop('nested_child_failed')
+                    child_context = copy.deepcopy(nested_marker)
+                    receipt = {'role': 'user', 'content':
+                        'NESTED BRANCH RESUME: gate verified resolved. Continue your own blocker.'}
+                    child_context.append(receipt)
+                    restored_boundaries[id(child_context)] = (child_context, copy.deepcopy(nested_marker + [receipt]))
+                    counters['adaptive_resumes'] += 1
+                child_ok = resolved() and not sim.verified
             child_event['completed'] = child_ok
             child_event['status'] = (
                 'blocker_resolved' if child_ok else
@@ -798,15 +857,22 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
             child_event['blocker_resolved'] = child_ok
             child_event['incident_verified_in_child'] = sim.verified
             counters['adaptive_child_resolutions'] += int(child_ok)
-            parent_event['child_resolved_blocker'] = child_ok
+            counters['adaptive_branch_failures'] += int(not child_ok)
+            if depth == 1:
+                parent_event['child_resolved_blocker'] = child_ok
             return child_ok
+        except Exception as exc:
+            child_event['status'] = bm.classify_exception(exc)
+            child_event['error'] = str(exc)
+            counters['adaptive_branch_failures'] += 1
+            raise
         finally:
             child_event['child_tokens'] = child_tokens_used(child_start)
             child_prompt_values = [
                 (r.get('prompt_tokens') if r.get('prompt_tokens') is not None
                  else r.get('prompt_est_tokens') or 0)
                 for r in trace.calls[child_start:]
-                if r.get('phase') == 'branch_adaptive_child']
+                if r.get('phase', '').startswith('branch_adaptive_child')]
             child_event['prompt_tokens'] = max(
                 [child_event.get('prompt_tokens', 0), *child_prompt_values])
             counters['adaptive_child_tokens'] = sum(
@@ -815,8 +881,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                 (r.get('completion_tokens') if r.get('completion_tokens') is not None
                  else r.get('completion_est_tokens') or 0)
                 for r in trace.calls[child_start:])
-            counters['adaptive_child_prompt_tokens'] = child_event['prompt_tokens']
-            counters['adaptive_child_transcript_leaks'] = 0
+            counters['adaptive_child_prompt_tokens'] = max(
+                counters['adaptive_child_prompt_tokens'], child_event['prompt_tokens'])
             parent_event['child_actions'] = child_event['model_actions']
             parent_event['child_prompt_tokens'] = child_event['prompt_tokens']
             parent_event['child_tokens'] = child_event['child_tokens']
@@ -831,7 +897,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
             action, answer, info = request_investigation_action(
                 cfg, model, parent_context, trace, bm,
                 phase='adaptive_parent',
-                max_retries=cfg.get('_no_action_retries', 1))
+                max_retries=cfg.get('_no_action_retries', 1),
+                before_request=lambda prompt: before_request(prompt, parent_context))
             counters['no_actions'] += info['no_actions']
             counters['retries'] += info['retries']
             counters['recoveries'] += info['recovered']
@@ -842,10 +909,11 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                 counters['adaptive_post_resume_decisions'] += 1
                 parent_event['post_resume_decisions'] += 1
             parent_context.append({'role': 'assistant', 'content': answer})
+            history_start = len(sim.history)
             if action and action.get('action') == 'delegate':
-                observation = (
-                    'DELEGATION IGNORED: a branch is created automatically only '
-                    'after an UNEXPECTED PROBLEM simulator result.')
+                observation = sim.reject_out_of_scope('adaptive_parent', action, [],
+                    ['inspect', 'rebuild_index', 'unlock_escrow', 'recover', 'repair', 'verify'])
+                parent_event['rejected_out_of_scope'] = parent_event.get('rejected_out_of_scope', 0) + 1
             else:
                 observation = sim.step(action)
                 if after_resume:
@@ -854,11 +922,17 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
             parent_context.append({'role': 'user', 'content':
                                    'SIMULATOR RESULT:\n' + observation +
                                    '\nContinue the parent incident. JSON action only.'})
+            if after_resume:
+                parent_event.setdefault('post_resume_trace', []).append({
+                    'action': copy.deepcopy(action),
+                    'outcome': sim.history[-1].get('label') if len(sim.history) > history_start else 'controller_refused',
+                    'verified': sim.verified,
+                    'prompt_est_tokens': before})
             if after_resume and sim.verified:
                 counters['adaptive_post_resume_verified'] = 1
                 parent_event['post_resume_verified'] = True
             after = bm.approximate_tokens(parent_context)
-            if sim.history and sim.history[-1].get('label') == 'unexpected_problem':
+            if len(sim.history) > history_start and sim.history[-1].get('label') == 'unexpected_problem':
                 counters['adaptive_surprise_triggers'] += 1
                 counters['adaptive_marker_count'] += 1
                 parent_event['surprise_triggered'] = True
@@ -867,14 +941,11 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                 parent_event['parent_prompt_before_marker'] = after
                 counters['adaptive_parent_prompt_before_marker'] = after
                 parent_event['branch_started'] = True
-                counters['adaptive_branches'] += 1
                 child_ok = run_child(
                     'Resolve only the unexpected endpoint blocker. Inspect '
                     'adaptive/blocker and submit its exact reconciliation token; '
                     'leave the original route repair for the resumed parent.', observation)
                 parent_event['branch_completed'] = child_ok
-                if not child_ok:
-                    counters['adaptive_branch_failures'] += 1
                 # Snap back to the exact parent checkpoint.  Only this compact
                 # receipt crosses the boundary; child prompts/actions do not.
                 parent_context = copy.deepcopy(marker_context)
@@ -884,10 +955,12 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                        'resolved. The route repair remains unapplied. Continue from '
                        'the preserved evidence: apply the repair, then verify it.'
                        if child_ok else
-                       'child did not resolve the focused blocker; no verified state '
-                       'change was handed off.')
+                       'child did not resolve the focused blocker. Earlier verified '
+                       'shared-state changes may persist; inspect the audit events.')
                 )
                 parent_context.append({'role': 'user', 'content': receipt})
+                restored_boundaries[id(parent_context)] = (parent_context, copy.deepcopy(
+                    marker_context + [{'role': 'user', 'content': receipt}]))
                 parent_event['resumed'] = True
                 counters['adaptive_resumes'] += 1
                 resumed_tokens = bm.approximate_tokens(parent_context)
@@ -906,6 +979,10 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                                and not parent_event['branch_completed']) else
             'action_budget_exhausted')
         return success, events, counters
+    except Exception as exc:
+        parent_event['status'] = bm.classify_exception(exc)
+        parent_event['error'] = str(exc)
+        raise
     finally:
         if not success and parent_event.get('status') == 'running':
             parent_event['status'] = (

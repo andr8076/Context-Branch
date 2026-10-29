@@ -437,6 +437,9 @@ class RepairSimulator:
     surprise_resolved: bool = False
     surprise_resolution_attempts: int = 0
     surprise_resolution_failures: int = 0
+    adaptive_nested_triggered: set = field(default_factory=set)
+    adaptive_nested_viewed: set = field(default_factory=set)
+    adaptive_nested_resolved: set = field(default_factory=set)
     history: list = field(default_factory=list)
 
     def reject_out_of_scope(self, stage, action, paths, actions):
@@ -506,6 +509,8 @@ class RepairSimulator:
                 if path == "adaptive/blocker":
                     self.surprise_evidence_viewed = True
                     label = "adaptive_blocker_evidence"
+                if path.startswith("adaptive/blocker/"):
+                    self.adaptive_nested_viewed.add(path)
         elif action["action"] in ("rebuild_index", "unlock_escrow"):
             stage = "index" if action["action"] == "rebuild_index" else "escrow"
             self.nested_attempts[stage] += 1
@@ -539,6 +544,27 @@ class RepairSimulator:
                                "recovery_rejected")
         elif action["action"] == "resolve_blocker":
             self.surprise_resolution_attempts += 1
+            level = action.get("level", 1)
+            levels = self.case.get("adaptive_surprise_levels", 1)
+            if type(level) is not int or not 1 <= level <= levels:
+                self.invalid_actions += 1
+                self.history.append({"action": action, "label": "invalid_blocker_level"})
+                return "BLOCKER RESOLUTION REJECTED: invalid level."
+            if self.surprise_triggered and level < levels and level + 1 not in self.adaptive_nested_resolved:
+                self.adaptive_nested_triggered.add(level + 1)
+                self.history.append({"action": action, "label": "unexpected_problem"})
+                return (f"UNEXPECTED PROBLEM: blocker level {level} has another gate. "
+                        f"Inspect adaptive/blocker/{level + 1}, then submit resolve_blocker "
+                        f"with level={level + 1} and its exact CURRENT token. No resolution applied.")
+            if level > 1:
+                path = f"adaptive/blocker/{level}"
+                valid = (level in self.adaptive_nested_triggered
+                         and path in self.adaptive_nested_viewed
+                         and action.get("token") == self.case["adaptive_nested_tokens"][level])
+                if valid:
+                    self.adaptive_nested_resolved.add(level)
+                self.history.append({"action": action, "label": "nested_blocker_resolved" if valid else "nested_blocker_rejected"})
+                return "BLOCKER RESOLVED: nested gate cleared; resume the enclosing blocker." if valid else "BLOCKER RESOLUTION REJECTED: read the CURRENT nested token."
             if not self.surprise_triggered:
                 self.surprise_resolution_failures += 1
                 text, label = (
@@ -633,7 +659,8 @@ TRAP_SUMMARY_REQUEST = (
 )
 
 
-def request_investigation_action(cfg, model, context, trace, bm, *, phase, max_retries=1):
+def request_investigation_action(cfg, model, context, trace, bm, *, phase, max_retries=1,
+                                 before_request=None):
     """Bounded retries of unusable JSON without immediately charging simulator actions.
 
     Every inference request still counts towards tokens and elapsed time.
@@ -649,6 +676,8 @@ def request_investigation_action(cfg, model, context, trace, bm, *, phase, max_r
             "role": "user",
             "content": "NO VALID ACTION was produced. Reply NOW with exactly ONE complete JSON "
                        "action permitted in your current stage. No reasoning text or markdown."}]
+        if before_request is not None:
+            before_request(prompt)
         answer = bm.call_parent(cfg, model, prompt)
         action = parse_action(answer)
         if action is not None:
@@ -680,6 +709,16 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
     puzzle = create_trap_puzzle(seed, tasks, trap_log_lines, trap_density, recovery_log_lines,
                                 nested_depth, nested_log_lines, pressure_records,
                                 pressure_detail_chars, adaptive_surprise=(mode == "adaptive"))
+    if mode == "adaptive":
+        for case in puzzle["cases"]:
+            case["adaptive_surprise_levels"] = cfg.get("_adaptive_surprise_levels", 1)
+            case["adaptive_nested_tokens"] = {}
+            for level in range(2, case["adaptive_surprise_levels"] + 1):
+                nested_token = "CHECK-" + token(random.Random(f"{seed}:{case['intro']}:{level}"), 10)
+                case["adaptive_nested_tokens"][level] = nested_token
+                case["docs"][f"adaptive/blocker/{level}"] = (
+                    f"state=CURRENT reconciliation_token={nested_token}\n"
+                    f"Submit resolve_blocker with level={level} and this token.")
     messages = [
         {"role": "system", "content": "Maintain the original audit and preserve verified seals. Follow each incident's JSON tool protocol."},
         {"role": "user", "content": puzzle["brief"]},

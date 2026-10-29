@@ -174,7 +174,7 @@ class Trace:
             (r["completion_tokens"] if r["completion_tokens"] is not None else (r["completion_est_tokens"] or 0))
             for r in stage_start_rows)
         action_retry_rows = [r for r in self.calls if r["phase"].endswith("_retry") and
-                             (r["phase"].startswith("branch_recursive_") or
+                             (r["phase"].startswith("branch_recursive_") or 'adaptive' in r['phase'] or
                               r["phase"] in ("branch_investigate_retry", "parent_investigate_retry"))]
         action_retry_prompt = sum(
             r["prompt_tokens"] if r["prompt_tokens"] is not None else r["prompt_est_tokens"]
@@ -372,7 +372,10 @@ def extract_lookup_answer(text):
 def classify_exception(exc):
     """Never claim definite context overflow/timeout from ambiguous errors."""
     explicit_kind = getattr(exc, 'error_kind', None)
-    if explicit_kind in ('context_overflow_confirmed', 'context_checkpoint_blocked'):
+    if explicit_kind in ('context_overflow_confirmed', 'context_checkpoint_blocked',
+                         'context_capacity_exceeded_estimate', 'token_budget_exhausted',
+                         'model_call_budget_exhausted', 'branch_depth_limit',
+                         'branch_count_limit', 'nested_child_failed', 'context_isolation_violation'):
         return explicit_kind
     message = str(exc).lower()
     if any(s in message for s in ('context length', 'context window', 'context capacity', 'context overflow',
@@ -392,6 +395,10 @@ def call_parent(cfg, model, messages, *, reporting=False, final=False, summary=F
     # Recognize them without changing the virtual simulator's request protocol.
     # Report/summary retries have different phases and must not be mistaken for actions.
     phase = bc.http_json.phase if isinstance(bc.http_json, Trace) else ""
+    # Adaptive investigation and retries inherit the normal user-selected output
+    # and reasoning settings. The short retry override belongs to older arms.
+    if 'adaptive' in phase:
+        no_action_retry = False
     no_action_retry = no_action_retry or (phase.endswith("_retry") and
         (phase.startswith("branch_recursive_") or phase in
          ("branch_investigate_retry", "parent_investigate_retry")))
@@ -686,8 +693,14 @@ def arguments(argv=None):
     parser.add_argument("--records", type=int, default=65, help="Rows in each archive (default 65)")
     parser.add_argument("--repeats", type=int, default=2, help="Different seeds per task level (default 2)")
     parser.add_argument("--seed", type=int, default=20261026)
-    parser.add_argument("--context-limit", type=int, default=8192, help="Context in tokens: passed to llama-server; for Jan used for reporting only")
+    parser.add_argument("--context-limit", type=int, default=8192, help="Context in tokens: passed to llama-server and controller checks; for Jan match the server's configured window")
     parser.add_argument("--max-output-tokens", type=int, default=1024, help="Investigation output cap (default 1024; equal for all modes)")
+    parser.add_argument("--adaptive-max-depth", type=int, choices=range(1, 9), default=3,
+                        help="Maximum private surprise branch depth; no per-child token cap")
+    parser.add_argument("--adaptive-max-calls", type=int, default=64,
+                        help="Shared adaptive inference-call guard, including retries")
+    parser.add_argument("--adaptive-surprise-levels", type=int, choices=range(1, 5), default=1,
+                        help="Number of unexpected blocker levels in the adaptive fixture")
     parser.add_argument("--final-output-tokens", type=int, default=2048, help="Output cap for final reporting ONLY (default 2048)")
     parser.add_argument("--final-retries", type=int, default=1, help="Retries for truncated or empty final report (default 1; retries counted in time/tokens)")
     parser.add_argument("--report-reasoning", choices=("auto", "none"), default="none",
@@ -783,6 +796,8 @@ def arguments(argv=None):
         parser.error("--autonomous-max-children must be 1-16")
     if not 1024 <= args.autonomous_max_tokens <= 200000:
         parser.error("--autonomous-max-tokens must be 1024-200000")
+    if args.adaptive_max_calls < 1:
+        parser.error("--adaptive-max-calls must be positive")
     if args.records < 2 or args.repeats < 1 or not args.tasks or any(n < 1 for n in args.tasks):
         parser.error("--tasks, --records, and --repeats must be positive (records >= 2)")
     return args
@@ -802,7 +817,11 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "scoring_version": 3,
                   "simulator_rules_version": 2,
                   "mandatory_authority_inspection": args.scenario == "repair",
-                  "benchmark_version": "1.8.0", "scenario": args.scenario,
+                  "benchmark_version": "1.9.0", "scenario": args.scenario,
+                  "adaptive_max_depth": args.adaptive_max_depth,
+                  "adaptive_max_calls": args.adaptive_max_calls,
+                  "adaptive_surprise_levels": args.adaptive_surprise_levels,
+                  "adaptive_retry_policy": "inherit_investigation_settings",
                   "engine": args.engine,
                   "llama_reset_policy": ("reuse" if args.reuse_llama else "fresh_each_trial") if args.engine == "llama" else None,
                   "jan_reset_policy": (("each_trial" if args.restart_jan_between_trials else
@@ -1275,6 +1294,9 @@ def main(argv=None):
             return 2
     cfg["_recursive_max_depth"] = args.recursive_max_depth
     cfg["_autonomous_max_children"] = args.autonomous_max_children
+    cfg["_adaptive_max_depth"] = args.adaptive_max_depth
+    cfg["_adaptive_max_calls"] = args.adaptive_max_calls
+    cfg["_adaptive_surprise_levels"] = args.adaptive_surprise_levels
     cfg["_autonomous_max_tokens"] = args.autonomous_max_tokens
     cfg["_recursive_checkpoint_threshold"] = args.recursive_checkpoint_threshold
     cfg["_recursive_checkpoint_max"] = args.recursive_checkpoint_max
