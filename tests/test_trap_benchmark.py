@@ -627,7 +627,7 @@ class TrapBenchmarkTests(unittest.TestCase):
             summary = (folder / "SUMMARY.md").read_text()
             rows = json.loads((folder / "results.json").read_text())
             self.assertEqual(rows["metadata"]["scenario"], "repair")
-            self.assertEqual(rows["metadata"]["benchmark_version"], "1.9.0")
+            self.assertEqual(rows["metadata"]["benchmark_version"], "1.10.0")
             self.assertEqual(rows["metadata"]["pressure_records"], 4)
             self.assertEqual(len(rows["trials"]), 3)
             self.assertIn("Repair traps: observable investigation behavior", summary)
