@@ -804,6 +804,17 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         child_ok = False
         def resolved():
             return sim.surprise_resolved if depth == 1 else depth in sim.adaptive_nested_resolved
+        blocker_token = (
+            case.get('adaptive_blocker_token') if depth == 1 else
+            case.get('adaptive_nested_tokens', {}).get(depth))
+
+        def child_scope_instruction():
+            return (
+                f'CHILD SCOPE REFUSED: you are the level-{depth} child. '
+                f'The active task is {path}. Submit exactly '
+                f'{{"action":"resolve_blocker","level":{depth},'
+                f'"token":"{blocker_token}"}}. Do not submit a level-2 action; '
+                'that belongs only to the nested child.')
         try:
             while (sim.actions < max_actions and tokens_used() < max_tokens
                    and not resolved()):
@@ -827,6 +838,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                                  or (action.get('action') == 'resolve_blocker'
                                      and action.get('level', 1) != depth)):
                     observation = sim.reject_out_of_scope('adaptive', action, [path], ['inspect', 'resolve_blocker'])
+                    if action and action.get('action') == 'resolve_blocker' and action.get('level', 1) != depth:
+                        observation = child_scope_instruction()
                     child_event['rejected_out_of_scope'] = child_event.get('rejected_out_of_scope', 0) + 1
                 else:
                     observation = sim.step(action)
@@ -844,7 +857,10 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                         raise AdaptiveStop('nested_child_failed')
                     child_context = copy.deepcopy(nested_marker)
                     receipt = {'role': 'user', 'content':
-                        'NESTED BRANCH RESUME: gate verified resolved. Continue your own blocker.'}
+                        f'NESTED BRANCH RESUME: the nested level-{depth + 1} gate is verified resolved. '
+                        f'Your level-{depth} blocker remains active. Continue by submitting exactly '
+                        f'{{"action":"resolve_blocker","level":{depth},'
+                        f'"token":"{blocker_token}"}}.'}
                     child_context.append(receipt)
                     restored_boundaries[id(child_context)] = (child_context, copy.deepcopy(nested_marker + [receipt]))
                     counters['adaptive_resumes'] += 1
