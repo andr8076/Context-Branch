@@ -700,6 +700,10 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         'adaptive_child_transcript_leaks': 0, 'adaptive_child_resolutions': 0,
         'adaptive_post_resume_decisions': 0, 'adaptive_post_resume_actions': 0,
         'adaptive_post_resume_verified': 0,
+        'adaptive_repeated_recovery_rejections': 0,
+        'adaptive_recovery_corrections': 0,
+        'adaptive_parent_checkpoints': 0,
+        'adaptive_pre_surprise_context_failures': 0,
     }
     trace.active_adaptive_events = events
     trace.active_adaptive_counters = counters
@@ -767,6 +771,25 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         'post_resume_verified': False,
     }
     events.append(parent_event)
+    parent_base = copy.deepcopy(parent_context)
+    parent_journal = []
+    journal_keys = set()
+    rejected_recoveries = {}
+    correction = None
+
+    def checkpoint_parent():
+        # Retain every distinct observed exchange, including successful changes
+        # and rejection outcomes. Never reconstruct evidence from the oracle.
+        rebuilt = copy.deepcopy(parent_base)
+        rebuilt.append({'role': 'user', 'content':
+            'PARENT CONTEXT CHECKPOINT: duplicate exchanges were removed. '
+            'All distinct observed evidence and action outcomes follow; shared state persists.'})
+        for action_text, observed in parent_journal:
+            rebuilt.extend(({'role': 'assistant', 'content': action_text},
+                            {'role': 'user', 'content': observed}))
+        if correction:
+            rebuilt.append({'role': 'user', 'content': correction})
+        return rebuilt
 
     def run_child(task_text, observed_problem, source=None, depth=1):
         """Solve the new problem in an isolated fork of the parent marker."""
@@ -926,6 +949,17 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                and not sim.verified):
             trace.phase = 'adaptive_parent'
             after_resume = parent_event['resumed']
+            if (not parent_event['surprise_triggered'] and
+                    bm.approximate_tokens(parent_context) + cfg['max_output_tokens'] + 256
+                    >= context_limit * 0.78):
+                shorter = checkpoint_parent()
+                if bm.approximate_tokens(shorter) < bm.approximate_tokens(parent_context):
+                    parent_event.setdefault('checkpoint_details', []).append({
+                        'before_est_tokens': bm.approximate_tokens(parent_context),
+                        'after_est_tokens': bm.approximate_tokens(shorter),
+                        'distinct_exchanges_preserved': len(parent_journal)})
+                    parent_context = shorter
+                    counters['adaptive_parent_checkpoints'] += 1
             before = bm.approximate_tokens(parent_context)
             action, answer, info = request_investigation_action(
                 cfg, model, parent_context, trace, bm,
@@ -955,6 +989,27 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
             parent_context.append({'role': 'user', 'content':
                                    'SIMULATOR RESULT:\n' + observation +
                                    '\nContinue the parent incident. JSON action only.'})
+            if not parent_event['surprise_triggered']:
+                observed = parent_context[-1]['content']
+                key = (json.dumps(action, sort_keys=True), observed)
+                if key not in journal_keys:
+                    journal_keys.add(key)
+                    parent_journal.append((answer, observed))
+                label = sim.history[-1].get('label') if len(sim.history) > history_start else None
+                if label == 'recovery_rejected' and action:
+                    proposal = json.dumps(action, sort_keys=True)
+                    rejected_recoveries[proposal] = rejected_recoveries.get(proposal, 0) + 1
+                    if rejected_recoveries[proposal] >= 2:
+                        counters['adaptive_repeated_recovery_rejections'] += 1
+                        correction = (
+                            'RECOVERY CORRECTION: this exact proposal has already been rejected '
+                            f'{rejected_recoveries[proposal]} times: {proposal}. '
+                            'Re-read the observed guide/index and both recovery shards. '
+                            'Select rows matching BOTH the guide run and state=CURRENT; '
+                            'join fragments in the published order with no spaces or separators. '
+                            'Do not resubmit the unchanged rejected token.')
+                        parent_context.append({'role': 'user', 'content': correction})
+                        counters['adaptive_recovery_corrections'] += 1
             if after_resume:
                 parent_event.setdefault('post_resume_trace', []).append({
                     'action': copy.deepcopy(action),
@@ -1017,6 +1072,11 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     except Exception as exc:
         parent_event['status'] = bm.classify_exception(exc)
         parent_event['error'] = str(exc)
+        if (not parent_event['surprise_triggered'] and
+                parent_event['status'] in ('context_capacity_exceeded_estimate',
+                                           'context_overflow_confirmed',
+                                           'context_checkpoint_blocked')):
+            counters['adaptive_pre_surprise_context_failures'] += 1
         raise
     finally:
         if not success and parent_event.get('status') == 'running':

@@ -774,6 +774,10 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "autonomous_max_depth": 0,
         "autonomous_events": [],
         "adaptive_surprise_triggers": 0,
+        "adaptive_repeated_recovery_rejections": 0,
+        "adaptive_recovery_corrections": 0,
+        "adaptive_parent_checkpoints": 0,
+        "adaptive_pre_surprise_context_failures": 0,
         "adaptive_marker_count": 0,
         "adaptive_branch_attempts": 0,
         "adaptive_branches": 0,
@@ -889,6 +893,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 else:
                     result["adaptive_events"].append({"batch": name, "events": nested_events})
                     for key in (
+                            "adaptive_repeated_recovery_rejections", "adaptive_recovery_corrections",
+                            "adaptive_parent_checkpoints", "adaptive_pre_surprise_context_failures",
                             "adaptive_surprise_triggers", "adaptive_marker_count",
                             "adaptive_branch_attempts", "adaptive_branches",
                             "adaptive_branch_failures", "adaptive_resumes",
@@ -1117,6 +1123,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 retry_stats = trace.active_adaptive_counters
                 result["adaptive_events"].append({"batch": name, "events": adaptive_events})
                 for key in (
+                        "adaptive_repeated_recovery_rejections", "adaptive_recovery_corrections",
+                        "adaptive_parent_checkpoints", "adaptive_pre_surprise_context_failures",
                         "adaptive_surprise_triggers", "adaptive_marker_count",
                         "adaptive_branch_attempts", "adaptive_branches",
                         "adaptive_branch_failures", "adaptive_resumes",

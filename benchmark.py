@@ -162,7 +162,7 @@ class Trace:
             self.calls.append(row)
 
     def totals(self):
-        peak_main = max((r["prompt_tokens"] or r["prompt_est_tokens"] for r in self.calls if r["phase"].startswith("parent")), default=0)
+        peak_main = max((r["prompt_tokens"] or r["prompt_est_tokens"] for r in self.calls if r["phase"].startswith(("parent", "adaptive_parent"))), default=0)
         peak_branch = max((r["prompt_tokens"] or r["prompt_est_tokens"] for r in self.calls if r["phase"].startswith("branch")), default=0)
         total_prompt = sum((r["prompt_tokens"] if r["prompt_tokens"] is not None else r["prompt_est_tokens"]) for r in self.calls)
         total_completion = sum((r["completion_tokens"] if r["completion_tokens"] is not None else (r["completion_est_tokens"] or 0)) for r in self.calls)
@@ -904,6 +904,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "autonomous_tokens_used", "autonomous_token_budget",
         "autonomous_branch_count", "autonomous_context_count", "autonomous_max_depth",
         "adaptive_surprise_triggers", "adaptive_marker_count", "adaptive_branch_attempts",
+        "adaptive_repeated_recovery_rejections", "adaptive_recovery_corrections",
+        "adaptive_parent_checkpoints", "adaptive_pre_surprise_context_failures",
         "adaptive_branches", "adaptive_branch_failures", "adaptive_resumes",
         "adaptive_decisions", "adaptive_child_decisions", "adaptive_child_actions",
         "adaptive_parent_prompt_before_marker", "adaptive_parent_prompt_after_resume",
@@ -1143,6 +1145,16 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{max((r.get('autonomous_token_budget', 0) for r in rows), default=0)} | "
                                  f"{max((r.get('autonomous_max_depth', 0) for r in rows), default=0)} |")
         if "adaptive" in args.modes:
+            lines += ["", "## Adaptive parent recovery", "",
+                      "| Tasks | Repeated recovery rejections | Corrections | Parent checkpoints | Pre-surprise context failures |",
+                      "|---:|---:|---:|---:|---:|"]
+            for n in args.tasks:
+                rows = [r for r in data if r["tasks"] == n and r["mode"] == "adaptive"]
+                if rows:
+                    values = [sum(r.get(key, 0) for r in rows) for key in (
+                        "adaptive_repeated_recovery_rejections", "adaptive_recovery_corrections",
+                        "adaptive_parent_checkpoints", "adaptive_pre_surprise_context_failures")]
+                    lines.append("| " + " | ".join(map(str, [n, *values])) + " |")
             lines += ["", "## Adaptive surprise-branch diagnostics", "",
                       "The adaptive arm injects one explicit unexpected blocker at the first repair attempt. "
                       "The controller saves the parent message list at a marker, resolves only that blocker in "

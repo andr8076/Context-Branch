@@ -191,6 +191,45 @@ class AdaptiveGuardTests(unittest.TestCase):
         self.assertEqual(result['verified_cases'], 1, result['error'])
         self.assertEqual(result['adaptive_child_resolutions'], 3)
 
+    def test_parent_repeated_recovery_gets_observation_based_correction(self):
+        class Rejected(NestedFake):
+            count = 0
+            def __call__(self, method, url, cfg, payload=None):
+                if method == 'POST' and self.count < 3:
+                    self.count += 1
+                    self.messages_seen.append(json.loads(json.dumps(payload['messages'])))
+                    return {'choices': [{'message': {'content': json.dumps(
+                        {'action': 'recover', 'token': 'WRONG'})}, 'finish_reason': 'stop'}]}
+                return super().__call__(method, url, cfg, payload)
+        result, fake = self.run_case(Rejected())
+        self.assertEqual(result['adaptive_repeated_recovery_rejections'], 2)
+        self.assertEqual(result['adaptive_recovery_corrections'], 2)
+        self.assertIn('no spaces or separators', json.dumps(fake.messages_seen))
+        self.assertNotIn('reconciliation_token=', json.dumps(fake.messages_seen[:3]))
+
+    def test_duplicate_parent_reads_checkpoint_and_preserve_evidence(self):
+        class RepeatedReads(NestedFake):
+            count = 0
+            def __call__(self, method, url, cfg, payload=None):
+                if method == 'POST' and self.count < 35:
+                    self.count += 1
+                    self.messages_seen.append(json.loads(json.dumps(payload['messages'])))
+                    return {'choices': [{'message': {'content': json.dumps(
+                        {'action': 'inspect', 'path': 'guide/index'})}, 'finish_reason': 'stop'}]}
+                return super().__call__(method, url, cfg, payload)
+        result, fake = self.run_case(RepeatedReads())
+        self.assertGreater(result['adaptive_parent_checkpoints'], 0)
+        compacted = [msgs for msgs in fake.messages_seen
+                     if 'PARENT CONTEXT CHECKPOINT' in json.dumps(msgs)]
+        self.assertTrue(compacted)
+        self.assertIn('MANDATORY RECOVERY', json.dumps(compacted[0]))
+
+    def test_pre_surprise_context_failure_is_separate(self):
+        result, _ = self.run_case(_context_limit=400)
+        self.assertEqual(result['error_type'], 'context_capacity_exceeded_estimate')
+        self.assertEqual(result['adaptive_pre_surprise_context_failures'], 1)
+        self.assertEqual(result['adaptive_branch_failures'], 0)
+
     def test_corrupted_resume_is_measured_before_inference(self):
         original = tb.request_investigation_action
 
