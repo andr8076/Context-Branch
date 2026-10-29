@@ -699,6 +699,8 @@ def arguments(argv=None):
                         help="Maximum private surprise branch depth; no per-child token cap")
     parser.add_argument("--adaptive-max-calls", type=int, default=64,
                         help="Shared adaptive inference-call guard, including retries")
+    parser.add_argument("--adaptive-max-tokens", type=int, default=150000,
+                        help="Adaptive tree processed-token guard (default 150000; includes parent and children)")
     parser.add_argument("--adaptive-surprise-levels", type=int, choices=range(1, 5), default=1,
                         help="Number of unexpected blocker levels in the adaptive fixture")
     parser.add_argument("--final-output-tokens", type=int, default=2048, help="Output cap for final reporting ONLY (default 2048)")
@@ -798,6 +800,8 @@ def arguments(argv=None):
         parser.error("--autonomous-max-tokens must be 1024-200000")
     if args.adaptive_max_calls < 1:
         parser.error("--adaptive-max-calls must be positive")
+    if not 1024 <= args.adaptive_max_tokens <= 300000:
+        parser.error("--adaptive-max-tokens must be 1024-300000")
     if args.records < 2 or args.repeats < 1 or not args.tasks or any(n < 1 for n in args.tasks):
         parser.error("--tasks, --records, and --repeats must be positive (records >= 2)")
     return args
@@ -820,6 +824,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "benchmark_version": "1.9.0", "scenario": args.scenario,
                   "adaptive_max_depth": args.adaptive_max_depth,
                   "adaptive_max_calls": args.adaptive_max_calls,
+                  "adaptive_max_tokens": args.adaptive_max_tokens,
                   "adaptive_surprise_levels": args.adaptive_surprise_levels,
                   "adaptive_retry_policy": "inherit_investigation_settings",
                   "engine": args.engine,
@@ -1296,6 +1301,7 @@ def main(argv=None):
     cfg["_autonomous_max_children"] = args.autonomous_max_children
     cfg["_adaptive_max_depth"] = args.adaptive_max_depth
     cfg["_adaptive_max_calls"] = args.adaptive_max_calls
+    cfg["_adaptive_max_tokens"] = args.adaptive_max_tokens
     cfg["_adaptive_surprise_levels"] = args.adaptive_surprise_levels
     cfg["_autonomous_max_tokens"] = args.autonomous_max_tokens
     cfg["_recursive_checkpoint_threshold"] = args.recursive_checkpoint_threshold

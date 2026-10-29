@@ -26,7 +26,8 @@ python3 benchmark.py --engine llama --scenario repair \
   --nested-depth 1 --nested-log-lines 4 --recovery-log-lines 4 \
   --pressure-records 0 --max-actions 48 \
   --adaptive-surprise-levels 2 --adaptive-max-depth 3 \
-  --adaptive-max-calls 64 --autonomous-max-children 8 \
+  --adaptive-max-calls 64 --adaptive-max-tokens 150000 \
+  --autonomous-max-children 8 \
   --autonomous-max-tokens 100000
 ```
 

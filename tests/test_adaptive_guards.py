@@ -84,7 +84,7 @@ class AdaptiveGuardTests(unittest.TestCase):
         self.assertEqual(result['adaptive_decisions'], 0)
 
     def test_reserves_generation_against_shared_work_budget(self):
-        result, _ = self.run_case(_autonomous_max_tokens=1100)
+        result, _ = self.run_case(_adaptive_max_tokens=1100)
         self.assertEqual(result['error_type'], 'token_budget_exhausted')
         self.assertEqual(result['adaptive_decisions'], 0)
 
@@ -126,7 +126,7 @@ class AdaptiveGuardTests(unittest.TestCase):
                     return {'choices': [{'message': {'content': '{"action":"delegate"}'}, 'finish_reason': 'stop'}]}
                 return super().__call__(method, url, cfg, payload)
 
-        result, _ = self.run_case(Delegator(), _autonomous_max_tokens=200000)
+        result, _ = self.run_case(Delegator(), _adaptive_max_tokens=200000)
         self.assertEqual(result['verified_cases'], 0)
         self.assertGreater(result['out_of_scope_actions'], 0)
         events = result['adaptive_events'][0]['events']
@@ -143,7 +143,7 @@ class AdaptiveGuardTests(unittest.TestCase):
                     return {'choices': [{'message': {'content': '{"action":"delegate"}'}, 'finish_reason': 'stop'}]}
                 return super().__call__(method, url, cfg, payload)
 
-        result, fake = self.run_case(StuckNested(), _autonomous_max_tokens=200000)
+        result, fake = self.run_case(StuckNested(), _adaptive_max_tokens=200000)
         self.assertEqual(result['error_type'], 'nested_child_failed')
         self.assertEqual(result['adaptive_branch_failures'], 2)
         self.assertEqual(result['adaptive_resumes'], 0)
