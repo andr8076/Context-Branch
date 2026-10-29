@@ -838,7 +838,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                     solver_kwargs["max_children"] = cfg.get("_autonomous_max_children", 8)
                     solver_kwargs["max_tokens"] = cfg.get("_autonomous_max_tokens", 100000)
                 elif mode == "adaptive":
-                    solver_kwargs["max_tokens"] = cfg.get("_autonomous_max_tokens", 100000)
+                    solver_kwargs["max_tokens"] = cfg.get("_adaptive_max_tokens", 150000)
                 success, nested_events, retry_stats = solver(
                     sim, case, cfg, model, trace, bm, max_actions, **solver_kwargs)
                 result["no_action_investigation_calls"] += retry_stats["no_actions"]
