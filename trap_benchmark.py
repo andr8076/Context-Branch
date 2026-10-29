@@ -437,6 +437,7 @@ class RepairSimulator:
     surprise_resolved: bool = False
     surprise_resolution_attempts: int = 0
     surprise_resolution_failures: int = 0
+    adaptive_nested_resolution_failures: int = 0
     adaptive_nested_triggered: set = field(default_factory=set)
     adaptive_nested_viewed: set = field(default_factory=set)
     adaptive_nested_resolved: set = field(default_factory=set)
@@ -548,44 +549,55 @@ class RepairSimulator:
             levels = self.case.get("adaptive_surprise_levels", 1)
             if type(level) is not int or not 1 <= level <= levels:
                 self.invalid_actions += 1
+                if type(level) is int and level > 1:
+                    self.adaptive_nested_resolution_failures += 1
                 self.history.append({"action": action, "label": "invalid_blocker_level"})
                 return "BLOCKER RESOLUTION REJECTED: invalid level."
-            if self.surprise_triggered and level < levels and level + 1 not in self.adaptive_nested_resolved:
-                self.adaptive_nested_triggered.add(level + 1)
-                self.history.append({"action": action, "label": "unexpected_problem"})
-                return (f"UNEXPECTED PROBLEM: blocker level {level} has another gate. "
-                        f"Inspect adaptive/blocker/{level + 1}, then submit resolve_blocker "
-                        f"with level={level + 1} and its exact CURRENT token. No resolution applied.")
             if level > 1:
                 path = f"adaptive/blocker/{level}"
                 valid = (level in self.adaptive_nested_triggered
                          and path in self.adaptive_nested_viewed
                          and action.get("token") == self.case["adaptive_nested_tokens"][level])
-                if valid:
-                    self.adaptive_nested_resolved.add(level)
-                self.history.append({"action": action, "label": "nested_blocker_resolved" if valid else "nested_blocker_rejected"})
-                return "BLOCKER RESOLVED: nested gate cleared; resume the enclosing blocker." if valid else "BLOCKER RESOLUTION REJECTED: read the CURRENT nested token."
+                if not valid:
+                    self.adaptive_nested_resolution_failures += 1
+                    self.history.append({"action": action, "label": "nested_blocker_rejected"})
+                    return "BLOCKER RESOLUTION REJECTED: read the CURRENT nested token."
+                if level < levels and level + 1 not in self.adaptive_nested_resolved:
+                    self.adaptive_nested_triggered.add(level + 1)
+                    self.history.append({"action": action, "label": "unexpected_problem"})
+                    return (f"UNEXPECTED PROBLEM: blocker level {level} has another gate. "
+                            f"Inspect adaptive/blocker/{level + 1}, then submit resolve_blocker "
+                            f"with level={level + 1} and its exact CURRENT token. No resolution applied.")
+                self.adaptive_nested_resolved.add(level)
+                self.history.append({"action": action, "label": "nested_blocker_resolved"})
+                return "BLOCKER RESOLVED: nested gate cleared; resume the enclosing blocker."
             if not self.surprise_triggered:
                 self.surprise_resolution_failures += 1
                 text, label = (
                     "BLOCKER RESOLUTION REJECTED: no unexpected blocker is active.",
                     "adaptive_blocker_rejected",
                 )
-            elif (self.surprise_evidence_viewed
-                  and action.get("token") == self.case.get("adaptive_blocker_token")):
+            elif not (self.surprise_evidence_viewed
+                      and action.get("token") == self.case.get("adaptive_blocker_token")):
+                self.surprise_resolution_failures += 1
+                text, label = (
+                    "BLOCKER RESOLUTION REJECTED: inspect adaptive/blocker and submit "
+                    "its exact CURRENT reconciliation token.",
+                    "adaptive_blocker_rejected",
+                )
+            elif level < levels and level + 1 not in self.adaptive_nested_resolved:
+                self.adaptive_nested_triggered.add(level + 1)
+                self.history.append({"action": action, "label": "unexpected_problem"})
+                return (f"UNEXPECTED PROBLEM: blocker level {level} has another gate. "
+                        f"Inspect adaptive/blocker/{level + 1}, then submit resolve_blocker "
+                        f"with level={level + 1} and its exact CURRENT token. No resolution applied.")
+            else:
                 self.surprise_resolved = True
                 text, label = (
                     "BLOCKER RESOLVED: endpoint reconciliation gate cleared. "
                     "The route repair is still unapplied; return a verified receipt "
                     "and let the parent continue from its marker.",
                     "adaptive_blocker_resolved",
-                )
-            else:
-                self.surprise_resolution_failures += 1
-                text, label = (
-                    "BLOCKER RESOLUTION REJECTED: inspect adaptive/blocker and submit "
-                    "its exact CURRENT reconciliation token.",
-                    "adaptive_blocker_rejected",
                 )
         elif action["action"] == "repair":
             # The adaptive benchmark injects one externally observable blocker
@@ -776,6 +788,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "adaptive_child_tokens": 0,
         "adaptive_child_transcript_leaks": 0,
         "adaptive_child_resolutions": 0,
+        "adaptive_nested_blocker_failures": 0,
         "adaptive_post_resume_decisions": 0,
         "adaptive_post_resume_actions": 0,
         "adaptive_post_resume_verified": 0,
@@ -883,7 +896,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                             "adaptive_child_actions", "adaptive_parent_prompt_before_marker",
                             "adaptive_parent_prompt_after_resume", "adaptive_child_prompt_tokens",
                             "adaptive_child_tokens", "adaptive_child_transcript_leaks",
-                            "adaptive_child_resolutions", "adaptive_post_resume_decisions",
+                            "adaptive_child_resolutions", "adaptive_nested_blocker_failures",
+                            "adaptive_post_resume_decisions",
                             "adaptive_post_resume_actions", "adaptive_post_resume_verified"):
                         result[key] += retry_stats.get(key, 0)
                     result["out_of_scope_actions"] += sum(
@@ -930,6 +944,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
             result["authority_evidence_chars"] += sim.authority_evidence_chars
             result["authority_docs_viewed"] += len(sim.authority_views)
             result["authority_blocked"] += sim.authority_blocked
+            result["adaptive_nested_blocker_failures"] += sim.adaptive_nested_resolution_failures
             result["lookup_breakdown"].append({"batch": name, "answer": seal, "correct": sim.verified,
                                                  "status": "verified" if sim.verified else "unverified"})
             result["case_breakdown"].append({"batch": name, "verified": sim.verified,
@@ -961,6 +976,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                                              "adaptive_blocker_resolved": sim.surprise_resolved,
                                              "adaptive_blocker_attempts": sim.surprise_resolution_attempts,
                                              "adaptive_blocker_failures": sim.surprise_resolution_failures,
+                                             "adaptive_nested_blocker_failures": sim.adaptive_nested_resolution_failures,
                                              "events": sim.history,
                                              "expected_repair_debug_only": case["expected_repair"]})
             case_recorded = True
@@ -1034,6 +1050,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
             result["authority_evidence_chars"] += sim.authority_evidence_chars
             result["authority_docs_viewed"] += len(sim.authority_views)
             result["authority_blocked"] += sim.authority_blocked
+            result["adaptive_nested_blocker_failures"] += sim.adaptive_nested_resolution_failures
             result["lookup_breakdown"].append({"batch": name, "answer": seal,
                 "correct": sim.verified, "status": "verified" if sim.verified else "interrupted"})
             result["case_breakdown"].append({
@@ -1050,6 +1067,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 "adaptive_blocker_resolved": sim.surprise_resolved,
                 "adaptive_blocker_attempts": sim.surprise_resolution_attempts,
                 "adaptive_blocker_failures": sim.surprise_resolution_failures,
+                "adaptive_nested_blocker_failures": sim.adaptive_nested_resolution_failures,
                 "recovery_shard_views": len(sim.recovery_shards_viewed),
                 "nested_shard_views": {k: len(v) for k, v in sim.nested_views.items()},
                 "stage_scope_rejected": sum(e["label"] == "stage_scope_rejected" for e in sim.history),
@@ -1106,7 +1124,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                         "adaptive_child_actions", "adaptive_parent_prompt_before_marker",
                         "adaptive_parent_prompt_after_resume", "adaptive_child_prompt_tokens",
                         "adaptive_child_tokens", "adaptive_child_transcript_leaks",
-                        "adaptive_child_resolutions", "adaptive_post_resume_decisions",
+                        "adaptive_child_resolutions", "adaptive_nested_blocker_failures",
+                        "adaptive_post_resume_decisions",
                         "adaptive_post_resume_actions", "adaptive_post_resume_verified"):
                     result[key] += retry_stats.get(key, 0)
                 result["out_of_scope_actions"] += sum(
