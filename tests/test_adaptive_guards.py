@@ -35,6 +35,7 @@ class NestedFake(DeliberateFakeJan):
 
 class AdaptiveGuardTests(unittest.TestCase):
     def run_case(self, fake=None, **overrides):
+        nested_depth = overrides.pop('_nested_depth', 0)
         cfg = {**bm.bc.DEFAULTS, 'api_base_url': 'http://fake/v1', 'max_output_tokens': 1024,
                'timeout_seconds': 30, '_autonomous_max_tokens': 100000,
                '_adaptive_surprise_levels': 2, '_context_limit': 8192}
@@ -42,7 +43,7 @@ class AdaptiveGuardTests(unittest.TestCase):
         fake = fake or NestedFake()
         with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, 'http_json', fake):
             result = tb.run_trap_trial('adaptive', 17, 1, cfg, 'mock', cfg['_context_limit'],
-                                      Path(temp), bm, nested_depth=0, recovery_log_lines=0,
+                                      Path(temp), bm, nested_depth=nested_depth, recovery_log_lines=0,
                                       nested_log_lines=0, pressure_records=0, max_actions=48)
         return result, fake
 
@@ -206,6 +207,31 @@ class AdaptiveGuardTests(unittest.TestCase):
         self.assertEqual(result['adaptive_recovery_corrections'], 2)
         self.assertIn('no spaces or separators', json.dumps(fake.messages_seen))
         self.assertNotIn('reconciliation_token=', json.dumps(fake.messages_seen[:3]))
+
+    def test_parent_repeated_nested_rejection_gets_stage_correction(self):
+        class MalformedIndexToken(NestedFake):
+            malformed = 0
+
+            def __call__(self, method, url, cfg, payload=None):
+                response = super().__call__(method, url, cfg, payload)
+                if method == 'POST' and self.malformed < 2:
+                    answer = response['choices'][0]['message']['content']
+                    action = tb.parse_action(answer)
+                    if action and action.get('action') == 'rebuild_index':
+                        token = action['token']
+                        action['token'] = token[:len(token) // 2] + '+' + token[len(token) // 2:]
+                        response['choices'][0]['message']['content'] = json.dumps(action)
+                        self.malformed += 1
+                return response
+
+        result, fake = self.run_case(MalformedIndexToken(), _nested_depth=2)
+        self.assertEqual(result['verified_cases'], 1, result['error'])
+        self.assertEqual(result['adaptive_repeated_stage_rejections'], 1)
+        self.assertEqual(result['adaptive_stage_corrections'], 1)
+        self.assertEqual(result['adaptive_repeated_recovery_rejections'], 0)
+        self.assertEqual(result['adaptive_branch_failures'], 0)
+        self.assertIn('RECOVERY-STAGE CORRECTION (index)', json.dumps(fake.messages_seen))
+        self.assertIn('including plus signs', json.dumps(fake.messages_seen))
 
     def test_duplicate_parent_reads_checkpoint_and_preserve_evidence(self):
         class RepeatedReads(NestedFake):

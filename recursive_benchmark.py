@@ -703,6 +703,12 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         'adaptive_child_transcript_leaks': 0, 'adaptive_child_resolutions': 0,
         'adaptive_post_resume_decisions': 0, 'adaptive_post_resume_actions': 0,
         'adaptive_post_resume_verified': 0,
+        # The recovery-only counters remain for compatibility.  These broader
+        # counters also cover the prerequisite reconstruction stages (index and
+        # escrow), which can otherwise consume the parent action budget before
+        # the adaptive surprise is reached.
+        'adaptive_repeated_stage_rejections': 0,
+        'adaptive_stage_corrections': 0,
         'adaptive_repeated_recovery_rejections': 0,
         'adaptive_recovery_corrections': 0,
         'adaptive_parent_checkpoints': 0,
@@ -780,7 +786,7 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     parent_base = copy.deepcopy(parent_context)
     parent_journal = []
     journal_keys = set()
-    rejected_recoveries = {}
+    rejected_stage_actions = {}
     correction = None
 
     def checkpoint_parent():
@@ -1033,20 +1039,47 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                     journal_keys.add(key)
                     parent_journal.append((answer, observed))
                 label = sim.history[-1].get('label') if len(sim.history) > history_start else None
-                if label == 'recovery_rejected' and action:
+                rejected_stage = {
+                    'index_rejected': 'index',
+                    'escrow_rejected': 'escrow',
+                    'recovery_rejected': 'recovery',
+                }.get(label)
+                if rejected_stage and action:
                     proposal = json.dumps(action, sort_keys=True)
-                    rejected_recoveries[proposal] = rejected_recoveries.get(proposal, 0) + 1
-                    if rejected_recoveries[proposal] >= 2:
-                        counters['adaptive_repeated_recovery_rejections'] += 1
+                    key = (rejected_stage, proposal)
+                    rejected_stage_actions[key] = rejected_stage_actions.get(key, 0) + 1
+                    rejection_count = rejected_stage_actions[key]
+                    if rejection_count >= 2:
+                        counters['adaptive_repeated_stage_rejections'] += 1
+                        if rejected_stage == 'recovery':
+                            counters['adaptive_repeated_recovery_rejections'] += 1
+                        stage_details = {
+                            'index': (
+                                'Re-read guide/index, index/shard-a, and index/shard-b. '
+                                'Match the requested run and state=CURRENT, then concatenate '
+                                'the two fragments in the published order directly, with no '
+                                'spaces or separators (including plus signs). Submit rebuild_index '
+                                'with that token.'),
+                            'escrow': (
+                                'Re-read guide/index, escrow/shard-a, and escrow/shard-b. '
+                                'Match the requested run and state=CURRENT, then concatenate '
+                                'the two fragments in the published order directly, with no '
+                                'spaces or separators (including plus signs). Submit unlock_escrow '
+                                'with that token.'),
+                            'recovery': (
+                                'Re-read guide/index and both recovery shards. Select rows '
+                                'matching BOTH the guide run and state=CURRENT; concatenate '
+                                'the fragments in the published order directly, with no spaces '
+                                'or separators (including plus signs). Submit recover with that token.'),
+                        }[rejected_stage]
                         correction = (
-                            'RECOVERY CORRECTION: this exact proposal has already been rejected '
-                            f'{rejected_recoveries[proposal]} times: {proposal}. '
-                            'Re-read the observed guide/index and both recovery shards. '
-                            'Select rows matching BOTH the guide run and state=CURRENT; '
-                            'join fragments in the published order with no spaces or separators. '
-                            'Do not resubmit the unchanged rejected token.')
+                            f'RECOVERY-STAGE CORRECTION ({rejected_stage}): this exact proposal '
+                            f'has already been rejected {rejection_count} times: {proposal}. '
+                            f'{stage_details} Do not resubmit the unchanged rejected token.')
                         parent_context.append({'role': 'user', 'content': correction})
-                        counters['adaptive_recovery_corrections'] += 1
+                        counters['adaptive_stage_corrections'] += 1
+                        if rejected_stage == 'recovery':
+                            counters['adaptive_recovery_corrections'] += 1
             if after_resume:
                 parent_event.setdefault('post_resume_trace', []).append({
                     'action': copy.deepcopy(action),

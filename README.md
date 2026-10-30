@@ -1,20 +1,23 @@
 # Context-Branch
 
-Adaptive parents now count repeated identical rejected recovery proposals and
-provide a correction after the second rejection: use matching CURRENT records,
-the published join order, and no separators. The correction never supplies the
-expected token. Before the first surprise, a parent approaching 78% of its
+Adaptive parents now count repeated identical rejected recovery-stage proposals
+for index rebuild, escrow unlock, and approvals recovery. After the second
+rejection, the parent receives a stage-specific correction: use matching CURRENT
+records, the published join order, and no separators. The correction never
+supplies the expected token. Before the first surprise, a parent approaching 78% of its
 context capacity (including generation reserve and safety margin) checkpoints
 its conversation by retaining every distinct observed exchange. Duplicate reads
 and identical rejected exchanges are removed; distinct evidence and successful
 state changes remain verbatim. If that cannot fit, the normal capacity guard
 still stops the trial. Parent checkpointing does not change saved resume markers.
 
-JSON, CSV and SUMMARY.md expose `adaptive_repeated_recovery_rejections`,
-`adaptive_recovery_corrections`, `adaptive_parent_checkpoints`, and
-`adaptive_pre_surprise_context_failures`. The last metric counts context-related
-stops before any surprise, independently of child branch failures. Adaptive parent
-API calls now contribute to `peak_main_prompt_tokens`.
+JSON, CSV and SUMMARY.md expose `adaptive_repeated_stage_rejections`,
+`adaptive_stage_corrections`, the recovery-only compatibility counters
+`adaptive_repeated_recovery_rejections` and `adaptive_recovery_corrections`,
+`adaptive_parent_checkpoints`, and `adaptive_pre_surprise_context_failures`. The
+last metric counts context-related stops before any surprise, independently of
+child branch failures. Adaptive parent API calls now contribute to
+`peak_main_prompt_tokens`.
 
 ## Context recycling
 

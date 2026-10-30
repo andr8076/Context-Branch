@@ -904,6 +904,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "autonomous_tokens_used", "autonomous_token_budget",
         "autonomous_branch_count", "autonomous_context_count", "autonomous_max_depth",
         "adaptive_surprise_triggers", "adaptive_marker_count", "adaptive_branch_attempts",
+        "adaptive_repeated_stage_rejections", "adaptive_stage_corrections",
         "adaptive_repeated_recovery_rejections", "adaptive_recovery_corrections",
         "adaptive_parent_checkpoints", "adaptive_pre_surprise_context_failures",
         "adaptive_branches", "adaptive_branch_failures", "adaptive_resumes",
@@ -1148,12 +1149,13 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{max((r.get('autonomous_max_depth', 0) for r in rows), default=0)} |")
         if "adaptive" in args.modes:
             lines += ["", "## Adaptive parent recovery", "",
-                      "| Tasks | Repeated recovery rejections | Corrections | Parent checkpoints | Pre-surprise context failures |",
-                      "|---:|---:|---:|---:|---:|"]
+                      "| Tasks | Repeated recovery-stage rejections | Stage corrections | Recovery-only rejections | Recovery-only corrections | Parent checkpoints | Pre-surprise context failures |",
+                      "|---:|---:|---:|---:|---:|---:|---:|"]
             for n in args.tasks:
                 rows = [r for r in data if r["tasks"] == n and r["mode"] == "adaptive"]
                 if rows:
                     values = [sum(r.get(key, 0) for r in rows) for key in (
+                        "adaptive_repeated_stage_rejections", "adaptive_stage_corrections",
                         "adaptive_repeated_recovery_rejections", "adaptive_recovery_corrections",
                         "adaptive_parent_checkpoints", "adaptive_pre_surprise_context_failures")]
                     lines.append("| " + " | ".join(map(str, [n, *values])) + " |")
