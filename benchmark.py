@@ -17,6 +17,8 @@ import re
 import sys
 import time
 import gc
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -394,11 +396,11 @@ def classify_exception(exc):
 
 
 def call_parent(cfg, model, messages, *, reporting=False, final=False, summary=False,
-                no_action_retry=False):
+                no_action_retry=False, trace=None):
     # In the repair benchmark, Trace.phase marks recovery attempts explicitly.
     # Recognize them without changing the virtual simulator's request protocol.
     # Report/summary retries have different phases and must not be mistaken for actions.
-    phase = bc.http_json.phase if isinstance(bc.http_json, Trace) else ""
+    phase = trace.phase if trace is not None else ""
     # Adaptive investigation and retries inherit the normal user-selected output
     # and reasoning settings. The short retry override belongs to older arms.
     if 'adaptive' in phase:
@@ -428,7 +430,8 @@ def call_parent(cfg, model, messages, *, reporting=False, final=False, summary=F
     effort = (cfg.get("_no_action_retry_reasoning_effort") if no_action_retry
               else cfg.get("_stage_start_reasoning_effort") if stage_start
               else cfg.get("_report_reasoning_effort") if reporting or summary else None)
-    result = bc.chat(request_cfg, model, messages, reasoning_effort=effort)
+    result = bc.chat(request_cfg, model, messages, reasoning_effort=effort,
+                     api=trace if trace is not None else None)
     content = result.get("content") or ""
     if isinstance(content, list):
         content = "\n".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
@@ -442,7 +445,7 @@ def model_final_report(cfg, model, messages, trace, expected, mission, control):
     and their inference work is included in token/time measurements.
     """
     trace.phase = "parent_final"
-    final = call_parent(cfg, model, messages, reporting=True, final=True)
+    final = call_parent(cfg, model, messages, reporting=True, final=True, trace=trace)
     first = score_final_report(final, expected, mission, control, trace.calls[-1])
     attempts = 1
     scored = first
@@ -454,7 +457,8 @@ def model_final_report(cfg, model, messages, trace, expected, mission, control):
             "The final report was not completed. Output ONLY the requested compact "
             "JSON object immediately. No analysis or commentary. Retain the original "
             "mission_id and control_code and all verified seals in their original batches.")}]
-        final = call_parent(cfg, model, retry_messages, reporting=True, final=True)
+        final = call_parent(cfg, model, retry_messages, reporting=True, final=True,
+                            trace=trace)
         attempts += 1
         scored = score_final_report(final, expected, mission, control, trace.calls[-1])
     scored["final_attempts"] = attempts
@@ -497,7 +501,8 @@ def compact_history(cfg, model, messages, preserved, trace, max_chars, summary_r
                  "Your previous summary attempt was empty or cut off. Return ONLY "
                  "completed batch names and exact verified seals, one per line. "
                  "No analysis; stay within the stated character limit."}]
-            summary = call_parent(cfg, model, current_messages, reporting=True, summary=True).strip()
+            summary = call_parent(cfg, model, current_messages, reporting=True,
+                                  summary=True, trace=trace).strip()
             attempts += 1
             last = trace.calls[-1] if trace.calls else {}
             cut_off = output_was_cut_off(last.get("finish_reason"), last.get("completion_tokens"),
@@ -567,11 +572,7 @@ def run_trial(mode, seed, tasks, records, cfg, model, context_limit, save_dir,
         "summary_max_chars": summary_max_chars if mode == "summarized" else None,
         "summaries_generated": 0, "summary_chars_peak": 0, "summaries": [],
     }
-    original_http = bc.http_json
-    original_data = bc.DATA
-    trace = Trace(mode, original_http)
-    bc.http_json = trace
-    bc.DATA = save_dir / "branches"
+    trace = Trace(mode, bc.http_json)
     started = time.perf_counter()
     stage = "setup"
     try:
@@ -580,7 +581,7 @@ def run_trial(mode, seed, tasks, records, cfg, model, context_limit, save_dir,
             if mode in ("linear", "summarized"):
                 trace.phase = "parent_lookup"
                 messages.append({"role": "user", "content": side_prompt})
-                response = call_parent(cfg, model, messages)
+                response = call_parent(cfg, model, messages, trace=trace)
                 messages.append({"role": "assistant", "content": response})
                 answer = extract_lookup_answer(response)
                 reason = trace.calls[-1]["finish_reason"] if trace.calls else None
@@ -591,7 +592,10 @@ def run_trial(mode, seed, tasks, records, cfg, model, context_limit, save_dir,
                 # Runtime-only final/recovery defaults must not give this arm
                 # more output tokens or retries than the other lookup arms.
                 lookup_cfg = dict(cfg, final_output_tokens=cfg["max_output_tokens"], no_action_retries=0)
-                isolated = bc.run_branch(lookup_cfg, side_prompt, f"Task: {name}; look up only its requested seal.")
+                isolated = bc.run_branch(
+                    lookup_cfg, side_prompt,
+                    f"Task: {name}; look up only its requested seal.",
+                    api=trace, data_dir=save_dir / "branches")
                 answer = str(isolated.get("result") or "")
                 reason = trace.calls[-1]["finish_reason"] if trace.calls else None
                 lookup_status = "correct" if answer == answer_expected else ("wrong" if answer else "missing_or_unreadable")
@@ -600,7 +604,7 @@ def run_trial(mode, seed, tasks, records, cfg, model, context_limit, save_dir,
                               "result": isolated.get("result"), "caveats": isolated.get("caveats")}
                 messages.append({"role": "user", "content": "Isolated lookup finished. Keep this compact outcome for the final report: "
                                  + json.dumps(compressed) + "\nReply ONLY READY; do not output a report yet."})
-                ack = call_parent(cfg, model, messages, reporting=True)
+                ack = call_parent(cfg, model, messages, reporting=True, trace=trace)
                 messages.append({"role": "assistant", "content": ack})
             result["reported_answers"][name] = answer
             result["lookup_breakdown"].append({
@@ -652,8 +656,6 @@ def run_trial(mode, seed, tasks, records, cfg, model, context_limit, save_dir,
             r["prompt_tokens"] is not None and r["prompt_tokens"] > context_limit
             for r in trace.calls
         )
-        bc.http_json = original_http
-        bc.DATA = original_data
     return result
 
 def arguments(argv=None):
@@ -819,9 +821,29 @@ def arguments(argv=None):
     return args
 
 
-def write_files(directory, data, cfg, args, reset_events=None):
+@contextmanager
+def atomic_output(path, *, newline=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", newline=newline, dir=path.parent,
+                delete=False) as fh:
+            temporary = Path(fh.name)
+            yield fh
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+
+
+def write_files(directory, data, cfg, args, reset_events=None, run_status="completed"):
     directory.mkdir(parents=True, exist_ok=True)
-    with (directory / "results.json").open("w", encoding="utf-8") as fh:
+    with atomic_output(directory / "results.json") as fh:
         json.dump({"metadata": {"model": data[0]["model"] if data else "unknown", "tasks": args.tasks,
                   "records": args.records, "repeats": args.repeats, "context_limit": args.context_limit,
                   "token_count_note": "Exact only when token_counts_exact_from_api=true; otherwise heuristic chars/4",
@@ -875,7 +897,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
                   "summary_output_tokens": args.summary_output_tokens,
                   "summary_retries": args.summary_retries,
                   "strict_pass_rule": "Complete valid JSON with every field and seal correct. Partial visible fields are diagnostics only."},
-                   "trials": data, "resets": reset_events or []}, fh, indent=2, ensure_ascii=False)
+                   "trials": data, "resets": reset_events or [],
+                   "run_status": run_status}, fh, indent=2, ensure_ascii=False)
     columns = [
         "mode", "seed", "tasks", "records_per_task", "model", "configured_context_limit", "max_output_tokens",
         "exact_final", "final_status", "final_json_valid", "final_output_truncation", "final_stop_reason",
@@ -936,7 +959,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "pressure_records", "pressure_detail_chars", "pressure_generated_chars", "pressure_evidence_chars",
         "authority_docs_viewed", "authority_evidence_chars", "authority_blocked"
     ]
-    with (directory / "results.csv").open("w", newline="", encoding="utf-8") as fh:
+    with atomic_output(directory / "results.csv", newline="") as fh:
         writer = csv.DictWriter(fh, columns, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(data)
@@ -950,7 +973,7 @@ def write_files(directory, data, cfg, args, reset_events=None):
         f"max actions={args.max_actions}" if args.scenario == "repair" else "Scenario: archive retrieval", "",
         f"Model: `{data[0]['model'] if data else 'unknown'}` | Configured context: {args.context_limit} | "
         f"Investigation output: {args.max_output_tokens} | Final output: {args.final_output_tokens} "
-        f"| Trials completed/started: {len(data)}", "",
+        f"Run status: **{run_status}** | Trials completed: {len(data)}", "",
         "## Strict correctness and recoverable information", "",
         ("| Tasks | Mode | Valid complete reports | Verified incidents / attempted | " if args.scenario == "repair"
          else "| Tasks | Mode | Valid complete reports | Direct lookups correct / attempted | ")
@@ -1185,10 +1208,11 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{sum(r.get('adaptive_child_transcript_leaks', 0) for r in rows)} |")
             lines += ["", "Context reclamation is an estimate using the largest observed child prompt and the resumed parent prompt. "
                       "It measures context retained by the parent, not total inference tokens saved."]
-            lines += ["", "### Post-resume continuation proof", "",
-                      "A complete adaptive proof requires a resolved child blocker followed by fresh parent "
+            lines += ["", "### Post-resume continuation criteria", "",
+                      "The instrumented adaptive continuation criterion requires a resolved child blocker followed by fresh parent "
                       "decisions and simulator actions after the marker is restored. Verification must occur "
-                      "in that resumed parent context.", "",
+                      "in that resumed parent context. It records protocol behavior in the virtual simulator, "
+                      "not live-model reliability or a performance benefit.", "",
                       "| Tasks | Blockers resolved by child | Parent decisions after resume | Parent actions after resume | Verified after resume | Post-resume checkpoints | Post-resume context failures |",
                       "|---:|---:|---:|---:|---:|---:|---:|"]
             for n in args.tasks:
@@ -1258,7 +1282,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "A server may silently truncate oversized inputs.",
         "", "The CSV contains all per-trial outcome and score fields. The JSON additionally records per-call finish reasons and per-batch judgments.",
     ]
-    (directory / "SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with atomic_output(directory / "SUMMARY.md") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 def main(argv=None):
     args = arguments(argv)
@@ -1382,10 +1407,11 @@ def main(argv=None):
         print(f"Output folder isn't empty: {output}. Choose --output another/folder", file=sys.stderr)
         return 2
     output.mkdir(parents=True, exist_ok=True)
-    original_data = bc.DATA
     rows = []
     reset_events = []
     previous_mode = None
+    run_status = "in_progress"
+    write_files(output, rows, cfg, args, reset_events, run_status)
     try:
         if managed_server is not None:
             managed_server.log_dir = output / "server_logs"
@@ -1413,7 +1439,8 @@ def main(argv=None):
                             event = {'status': 'failed', 'method': 'fresh_llama_process',
                                      'next_mode': mode, 'next_seed': seed, 'next_tasks': n, 'error': str(ex)[:300]}
                             reset_events.append(event)
-                            write_files(output, rows, cfg, args, reset_events)
+                            run_status = "failed"
+                            write_files(output, rows, cfg, args, reset_events, run_status)
                             print(f"Dedicated llama.cpp start FAILED: {ex}. Partial results saved.", file=sys.stderr)
                             return 3
                     model = managed_server.model_id
@@ -1429,7 +1456,8 @@ def main(argv=None):
                         event.update({'next_mode': mode, 'next_seed': seed, 'next_tasks': n,
                                       'error': str(ex)[:300]})
                         reset_events.append(event)
-                        write_files(output, rows, cfg, args, reset_events)
+                        run_status = "failed"
+                        write_files(output, rows, cfg, args, reset_events, run_status)
                         print(f"Jan reset FAILED: {ex}. Stopping; partial results saved.", file=sys.stderr)
                         return 3
                 previous_mode = mode
@@ -1461,23 +1489,25 @@ def main(argv=None):
                     if crashed:
                         result['inference_process_crashed'] = True
                 rows.append(result)
-                write_files(output, rows, cfg, args, reset_events)
+                run_status = "failed" if result.get("inference_process_crashed") else "in_progress"
+                write_files(output, rows, cfg, args, reset_events, run_status)
                 if managed_server is not None and result.get('inference_process_crashed'):
                     print("Dedicated inference process crashed; stopping. See server_logs. Partial results saved.", file=sys.stderr)
                     return 3
                 gc.collect()  # Release Python trial objects; never clear a live model context.
                 print(f"  final={result['final_status']}, lookups={result['subtask_accuracy']}/{result['solved_subtasks']}, visible={result['visible_seals_correct']}/{n}, peak-main={result['peak_main_prompt_tokens']}, sec={result['elapsed_seconds']}, error={result['error'] or '-'}", flush=True)
     except KeyboardInterrupt:
+        run_status = "interrupted"
+        write_files(output, rows, cfg, args, reset_events, run_status)
         print("Interrupted: partial results saved.", file=sys.stderr)
         return 130
     finally:
         if managed_server is not None:
             managed_server.stop()  # Always clean up ONLY the subprocess spawned here (also on Ctrl+C).
-        bc.DATA = original_data
+    write_files(output, rows, cfg, args, reset_events, "completed")
     print(f"\nSaved: {output / 'SUMMARY.md'}\n       {output / 'results.csv'}\n       {output / 'results.json'}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

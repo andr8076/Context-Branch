@@ -161,6 +161,25 @@ class IntegrationTests(unittest.TestCase):
         self.assertIsNone(refreshed_child["parent_id"])
         self.assertFalse(stale_budget.exists())
 
+    def test_cleanup_repairs_malformed_mixed_branch_links(self):
+        broken_id = "d" * 32
+        malformed = {
+            "id": broken_id,
+            "parent_id": ["not", "an", "id"],
+            "subbranches": {"unexpected": "mapping"},
+            "status": "blocked",
+            "task": "Interrupted branch",
+        }
+        b.atomic_json_write(b.branch_path(broken_id), malformed)
+
+        report = b.cleanup_orphaned_state()
+
+        self.assertEqual(report["cleared_parent_links"], 1)
+        self.assertEqual(report["pruned_subbranches"], 1)
+        repaired = b.load_branch(broken_id)
+        self.assertIsNone(repaired["parent_id"])
+        self.assertEqual(repaired["subbranches"], [])
+
     def test_invalid_endpoints_and_protocol(self):
         self.cfg["api_base_url"] = "https://remote.example/v1"
         b.CONFIG.write_text(json.dumps(self.cfg))

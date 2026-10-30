@@ -96,18 +96,22 @@ def run(argv=None):
     if not treatment.get("recursive_checkpoints"):
         verdict = "INCONCLUSIVE: checkpoint did not activate; increase legitimate workload or adjust context limit."
     elif control.get("error_type") == "context_overflow_confirmed" and treatment_success:
-        verdict = "SUCCESSFUL DEMONSTRATION: control overflowed; checkpoint run verified the repair."
+        verdict = ("OBSERVED DIFFERENCE: control reported context overflow; checkpointing activated "
+                   "and the simulator verified the treatment repair. A single paired run does not "
+                   "establish that checkpointing caused the difference; repeat across seeds and runs.")
     elif treatment_success and not control_success:
-        verdict = ("CHECKPOINT ROBUSTNESS WIN: checkpoint run completed while control did not; "
+        verdict = ("OBSERVED ROBUSTNESS DIFFERENCE: checkpoint run completed while control did not; "
                    f"control outcome={control.get('final_status') or control.get('error_type')}. "
-                   "The cause may be action exhaustion or model variance, not necessarily overflow.")
+                   "The cause may be action exhaustion or model variance, not necessarily overflow; "
+                   "repeat across seeds and runs.")
     elif (control.get("error_type") == "context_overflow_confirmed" and
           treatment.get("error_type") == "context_checkpoint_blocked"):
         verdict = ("SAFE CHECKPOINT BLOCK: control overflowed and checkpointing refused to discard "
                    "evidence, but the treatment did not complete. Reduce evidence, lower the output "
                    "reserve, or use a larger context.")
     elif treatment_success:
-        verdict = "CHECKPOINT VERIFIED: it activated and the run completed; control did not prove necessity."
+        verdict = ("CHECKPOINT ACTIVATED AND REPAIR VERIFIED IN THE SIMULATOR; the control did not "
+                   "establish necessity. This single run does not estimate reliability or performance.")
     else:
         verdict = "CHECKPOINT ACTIVATED BUT DID NOT COMPLETE: inspect both traces and stage events."
     summary["verdict"] = verdict
@@ -120,4 +124,3 @@ def run(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(run())
-

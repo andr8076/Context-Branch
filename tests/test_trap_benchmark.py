@@ -317,12 +317,21 @@ class TrapBenchmarkTests(unittest.TestCase):
 
     def test_three_modes_complete_with_pressure_and_export_metrics(self):
         fake = DeliberateFakeJan()
-        with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, "http_json", fake):
+        runtime_data = bm.bc.DATA
+
+        def checked_transport(method, url, cfg, payload=None):
+            self.assertIs(bm.bc.http_json, checked_transport)
+            self.assertIs(bm.bc.DATA, runtime_data)
+            return fake(method, url, cfg, payload)
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+                bm.bc, "http_json", checked_transport):
             outputs = [tb.run_trap_trial(
                 mode, 481, 2, self.cfg(), "fake-model", 8192, Path(temp), bm,
                 nested_depth=2, nested_log_lines=6, recovery_log_lines=12,
                 pressure_records=4, pressure_detail_chars=32)
                 for mode in ("linear", "summarized", "branch")]
+        self.assertIs(bm.bc.DATA, runtime_data)
         for result in outputs:
             self.assertEqual(result["verified_cases"], 2, result["case_breakdown"])
             self.assertTrue(result["exact_final"], result.get("error"))
@@ -643,4 +652,3 @@ class TrapBenchmarkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

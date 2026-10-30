@@ -1,5 +1,43 @@
 # Context-Branch
 
+Context-Branch runs isolated side-task conversations through Jan's local
+OpenAI-compatible API. It is a bounded assistant/runtime, not an independent
+verification system: a `success` status is the model's report, and conclusions
+still need review against authoritative sources.
+
+## Trust and limits
+
+- **Context and token guards are estimates, not ground truth.** The runtime
+  estimates prompt size before sending a request so it can stop or deduplicate
+  repeated read-only observations conservatively. It does not use Jan's exact
+  tokenizer or control the server's context window. An estimate can be high or
+  low; a guard stop means the configured estimate did not fit, not that Jan
+  confirmed an overflow. Conversely, passing the guard is not a guarantee the
+  server will accept the request.
+- **Usage is reported usage where available.** The runtime reconciles reserved
+  estimates with API-reported token counts after a response. These numbers
+  reflect the API's report, not an independently measured tokenizer count.
+  Missing usage stays conservatively estimated, and a single request can
+  overshoot a cumulative budget when actual usage exceeds its reservation.
+- **Stops and outcomes have different evidence levels.** A `context_budget`
+  guard stop is based on the runtime estimate; a server error classified as
+  `context_overflow_confirmed` is stronger evidence that the request was
+  rejected for context capacity. `status: success` remains `model_reported`,
+  not externally verified.
+- **Tests validate software behavior, not model quality.** Offline tests use
+  controlled doubles. `doctor` checks API/model availability and `demo` checks
+  that generation works, but neither establishes answer accuracy, context
+  behavior under load, or performance. Evaluate representative tasks against
+  source material before relying on results.
+- **Operational coverage is not exhaustive.** Regression tests cover selected
+  resume, cleanup, process-restart, and interrupted-run paths, but do not
+  represent every filesystem failure, abrupt machine shutdown, server version,
+  or long-running workload. Benchmark output folders are not resumable; check
+  `run_status` in `results.json` and treat an interrupted run as partial.
+
+See [RUNTIME.md](RUNTIME.md) for runtime limits and result interpretation, and
+[BENCHMARK.md](BENCHMARK.md) for experiment-specific evidence and limitations.
+
 Adaptive parents now count repeated identical rejected recovery-stage proposals
 for index rebuild, escrow unlock, and approvals recovery. After the second
 rejection, the parent receives a stage-specific correction: use matching CURRENT
@@ -101,15 +139,16 @@ validation remain necessary. Adaptive fixtures also have extra blockers absent
 from the other arms; current scores are not a fair performance comparison until
 the same surprise workload is supplied to each arm.
 
-## v1.8 — verified parent continuation after an adaptive branch
+## v1.8 — simulator-verified parent continuation after an adaptive branch
 
-The opt-in `adaptive` repair benchmark now proves the full marker → child →
-parent continuation flow. When the simulator reports an unexpected endpoint
-blocker, the controller saves the parent conversation at a marker. A private
-child may inspect only `adaptive/blocker` and clear that gate. The controller
-then restores the exact parent marker with a compact verified receipt. The
-resumed parent must use its preserved evidence to apply and verify the original
-repair. A child can no longer finish the incident itself.
+The opt-in `adaptive` repair benchmark now exercises and records the full
+marker → child → parent continuation flow in its virtual simulator. When the
+simulator reports an unexpected endpoint blocker, the controller saves the
+parent conversation at a marker. A private child may inspect only
+`adaptive/blocker` and clear that gate. The controller then restores the exact
+parent marker with a compact simulator-verified receipt. The resumed parent
+must use its preserved evidence to apply and verify the original repair in the
+simulator. A child can no longer finish the incident itself.
 
 This is distinct from the legacy `autonomous` arm, which lets the model choose
 whether to delegate known prerequisite stages. Use `adaptive` to test marker,
@@ -126,8 +165,10 @@ python3 benchmark.py --engine llama --scenario repair \
 Results include `adaptive_child_resolutions`,
 `adaptive_post_resume_decisions`, `adaptive_post_resume_actions`, and
 `adaptive_post_resume_verified`, alongside marker, branch, context-size and
-transcript-isolation diagnostics. A complete proof requires all four continuation
-signals; restoring a message list without a later parent action is insufficient.
+transcript-isolation diagnostics. The instrumented continuation criterion
+requires all four signals; restoring a message list without a later parent
+action does not count as a completed continuation in this simulator. This is
+not evidence of live-model reliability or a performance benefit.
 
 **Benchmark safety update:** recursive checkpoint pressure tests now compact only
 explicitly rejected/blocked observations that confirm no state change. Ambiguous
@@ -169,9 +210,9 @@ python3 checkpoint_stress.py
 
 This defaults to 4,096 context tokens, 1 plausible extra record per evidence source, 8 recovery and nested log lines, 40 actions, and checkpoint thresholds **0 (off)** vs **0.50 (on)**. Override with e.g. `--context-limit 6144 --pressure-records 3 --max-actions 48 --checkpoint-threshold 0.55`. The GGUF path comes from ignored `local_model.json`; `--llama-model` can override it.
 
-The script creates `data/benchmarks/pressure-study-<UTC timestamp>/off`, `.../on`, and `comparison.json`. A successful proof requires a **confirmed context overflow with checkpointing off**, a **checkpoint actually created with it on**, and a **verified final repair** in the checkpoint-on run. If both succeed or no checkpoint is created, the result is **inconclusive about necessity**, not a failure of the code. A checkpoint may also legitimately report that the unique required evidence cannot fit.
+The script creates `data/benchmarks/pressure-study-<UTC timestamp>/off`, `.../on`, and `comparison.json`. If the control reports a context overflow and the checkpoint arm activates and completes a simulator-verified repair, the comparator reports that **observed outcome**. It is not proof that checkpointing caused the difference: this is one paired run with one seed, and model variance or other run-to-run effects remain possible. A treatment repair completed when the control did not is reported as an **observed robustness difference**, not attributed to context overflow prevention. If both succeed or no checkpoint is created, the result is **inconclusive about necessity**. Repeat paired runs across multiple seeds and, where practical, repeat seeds to assess variability before drawing performance conclusions. A checkpoint may also legitimately report that the unique required evidence cannot fit.
 
-Offline regression tests also simulate a hard 4,096-token API limit and have the same *model double* repeatedly inspect authentic simulator documents in each arm. This tests checkpoint reconstruction and the actual error path but **is not a Qwen performance measurement**. Run with `python3 -m unittest discover -s tests -q`.
+Offline regression tests also simulate a hard 4,096-token API limit and have the same *model double* repeatedly inspect authentic simulator documents in each arm. This tests checkpoint reconstruction and the actual error path but **is not a Qwen performance measurement or evidence of live-model benefit**. Run with `python3 -m unittest discover -s tests -q`.
 
 ---
 
@@ -335,8 +376,8 @@ track the next reliability issue without silently changing how actions are score
 `autonomous` repair arm lets the model choose explicit lower-level delegation
 mid-incident. The `adaptive` arm tests the original unexpected-problem marker,
 private child, and parent-resume flow. Neither arm operates real files, browsers,
-shell commands or credentials, and offline simulator tests prove plumbing and
-integrity but not real GPU/model accuracy. See [ROADMAP.md](ROADMAP.md) for the
+shell commands or credentials, and offline simulator tests exercise plumbing
+and integrity but do not establish real GPU/model accuracy. See [ROADMAP.md](ROADMAP.md) for the
 remaining live-validation work.
 
 ```bash
@@ -806,4 +847,3 @@ Tests use a local mock API and verify branch creation, isolation, resuming, nest
 - **Tool never called**: enable tool calling and paste assistant instructions; model must follow tool calling.
 - **MCP tool timeout**: raise Jan's MCP tool-call timeout; reduce max_agent_turns or max_output_tokens; ensure Jan local model inference is stable.
 - **VRAM limit**: this project **reuses** Jan's inference endpoint. Avoid a second independent Jan worker loaded with another model if VRAM is tight. The local API model and Jan desktop model configuration may affect memory usage.
-

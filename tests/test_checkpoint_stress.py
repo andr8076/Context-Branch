@@ -45,7 +45,8 @@ class CheckpointStressHarnessTests(unittest.TestCase):
                 args[args.index("--output") + 1] = "SAME"
             self.assertEqual(before, after)
             summary = json.loads((output / "comparison.json").read_text())
-            self.assertIn("SUCCESSFUL DEMONSTRATION", summary["verdict"])
+            self.assertIn("OBSERVED DIFFERENCE", summary["verdict"])
+            self.assertIn("does not establish", summary["verdict"])
             self.assertEqual(summary["off"]["authority_docs_viewed"], 5)
             self.assertEqual(summary["on"]["authority_docs_viewed"], 5)
 
@@ -92,7 +93,8 @@ class CheckpointStressHarnessTests(unittest.TestCase):
             with patch.object(cs.benchmark, "main", simulate_main):
                 self.assertEqual(cs.run(["--output", str(output)]), 0)
             summary = json.loads((output / "comparison.json").read_text())
-            self.assertIn("ROBUSTNESS WIN", summary["verdict"])
+            self.assertIn("OBSERVED ROBUSTNESS DIFFERENCE", summary["verdict"])
+            self.assertIn("repeat across seeds and runs", summary["verdict"])
 
     def test_checkpoint_block_after_control_overflow_is_reported_as_safe_stop(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -131,4 +133,3 @@ class CheckpointStressHarnessTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

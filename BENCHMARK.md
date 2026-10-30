@@ -11,9 +11,25 @@ python3 checkpoint_stress.py
 
 This defaults to 4,096 context tokens, 1 plausible extra record per evidence source, 8 recovery and nested log lines, 40 actions, and checkpoint thresholds **0 (off)** vs **0.50 (on)**. Override with e.g. `--context-limit 6144 --pressure-records 3 --max-actions 48 --checkpoint-threshold 0.55`. The GGUF path comes from ignored `local_model.json`; `--llama-model` can override it.
 
-The script creates `data/benchmarks/pressure-study-<UTC timestamp>/off`, `.../on`, and `comparison.json`. A **successful necessity proof** requires a **confirmed context overflow with checkpointing off**, a **checkpoint actually created with it on**, and a **verified final repair** in the checkpoint-on run. A verified treatment run where the control is incomplete is reported separately as a **robustness win**; it is useful evidence but may reflect action exhaustion or model variance rather than overflow prevention. If both succeed or no checkpoint is created, the result is **inconclusive about necessity**, not a failure of the code. A checkpoint may also legitimately report that the unique required evidence cannot fit; this is reported as the first-class `context_checkpoint_blocked` safety outcome, not a generic API/runtime error.
+The script creates `data/benchmarks/pressure-study-<UTC timestamp>/off`, `.../on`, and `comparison.json`. If the control reports a context overflow and the checkpoint arm activates and completes a simulator-verified repair, the comparator reports that **observed outcome**. It is not proof that checkpointing caused the difference: this is one paired run with one seed, and model variance or other run-to-run effects remain possible. A treatment repair completed when the control did not is reported as an **observed robustness difference**, not attributed to context overflow prevention. If both succeed or no checkpoint is created, the result is **inconclusive about necessity**. Repeat paired runs across multiple seeds and, where practical, repeat seeds to assess variability before drawing performance conclusions. A checkpoint may also report that the unique required evidence cannot fit; this appears as the first-class `context_checkpoint_blocked` safety outcome, not a generic API/runtime error.
 
-Offline regression tests also simulate a hard 4,096-token API limit and have the same *model double* repeatedly inspect authentic simulator documents in each arm. This tests checkpoint reconstruction and the actual error path but **is not a Qwen performance measurement**. Run with `python3 -m unittest discover -s tests -q`.
+Offline regression tests also simulate a hard 4,096-token API limit and have the same *model double* repeatedly inspect authentic simulator documents in each arm. This tests checkpoint reconstruction and the actual error path but **is not a Qwen performance measurement or evidence of live-model benefit**. Run with `python3 -m unittest discover -s tests -q`.
+
+## Long runs and interruption
+
+The runner writes `results.json`, `results.csv`, and `SUMMARY.md` atomically one
+file at a time, first recording `run_status: in_progress`. A normal finish marks
+the run `completed`; Ctrl+C marks it `interrupted`, preserves completed trials,
+and stops only an inference server process owned by this run. A failure detected
+by the runner is marked `failed` when its result is available.
+
+An in-flight trial is not checkpointed for later resumption. If interrupted
+before its result is appended, that trial may be absent from the saved list even
+if it had made partial progress. The output folder is intentionally not
+resumable: start a new run in a new empty folder rather than combining results
+from different attempts. Atomic replacement protects each artifact from a
+partially written file; it does not make the three files a single transaction,
+so `run_status` in `results.json` is the authoritative run-level indicator.
 
 ---
 
@@ -518,4 +534,3 @@ All example audits are fake and generated locally. No passwords, cookies or othe
 ## Router autodetection troubleshooting (v1.0.1)
 
 `python3 benchmark.py --check-jan-reset` is read-only. It checks for the selected benchmark model in Jan's internal router. The detector looks for TCP listening sockets owned by `jan-llama-worker` or its children using `ss`, then falls back to matching socket inodes under `/proc`. If discovery fails, the error includes worker PIDs, candidate ports, and any model IDs returned by a Jan-owned router. The public Jan API on port 1337 is **not necessarily** the internal router. Never use port 1337 as the router URL unless its root `/models` endpoint is independently verified to be a compatible llama.cpp router.
-

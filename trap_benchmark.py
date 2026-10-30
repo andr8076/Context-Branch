@@ -690,7 +690,7 @@ def request_investigation_action(cfg, model, context, trace, bm, *, phase, max_r
                        "action permitted in your current stage. No reasoning text or markdown."}]
         if before_request is not None:
             before_request(prompt)
-        answer = bm.call_parent(cfg, model, prompt)
+        answer = bm.call_parent(cfg, model, prompt, trace=trace)
         action = parse_action(answer)
         if action is not None:
             if action.get("_schema_alias"):
@@ -823,9 +823,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "decoy_documents_opened": 0, "trap_waste_chars": 0,
         "verified_cases": 0, "case_breakdown": [],
     }
-    original_http = bm.bc.http_json
-    trace = bm.Trace(mode, original_http)
-    bm.bc.http_json = trace
+    trace = bm.Trace(mode, bm.bc.http_json)
     started = time.perf_counter()
     stage = "setup"
     active_sim = None
@@ -1005,7 +1003,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                            "seal": seal, "caveats": "" if sim.verified else "No verified repair"}
                 messages.append({"role": "user", "content": "Isolated repair finished. Keep only this verified outcome: "
                                  + json.dumps(compact) + "\nReply ONLY READY."})
-                ack = bm.call_parent(cfg, model, messages, reporting=True)
+                ack = bm.call_parent(cfg, model, messages, reporting=True, trace=trace)
                 messages.append({"role": "assistant", "content": ack})
             if (mode == "summarized" and result["solved_subtasks"] % summary_every == 0
                     and result["solved_subtasks"] < tasks):
@@ -1182,6 +1180,4 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         result["calls"] = trace.calls
         result["input_over_limit_risk"] = any(
             r["prompt_tokens"] is not None and r["prompt_tokens"] > context_limit for r in trace.calls)
-        bm.bc.http_json = original_http
     return result
-

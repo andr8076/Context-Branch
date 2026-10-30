@@ -77,10 +77,59 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertTrue(trial["token_counts_exact_from_api"])
                 self.assertEqual(trial["api_calls"], 4 if mode == "linear" else 7)
 
+    def test_branch_trial_injects_transport_and_isolates_runtime_store(self):
+        fake = FakeJan()
+        runtime_data = bm.bc.DATA
+
+        def checked_transport(method, url, cfg, payload=None):
+            self.assertIs(bm.bc.http_json, checked_transport)
+            self.assertIs(bm.bc.DATA, runtime_data)
+            return fake(method, url, cfg, payload)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+                bm.bc, "http_json", checked_transport):
+            trial_dir = Path(tmp) / "trial"
+            trial = bm.run_trial("branch", 77, 1, 15, self.cfg(),
+                                 "fake-local-model", 8192, trial_dir)
+            self.assertTrue(list((trial_dir / "branches").glob("*.json")))
+
+        self.assertFalse(trial["error"], trial["error"])
+        self.assertIs(bm.bc.DATA, runtime_data)
 
     def test_cli_default_output_cap_and_override(self):
         self.assertEqual(bm.arguments(["--dry-run"]).max_output_tokens, 1024)
         self.assertEqual(bm.arguments(["--dry-run", "--max-output-tokens", "1536"]).max_output_tokens, 1536)
+
+    def test_interrupted_run_keeps_readable_partial_artifacts_and_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "interrupted"
+            with patch.object(bm.bc, "config", return_value=dict(bm.bc.DEFAULTS)), \
+                    patch.object(bm.bc, "chosen_model", return_value="offline-model"), \
+                    patch.object(bm, "run_trial", side_effect=KeyboardInterrupt):
+                status = bm.main([
+                    "--scenario", "archive", "--tasks", "1", "--modes", "linear",
+                    "--output", str(output),
+                ])
+
+            self.assertEqual(status, 130)
+            saved = json.loads((output / "results.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["run_status"], "interrupted")
+            self.assertEqual(saved["trials"], [])
+            self.assertIn("interrupted", (output / "SUMMARY.md").read_text(encoding="utf-8"))
+            self.assertTrue((output / "results.csv").is_file())
+
+    def test_atomic_output_keeps_previous_artifact_on_writer_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "results.json"
+            target.write_text('{"previous": true}', encoding="utf-8")
+
+            with self.assertRaises(RuntimeError):
+                with bm.atomic_output(target) as output:
+                    output.write('{"partial":')
+                    raise RuntimeError("interrupted write")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"previous": true}')
+            self.assertEqual(list(Path(tmp).iterdir()), [target])
 
     def test_output_cap_reaches_every_api_call_in_both_modes(self):
         fake = FakeJan()
@@ -518,7 +567,9 @@ class ReportingTests(unittest.TestCase):
         def fake(method, url, cfg, payload=None):
             nonlocal summary_calls
             if payload:
-                seen.append((bm.bc.http_json.phase, payload))
+                phase = ("parent_lookup" if "INDEPENDENT ARCHIVE LOOKUP" in
+                         payload["messages"][-1]["content"] else "other")
+                seen.append((phase, payload))
                 if "PERIODIC CONTEXT COMPACTION" in payload["messages"][-1]["content"]:
                     summary_calls += 1
                     if summary_calls == 1:
@@ -632,4 +683,3 @@ class ReportingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

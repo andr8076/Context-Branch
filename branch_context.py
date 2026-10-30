@@ -145,8 +145,8 @@ def _safe_api_error(ex):
     if "json" in message and "invalid" in message:
         return ("request JSON rejected; check server logs for the rejected field.", "api_or_runtime_error")
     if ex.code == 400:
-        return ("request rejected; check the dedicated llama-server log in data/benchmarks/.../server_logs/ "
-                "for the precise cause (often context capacity or an unsupported parameter).", "api_or_runtime_error")
+        return ("request rejected; check the local inference server log for the precise cause "
+                "(often context capacity or an unsupported parameter).", "api_or_runtime_error")
     if ex.code in (401, 403):
         return ("authentication rejected; check the configured inference endpoint and credentials.", "api_or_runtime_error")
     return ("server rejected request; check its local server logs.", "api_or_runtime_error")
@@ -168,8 +168,9 @@ def http_json(method, url, cfg, payload=None):
         raise RuntimeError("Cannot reach local inference API (or request timed out). Check server health, address and timeout settings.") from ex
 
 
-def available_models(cfg):
-    result = http_json("GET", cfg["api_base_url"].rstrip("/") + "/models", cfg)
+def available_models(cfg, api=None):
+    transport = http_json if api is None else api
+    result = transport("GET", cfg["api_base_url"].rstrip("/") + "/models", cfg)
     ids = [m["id"] for m in result.get("data", [])
            if isinstance(m, dict) and isinstance(m.get("id"), str) and m["id"]]
     if not ids:
@@ -177,10 +178,10 @@ def available_models(cfg):
     return ids
 
 
-def chosen_model(cfg):
+def chosen_model(cfg, api=None):
     if cfg["model"] != "auto":
         return cfg["model"]
-    ids = available_models(cfg)
+    ids = available_models(cfg, api)
     return ids[0]
 
 
@@ -193,7 +194,7 @@ class ChatMessage(dict):
         self.finish_reason = finish_reason
 
 
-def chat(cfg, model, messages, tools=None, reasoning_effort=None):
+def chat(cfg, model, messages, tools=None, reasoning_effort=None, api=None):
     payload = {"model": model, "messages": messages,
                "stream": False, "max_tokens": cfg["max_output_tokens"], "temperature": 0.2}
     if reasoning_effort is not None:
@@ -201,7 +202,8 @@ def chat(cfg, model, messages, tools=None, reasoning_effort=None):
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-    answer = http_json("POST", cfg["api_base_url"].rstrip("/") + "/chat/completions", cfg, payload)
+    transport = http_json if api is None else api
+    answer = transport("POST", cfg["api_base_url"].rstrip("/") + "/chat/completions", cfg, payload)
     choices = answer.get("choices") or []
     if not choices:
         raise RuntimeError("Jan returned no completion choices")
@@ -212,18 +214,19 @@ def chat(cfg, model, messages, tools=None, reasoning_effort=None):
 
 
 @contextmanager
-def locked_store():
+def locked_store(data_dir=None):
     with STORE_LOCK:
-        ensure_store()
+        ensure_store(data_dir)
         yield
 
 
-def ensure_store():
-    DATA.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
+def ensure_store(data_dir=None):
+    data_dir = DATA if data_dir is None else Path(data_dir)
+    data_dir.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.name == "posix":
-        DATA.parent.chmod(0o700)
-        DATA.chmod(0o700)
+        data_dir.parent.chmod(0o700)
+        data_dir.chmod(0o700)
 
 
 def atomic_json_write(target, value):
@@ -243,29 +246,29 @@ def atomic_json_write(target, value):
         target.chmod(0o600)
 
 
-def branch_path(branch_id):
+def branch_path(branch_id, data_dir=None):
     if not re.fullmatch(r"[0-9a-f]{32}", branch_id or ""):
         raise ValueError("Invalid branch ID")
-    return DATA / f"{branch_id}.json"
+    return (DATA if data_dir is None else Path(data_dir)) / f"{branch_id}.json"
 
 
-def save_branch(branch):
-    with locked_store():
-        save_private_json(branch_path(branch["id"]), branch)
+def save_branch(branch, data_dir=None):
+    with locked_store(data_dir):
+        save_private_json(branch_path(branch["id"], data_dir), branch)
 
 
 def save_private_json(target, value):
     atomic_json_write(Path(target), value)
 
 
-def budget_path(root_id):
-    branch_path(root_id)  # validate before using it in a separate storage directory
-    return DATA / "budgets" / f"{root_id}.json"
+def budget_path(root_id, data_dir=None):
+    branch_path(root_id, data_dir)  # validate before using it in a separate storage directory
+    return (DATA if data_dir is None else Path(data_dir)) / "budgets" / f"{root_id}.json"
 
 
-def save_budget(root_id, ledger):
-    with locked_store():
-        target = budget_path(root_id)
+def save_budget(root_id, ledger, data_dir=None):
+    with locked_store(data_dir):
+        target = budget_path(root_id, data_dir)
         target.parent.mkdir(mode=0o700, exist_ok=True)
         if os.name == "posix":
             target.parent.chmod(0o700)
@@ -328,17 +331,23 @@ def cleanup_orphaned_state():
             valid_ids.add(data["id"])
             branch_files.append(data)
     for branch in branch_files:
-        original = list(branch.get("subbranches", []))
+        original_value = branch.get("subbranches", [])
+        original = original_value if isinstance(original_value, list) else []
         cleaned = []
         for child_id in original:
-            if child_id in valid_ids and child_id != branch.get("id"):
+            if (isinstance(child_id, str) and child_id in valid_ids
+                    and child_id != branch.get("id")):
                 cleaned.append(child_id)
             else:
                 issues["pruned_subbranches"] += 1
-        if cleaned != original:
+        if not isinstance(original_value, list):
+            issues["pruned_subbranches"] += 1
+        if cleaned != original or not isinstance(original_value, list):
             branch["subbranches"] = cleaned
             save_branch(branch)
-        if branch.get("parent_id") and branch["parent_id"] not in valid_ids:
+        parent_id = branch.get("parent_id")
+        if parent_id is not None and (
+                not isinstance(parent_id, str) or parent_id not in valid_ids):
             branch["parent_id"] = None
             save_branch(branch)
             issues["cleared_parent_links"] += 1
@@ -349,20 +358,20 @@ def cleanup_orphaned_state():
     return issues
 
 
-def root_branch(branch):
+def root_branch(branch, data_dir=None):
     """Resolve legacy branches through parent links; refuse corrupt cycles."""
     seen = set()
     while branch.get("parent_id"):
         if branch["id"] in seen:
             raise ValueError("Cycle in saved branch parents")
         seen.add(branch["id"])
-        branch = load_branch(branch["parent_id"])
+        branch = load_branch(branch["parent_id"], data_dir)
     return branch
 
 
-def load_branch(branch_id):
-    with locked_store():
-        p = branch_path(branch_id)
+def load_branch(branch_id, data_dir=None):
+    with locked_store(data_dir):
+        p = branch_path(branch_id, data_dir)
         if not p.is_file():
             raise ValueError("Branch not found")
         try:
@@ -543,12 +552,12 @@ def agent_tools(cfg, depth):
     return tools
 
 
-def format_parent(branch, cfg):
+def format_parent(branch, cfg, data_dir=None):
     result = branch.get("outcome") or {}
     usage = branch.get("usage", {})
-    root_id = branch.get("root_id") or root_branch(branch)["id"]
-    if budget_path(root_id).exists():
-        ledger = load_json_if_exists(budget_path(root_id))
+    root_id = branch.get("root_id") or root_branch(branch, data_dir)["id"]
+    if budget_path(root_id, data_dir).exists():
+        ledger = load_json_if_exists(budget_path(root_id, data_dir))
         if isinstance(ledger, dict):
             try:
                 usage = RunBudget(root_id, cfg, ledger).public()
@@ -682,7 +691,7 @@ def unusable_stop_reason(metrics):
     return status if status.startswith("output_truncated") else "no_usable_response"
 
 
-def request_branch_reply(cfg, model, messages, tools, budget, metrics):
+def request_branch_reply(cfg, model, messages, tools, budget, metrics, api=None):
     """Every initial call, retry and forced final uses the same run ledger."""
     answer = {}
     diagnostics = {}
@@ -734,7 +743,10 @@ def request_branch_reply(cfg, model, messages, tools, budget, metrics):
         metrics["calls"].append(row)
         started = budget.elapsed()
         try:
-            answer = chat(request_cfg, model, prompt, tools)
+            if api is None:
+                answer = chat(request_cfg, model, prompt, tools)
+            else:
+                answer = chat(request_cfg, model, prompt, tools, api=api)
             usage = getattr(answer, "usage", {})
             diagnostics = reply_diagnostics(answer, tools, output_tokens)
             row.update(diagnostics)
@@ -751,16 +763,17 @@ def request_branch_reply(cfg, model, messages, tools, budget, metrics):
     return answer
 
 
-def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None, _budget=None):
+def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None, _budget=None,
+               *, api=None, data_dir=None):
     task = clip(task, cfg["max_context_chars"])
     relevant_context = clip(relevant_context, cfg["max_context_chars"])
     if not task:
         raise ValueError("A nonempty task is required")
-    parent = load_branch(parent_id) if parent_id else None
+    parent = load_branch(parent_id, data_dir) if parent_id else None
     if existing_id:
-        branch = load_branch(existing_id)
+        branch = load_branch(existing_id, data_dir)
         parent_id = branch.get("parent_id")
-        parent = load_branch(parent_id) if parent_id else None
+        parent = load_branch(parent_id, data_dir) if parent_id else None
         previous = json.dumps(branch.get("outcome", {}), ensure_ascii=False)
         intro = f"ORIGINAL TASK:\n{branch['task']}\n\nPREVIOUS BRANCH RESULT:\n{previous}\n\nNEW FOLLOW-UP:\n{task}"
         messages, repaired = normalize_conversation(
@@ -782,7 +795,7 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
             seen.add(ancestor["id"])
             if task_identity(task) == task_identity(ancestor["task"]):
                 raise DelegationRefused("A nested branch cannot repeat an ancestor's task")
-            ancestor = load_branch(ancestor["parent_id"]) if ancestor.get("parent_id") else None
+            ancestor = load_branch(ancestor["parent_id"], data_dir) if ancestor.get("parent_id") else None
         branch = {"id": uuid.uuid4().hex, "parent_id": parent_id, "depth": depth,
                   "model": parent["model"] if parent else cfg["model"],
                   "task": task, "created": utcnow(), "updated": utcnow(),
@@ -790,12 +803,13 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
         initial = f"SIDE TASK:\n{task}\n\nONLY RELEVANT MAIN-TASK CONTEXT:\n{relevant_context or '(none supplied)'}"
         messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": initial}]
         repaired = 0
-    root = root_branch(parent or branch)
+    root = root_branch(parent or branch, data_dir)
     root_id = root["id"]
     if _budget is None:
-        path = budget_path(root_id)
+        path = budget_path(root_id, data_dir)
         saved = load_json_if_exists(path)
-        budget = RunBudget(root_id, cfg, saved, lambda state: save_budget(root_id, state))
+        budget = RunBudget(root_id, cfg, saved,
+                           lambda state: save_budget(root_id, state, data_dir))
         if saved is None and (parent or existing_id):
             # Pre-upgrade usage is unknown. Charge existing branch slots so a
             # migrated child cannot start a disconnected fresh tree allowance.
@@ -812,24 +826,24 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
     branch.pop("stop_reason", None)
     metrics = {"model_calls": 0, "checkpoints": 0, "no_action_retries": 0,
                "repaired_transcript_fragments": repaired, "calls": []}
-    save_branch(branch)
+    save_branch(branch, data_dir)
     if parent:
         # Also maintain the link for explicit MCP calls with parent_id.
         if branch["id"] not in parent["subbranches"]:
             parent["subbranches"].append(branch["id"])
-            save_branch(parent)
+            save_branch(parent, data_dir)
     try:
         budget.check()
         model = branch["model"]
         if model == "auto":
             request_cfg = dict(cfg, request_timeout_seconds=min(cfg["request_timeout_seconds"], budget.remaining_seconds()))
-            model = chosen_model(request_cfg)
+            model = chosen_model(request_cfg, api)
             branch["model"] = model
-            save_branch(branch)
+            save_branch(branch, data_dir)
         tools = agent_tools(cfg, branch["depth"])
         final = None
         for _ in range(cfg["max_agent_turns"]):
-            answer = request_branch_reply(cfg, model, messages, tools, budget, metrics)
+            answer = request_branch_reply(cfg, model, messages, tools, budget, metrics, api)
             calls = answer.get("tool_calls") or []
             content = message_content(answer)
             if calls and usable_reply(answer, tools):
@@ -851,7 +865,8 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
                             output = search_project(cfg, args.get("query", ""))
                         elif name == "solve_nested_branch" and branch["depth"] < cfg["max_branch_depth"]:
                             child = run_branch(cfg, args.get("task", ""), args.get("relevant_context", ""),
-                                               parent_id=branch["id"], _budget=budget)
+                                               parent_id=branch["id"], _budget=budget,
+                                               api=api, data_dir=data_dir)
                             if child["branch_id"] not in branch["subbranches"]:
                                 branch["subbranches"].append(child["branch_id"])
                             output = nested_handoff(child)
@@ -872,7 +887,7 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
             break
         if final is None:
             messages.append({"role": "user", "content": "Tool budget exhausted. Answer now using ONLY compact final JSON, no more tool use."})
-            final_msg = request_branch_reply(cfg, model, messages, None, budget, metrics)
+            final_msg = request_branch_reply(cfg, model, messages, None, budget, metrics, api)
             final = message_content(final_msg)
             messages.append({"role": "assistant", "content": final})
             if not usable_reply(final_msg, None):
@@ -922,8 +937,8 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
         branch["usage"] = budget.public()
         branch["updated"] = utcnow()
         budget.flush()
-        save_branch(branch)
-    return format_parent(branch, cfg)
+        save_branch(branch, data_dir)
+    return format_parent(branch, cfg, data_dir)
 
 
 TOOLS = [
@@ -1065,4 +1080,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

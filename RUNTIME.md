@@ -72,6 +72,30 @@ estimate, not the exact model tokenizer; the server still enforces its real limi
 Time limits are cooperative checks between operations, with each HTTP timeout
 clamped to the remaining allowance. They are not process termination timers.
 
+## What the guardrails do and do not establish
+
+The configured context limit is an operational target supplied by you; the
+runtime does not query Jan for the selected model's exact context window or
+tokenizer. Before a request, it compares an estimated prompt size plus the full
+requested output and safety reserve against that target. The estimate includes
+message and tool-schema overhead, but it can over- or under-estimate the server's
+actual tokenization.
+
+| Signal | What it means | What it does not mean |
+| --- | --- | --- |
+| `stop_reason: context_budget` | The runtime's estimate exceeded the configured guard, so it stopped before sending that request. | Jan confirmed an overflow; the actual request would necessarily have failed. |
+| `context_overflow_confirmed` | The server error text matched the runtime's context-capacity classifier. | Independent proof of the server's internal token count; classification depends on the error the server returned. |
+| `usage.total_tokens` / per-call usage | API-reported usage when supplied; otherwise the reservation/estimate is retained. | An independently verified exact count. Actual usage can exceed the reservation; an over-budget request is detected after its response, not prevented in advance. |
+| `output_truncated_confirmed` | The API reported a length stop for an incomplete response. | That the prompt exceeded the context window; output limits and context limits are distinct. |
+| `status: success` | The model returned a success status in its report. | That the result is factually correct or externally verified. |
+
+Treat guard stops as conservative control decisions, not measurements. Treat
+server-classified errors as diagnostic evidence, not a substitute for inspecting
+the server log. Leave headroom in `context_limit_tokens`; if the model's actual
+context size is unknown, use a smaller configured guard and verify behavior with
+representative requests. Review the evidence behind any important model-reported
+conclusion.
+
 Ledgers are private JSON files under `data/branches/budgets/`; this directory is
 ignored by Git. Old branches begin a ledger on their first post-upgrade use.
 Earlier usage cannot be reconstructed and is marked `pre_upgrade_usage_unknown`.
@@ -132,10 +156,11 @@ transcripts and marks pending calls as not executed.
 Because all branch tools are read-only, `what_changed` is always `Nothing`.
 The parent must verify conclusions and perform any required external actions.
 
-The archive benchmark explicitly keeps the same per-lookup generation allowance
-and zero lookup retries in all modes. MCP-only final/recovery defaults do not
-give its branch arm an extra allowance; benchmark final-report retries remain
-separate and apply under their existing policy.
+The experimental benchmark and its simulator are separate from the MCP runtime.
+Benchmark trials that exercise a real branch use an explicit request transport
+and an isolated trial store; they do not change the runtime's API or state
+settings. See [BENCHMARK.md](BENCHMARK.md) for experiment-specific behavior and
+validation.
 
 ## Validation and next experiment
 
@@ -147,17 +172,3 @@ Regression tests exercise the actual MCP runner with controlled model doubles:
 repeated reads/resumes, shared nested budgets, deadline/token accounting,
 duplicate/cycle rejection, partial stops, health checks, range reads and recovery.
 These validate code behavior, not live Qwen accuracy or speed.
-
-After the doctor/demo checks, the existing live checkpoint comparison can be run
-with your saved GGUF path:
-
-```bash
-python3 checkpoint_stress.py
-```
-
-This measures the controlled recursive repair benchmark, which has its own
-simulator/action protocol. It does not measure these MCP run budgets. The repair
-benchmark's separate `autonomous` arm measures model-chosen delegation; the
-installed MCP runner remains a distinct live integration. Keep the two results
-separate. Evaluating the benefit of context isolation still needs repeated live
-runs and a matching stage-plan baseline.

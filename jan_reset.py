@@ -473,12 +473,12 @@ class JanModelReset:
     def _jan_api_ready(self):
         # Health-check Jan's documented GET /v1/models without generating tokens
         # (and without warming the next trial's KV cache).
-        import branch_context as bc
         url = self.cfg['api_base_url'].rstrip('/') + '/models'
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             try:
-                data = bc.http_json('GET', url, self.cfg)
+                data = api_json('GET', url, timeout=self.cfg['request_timeout_seconds'],
+                                api_key=self.cfg['api_key'])
                 if match_model(self.jan_model, data.get('data') or []) is not None:
                     return
             except Exception:
