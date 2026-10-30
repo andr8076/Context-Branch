@@ -18,6 +18,8 @@
   "no_action_retries": 1,
   "retry_output_tokens": 256,
   "save_transcripts": false,
-  "read_only_project_root": ""
+  "read_only_project_root": "",
+  "context_memory": true,
+  "early_branching": true,
+  "memory_max_chars": 1800
 }
-

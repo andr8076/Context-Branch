@@ -5,6 +5,60 @@ OpenAI-compatible API. It is a bounded assistant/runtime, not an independent
 verification system: a `success` status is the model's report, and conclusions
 still need review against authoritative sources.
 
+## v1.11 — proactive context management
+
+Three context-saving mechanisms now work before an investigation completes:
+
+- **Early isolation:** the runtime routes large project-file reads into a child
+  when the projected parent prompt plus output reserve reaches 55% of its
+  configured window. The child gets the goal, supplied relevant context and a
+  source/range request. The parent receives a model-reported receipt, not raw
+  source text. Existing depth, branch, call, token and time limits still apply.
+  This currently covers `read_project_file`, not arbitrary third-party tools.
+- **Bounded working memory:** after removing duplicate reads, the runtime can
+  summarize unique history into a capped memory of goals, constraints, evidence
+  references, outcomes and unresolved work. Exact prior exchanges are retained
+  in local archives, accessible through `read_context_archive`. Summaries are
+  lossy model reports; archival retrieval is available when detail is missing.
+- **Active comparison baseline:** repair `summarized` mode compacts during a
+  case, including before a selected large observation enters context. It no
+  longer has to finish a case before invoking its summarizer.
+
+The adaptive repair benchmark also isolates index, escrow and recovery stages
+when their projected evidence size reaches the early-branch threshold. This
+uses published stage boundaries and document sizes, never the repair oracle.
+It is a controller policy for this simulator, not proof of general autonomous
+problem decomposition. Adaptive parents and recursive stages can use working
+memory; original task instructions survive compaction unchanged.
+
+Both benchmark thresholds default to `0.55`:
+
+```bash
+--context-memory-threshold 0.55 --early-branch-threshold 0.55
+```
+
+Set either to `0` to disable that mechanism. `--summary-every` still controls
+between-case compaction for the summarized arm. `--summary-max-chars` also caps
+active benchmark memory. Summary requests and archive reads count toward the
+applicable request/token and action budgets. Summarization can fail explicitly;
+there is no guarantee that one huge observation or irreducible task will fit.
+
+For the runtime, `context_memory` and `early_branching` default to `true`, with
+`memory_max_chars: 1800`. **With context memory enabled, archived historical
+exchanges are saved locally even when `save_transcripts` is false.** They are
+kept in the branch record and removed with it. Disable `context_memory` for the
+previous duplicate-only policy. This manages conversations owned by this
+runtime; it does not rewrite the external Jan/ChatGPT parent conversation.
+
+New benchmark diagnostics include `adaptive_early_branches`,
+`adaptive_memory_compactions`, `adaptive_archive_reads`, mid-case entries in
+`summaries`, and exact archived exchanges in each trial's
+`context_archives.json`. Existing reclamation estimates describe surprise
+branches; they do not measure the added early-stage branches. Use verified
+completion, peak context, total inference tokens and elapsed time together.
+Offline tests establish controller behavior only; live model savings remain
+an empirical question.
+
 ## Trust and limits
 
 - **Context and token guards are estimates, not ground truth.** The runtime
@@ -847,3 +901,4 @@ Tests use a local mock API and verify branch creation, isolation, resuming, nest
 - **Tool never called**: enable tool calling and paste assistant instructions; model must follow tool calling.
 - **MCP tool timeout**: raise Jan's MCP tool-call timeout; reduce max_agent_turns or max_output_tokens; ensure Jan local model inference is stable.
 - **VRAM limit**: this project **reuses** Jan's inference endpoint. Avoid a second independent Jan worker loaded with another model if VRAM is tight. The local API model and Jan desktop model configuration may affect memory usage.
+

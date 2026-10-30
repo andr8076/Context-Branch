@@ -374,7 +374,7 @@ def extract_lookup_answer(text):
 def classify_exception(exc):
     """Never claim definite context overflow/timeout from ambiguous errors."""
     explicit_kind = getattr(exc, 'error_kind', None)
-    if explicit_kind in ('context_overflow_confirmed', 'context_checkpoint_blocked',
+    if explicit_kind in ('summary_failed', 'context_overflow_confirmed', 'context_checkpoint_blocked',
                          'context_capacity_exceeded_estimate', 'token_budget_exhausted',
                          'model_call_budget_exhausted', 'branch_depth_limit',
                          'branch_count_limit', 'nested_child_failed',
@@ -479,7 +479,7 @@ SUMMARY_REQUEST = (
 )
 
 
-def compact_history(cfg, model, messages, preserved, trace, max_chars, summary_request=SUMMARY_REQUEST):
+def compact_history(cfg, model, messages, preserved, trace, max_chars, summary_request=SUMMARY_REQUEST, before_request=None):
     """Compact only model-visible history, preserving the original instructions.
 
     Summarization uses its own output allowance and reporting reasoning policy.
@@ -499,8 +499,10 @@ def compact_history(cfg, model, messages, preserved, trace, max_chars, summary_r
             current_messages = request_messages if attempt == 0 else messages + [
                 {"role": "user", "content": request + "\n"
                  "Your previous summary attempt was empty or cut off. Return ONLY "
-                 "completed batch names and exact verified seals, one per line. "
+                 "a concise memory satisfying the original compaction instructions. "
                  "No analysis; stay within the stated character limit."}]
+            if before_request is not None:
+                before_request(current_messages)
             summary = call_parent(cfg, model, current_messages, reporting=True,
                                   summary=True, trace=trace).strip()
             attempts += 1
@@ -537,7 +539,8 @@ def compact_history(cfg, model, messages, preserved, trace, max_chars, summary_r
     # The original task survives unchanged. Neither the full investigative
     # history nor either summarization request enters future parent calls.
     compacted = [dict(preserved[0]), dict(preserved[1]),
-                 {"role": "assistant", "content": "COMPACT MEMORY OF COMPLETED LOOKUPS:\n" + summary}]
+                 {"role": "assistant", "content": ("COMPACT WORKING MEMORY:\n" if "unfinished investigations" in summary_request else
+                                                    "COMPACT MEMORY OF COMPLETED LOOKUPS:\n") + summary}]
     return compacted, summary
 
 
@@ -721,6 +724,10 @@ def arguments(argv=None):
                         help="Output cap only for periodic summaries (default 2048)")
     parser.add_argument("--summary-retries", type=int, default=1,
                         help="Retries for empty or truncated summaries (default 1)")
+    parser.add_argument("--context-memory-threshold", type=float, default=0.55,
+                        help="Repair working-memory trigger fraction; 0 disables active compaction")
+    parser.add_argument("--early-branch-threshold", type=float, default=0.55,
+                        help="Adaptive projected investigation trigger fraction; 0 disables early branching")
     parser.add_argument("--summary-every", type=int, default=2, help="Summarize history after every N completed lookups, except after the last (default: 2)")
     parser.add_argument("--summary-max-chars", type=int, default=1800, help="Maximum length of each compact memory note (default: 1800 chars)")
     parser.add_argument("--trap-log-lines", type=int, default=32, help="Repair: non-authoritative log lines per trap (default 32; 0-150)")
@@ -764,6 +771,8 @@ def arguments(argv=None):
         parser.error("--final-output-tokens must be 64-4096 and --final-retries 0-2")
     if not 64 <= args.summary_output_tokens <= 4096 or not 0 <= args.summary_retries <= 2:
         parser.error("--summary-output-tokens must be 64-4096 and --summary-retries 0-2")
+    if not 0 <= args.context_memory_threshold <= .8 or not 0 <= args.early_branch_threshold <= .8:
+        parser.error("Context thresholds must be between 0 and 0.8")
     if args.summary_every < 1 or not 100 <= args.summary_max_chars <= 10000:
         parser.error("--summary-every must be >= 1 and --summary-max-chars between 100 and 10000")
     if (not 0 <= args.trap_log_lines <= 150 or not 0 <= args.recovery_log_lines <= 120
@@ -855,7 +864,7 @@ def write_files(directory, data, cfg, args, reset_events=None, run_status="compl
                   "scoring_version": 3,
                   "simulator_rules_version": 2,
                   "mandatory_authority_inspection": args.scenario == "repair",
-                  "benchmark_version": "1.10.0", "scenario": args.scenario,
+                  "benchmark_version": "1.11.0", "scenario": args.scenario,
                   "adaptive_max_depth": args.adaptive_max_depth,
                   "adaptive_max_children": args.adaptive_max_children,
                   "adaptive_max_calls": args.adaptive_max_calls,
@@ -893,6 +902,8 @@ def write_files(directory, data, cfg, args, reset_events=None, run_status="compl
                   "no_action_retries": args.no_action_retries,
                   "no_action_retry_output_tokens": args.no_action_retry_output_tokens,
                   "no_action_retry_reasoning": args.no_action_retry_reasoning if args.engine == "llama" else "auto",
+                  "context_memory_threshold": args.context_memory_threshold,
+                  "early_branch_threshold": args.early_branch_threshold,
                   "summary_every": args.summary_every, "summary_max_chars": args.summary_max_chars,
                   "summary_output_tokens": args.summary_output_tokens,
                   "summary_retries": args.summary_retries,
@@ -914,6 +925,7 @@ def write_files(directory, data, cfg, args, reset_events=None, run_status="compl
         "reset_before_trial", "reset_status", "reset_seconds", "reset_method", "reset_memory_before_mb",
         "reset_memory_after_unload_mb", "reset_memory_after_reload_mb",
         "summary_every", "summary_max_chars", "summaries_generated", "summary_chars_peak",
+        "adaptive_early_branches", "adaptive_memory_compactions", "adaptive_archive_reads",
         "summary_attempts", "summary_retries", "summary_retry_recoveries", "summary_failures",
         "error_type", "failed_phase", "error",
         "scenario", "trap_density", "trap_log_lines", "max_actions",
@@ -1274,6 +1286,7 @@ def write_files(directory, data, cfg, args, reset_events=None, run_status="compl
         "Model sampling can still vary; compare multiple seeds/repeats. The autonomous arm records model-selected delegation separately from controlled recursion.",
         "**Modes:** linear retains entire history; summarized periodically replaces old steps with a note "
         "written by the same model; branch isolates each case and returns an outcome. "
+        f"Repair active memory threshold: {args.context_memory_threshold}; early branch threshold: {args.early_branch_threshold}. "
         f"Summarized cadence: every {args.summary_every} lookups, memory budget {args.summary_max_chars} characters. "
         f"Summary cap: {args.summary_output_tokens} tokens; retry allowance: {args.summary_retries}. "
         "Summaries, retry events and per-call traces are in results.json.\n",
@@ -1385,6 +1398,9 @@ def main(argv=None):
     cfg["_final_retries"] = args.final_retries
     cfg["_summary_output_tokens"] = args.summary_output_tokens
     cfg["_summary_retries"] = args.summary_retries
+    cfg["_context_memory_threshold"] = args.context_memory_threshold
+    cfg["_early_branch_threshold"] = args.early_branch_threshold
+    cfg["_memory_max_chars"] = args.summary_max_chars
     # Per-request control is best-effort: older llama.cpp builds may ignore it.
     cfg["_report_reasoning_effort"] = "none" if args.engine == "llama" and args.report_reasoning == "none" else None
     resetter = None
@@ -1511,3 +1527,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

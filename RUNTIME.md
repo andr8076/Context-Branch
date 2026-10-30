@@ -108,6 +108,23 @@ its matching result, keeps the latest occurrence, and preserves distinct version
 of a source, original instructions and every child outcome. Checkpoints make no
 model requests and invent no summaries or observations.
 
+With `context_memory: true` (the default), unique history can also be replaced
+by a bounded, model-generated working memory before the next request. Original
+task instructions remain active. The exact pre-compaction exchanges are saved
+in `context_archives` inside the branch record, including when
+`save_transcripts: false`; this retention is necessary for later retrieval.
+The model uses `read_context_archive(path="archive/1", start=0, limit=2400)`
+to recover omitted details. These are character offsets, not line numbers.
+Summaries are not independently verified. Empty, oversized or cut-off summaries
+stop with `memory_summary_failed` while preserving the original evidence;
+a summary that does not reduce the prompt stops with `memory_not_reduced`.
+All summary calls use the same persistent run ledger as ordinary calls.
+
+`early_branching: true` isolates large `read_project_file` investigations before
+the raw result reaches the parent. Its child inherits the shared budgets and
+normal depth limit. The returned text explicitly identifies the result as a
+model report. Other tool types are not automatically delegated.
+
 If unique evidence still cannot fit, the branch returns `blocked` with
 `stop_reason: context_budget` before sending the oversized estimated request.
 Unique evidence is not silently dropped. Read smaller ranges or start a smaller
@@ -172,3 +189,4 @@ Regression tests exercise the actual MCP runner with controlled model doubles:
 repeated reads/resumes, shared nested budgets, deadline/token accounting,
 duplicate/cycle rejection, partial stops, health checks, range reads and recovery.
 These validate code behavior, not live Qwen accuracy or speed.
+

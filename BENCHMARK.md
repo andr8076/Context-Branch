@@ -1,3 +1,32 @@
+## v1.11 active memory comparison
+
+Repair mode now enables `--context-memory-threshold 0.55` and
+`--early-branch-threshold 0.55` by default. The first applies to the summarized
+baseline, adaptive parents and recursive stages. The second applies to adaptive
+prerequisite investigations before raw shard evidence enters the parent.
+For a historical comparison set both thresholds to zero explicitly.
+
+Active summaries preserve the immutable mission/incident instructions and ask
+the model to retain unfinished evidence, exact identifiers, uncertainty and next
+steps. They archive only already-visible messages. No hidden expected answer
+is supplied or restored if the model loses a fact. A model may recover detail
+with `inspect` on `archive/N`, using optional `start` character offset. Retrieval
+consumes one simulator action and is recorded in the audit trail. Archives are
+saved in the trial directory. Summary failures remain failures.
+
+The summary output reserve and observed tokenizer calibration participate in
+pressure estimates. Lookahead uses document-size metadata, not unseen content.
+A document larger than the available window can still fail; this implementation
+does not claim arbitrary-size document streaming. Stage-oriented early branches
+are benchmark-controlled and use the same shared action/call/token limits.
+
+Compare `summarized` and `adaptive` on repeated seeds at the same context limit.
+Check that `summaries_generated` is positive in the baseline, that
+`adaptive_early_branches` fires under pressure, and that final verification still
+passes. Report total inference work separately from retained-context savings.
+The existing adaptive surprise workload remains mode-specific, so this is a
+system comparison rather than a pure single-variable causal experiment.
+
 # Evidence-gated repairs and reproducible context-pressure experiment
 
 **Simulator rule update:** every repair now requires the model to inspect all five authoritative documents: `registry/releases`, `registry/approvals`, `network/aliases`, `network/routes`, and `security/certificates`, even when `--pressure-records 0`. Correct guesses without evidence are rejected and counted as `authority_blocked`. This changes the task protocol relative to older runs; do not compare pass rates across simulator-rule versions without noting the difference. `results.json` now includes `simulator_rules_version=2` and `mandatory_authority_inspection=true`.
@@ -534,3 +563,4 @@ All example audits are fake and generated locally. No passwords, cookies or othe
 ## Router autodetection troubleshooting (v1.0.1)
 
 `python3 benchmark.py --check-jan-reset` is read-only. It checks for the selected benchmark model in Jan's internal router. The detector looks for TCP listening sockets owned by `jan-llama-worker` or its children using `ss`, then falls back to matching socket inodes under `/proc`. If discovery fails, the error includes worker PIDs, candidate ports, and any model IDs returned by a Jan-owned router. The public Jan API on port 1337 is **not necessarily** the internal router. Never use port 1337 as the router URL unless its root `/models` endpoint is independently verified to be a compatible llama.cpp router.
+

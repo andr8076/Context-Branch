@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from context_memory import benchmark_memory, archive_observation
+
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
@@ -773,6 +775,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "autonomous_context_count": 0,
         "autonomous_max_depth": 0,
         "autonomous_events": [],
+        "adaptive_early_branches": 0, "adaptive_memory_compactions": 0, "adaptive_archive_reads": 0,
         "adaptive_surprise_triggers": 0,
         "adaptive_repeated_stage_rejections": 0,
         "adaptive_stage_corrections": 0,
@@ -829,6 +832,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
     active_sim = None
     active_case = None
     case_recorded = True
+    archives = []
     try:
         for case in puzzle["cases"]:
             name = case["name"]
@@ -846,6 +850,18 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 # Same policy for parent and branches, but the parent keeps its previous cases.
                 messages.append({"role": "user", "content": "INCIDENT ACTION PROTOCOL: " + ACTION_SYSTEM})
                 incident_msgs = messages
+            incident_protected = protected + [
+                {"role": "user", "content": "INCIDENT TO SOLVE: " + case["intro"]},
+                {"role": "user", "content": "INCIDENT ACTION PROTOCOL: " + ACTION_SYSTEM}]
+            def maintain_summary(incoming_chars=0):
+                if mode != "summarized":
+                    return
+                event = benchmark_memory(cfg, model, incident_msgs, incident_protected, trace,
+                    bm, archives, context_limit, incoming_chars)
+                if event:
+                    result["summaries_generated"] += 1
+                    result["summary_chars_peak"] = max(result["summary_chars_peak"], event["chars"])
+                    result["summaries"].append(dict(event, during_batch=name))
             if mode in ("recursive", "autonomous", "adaptive"):
                 from recursive_benchmark import (solve_adaptive_case,
                                                   solve_autonomous_case,
@@ -898,6 +914,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 else:
                     result["adaptive_events"].append({"batch": name, "events": nested_events})
                     for key in (
+                            "adaptive_early_branches", "adaptive_memory_compactions", "adaptive_archive_reads",
                             "adaptive_repeated_stage_rejections", "adaptive_stage_corrections",
                             "adaptive_repeated_recovery_rejections", "adaptive_recovery_corrections",
                             "adaptive_parent_checkpoints", "adaptive_pre_surprise_context_failures",
@@ -919,6 +936,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                     result["out_of_scope_actions"] += sum(
                         e.get("rejected_out_of_scope", 0) for e in nested_events)
             for _ in range(0 if mode in ("recursive", "autonomous", "adaptive") else max_actions):
+                maintain_summary()
                 phase = "branch_investigate" if mode == "branch" else "parent_investigate"
                 action, answer, retry_stats = request_investigation_action(
                     cfg, model, incident_msgs, trace, bm, phase=phase,
@@ -927,8 +945,13 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 result["no_action_retry_attempts"] += retry_stats["retries"]
                 result["no_action_retry_recoveries"] += retry_stats["recovered"]
                 result["no_action_retry_failures"] += retry_stats["failed"]
+                incoming = len(case["docs"].get(action.get("path"), "")) if action and action.get("action") == "inspect" else 0
+                maintain_summary(incoming)
                 incident_msgs.append({"role": "assistant", "content": answer})
-                observation = sim.step(action)
+                if mode == "summarized" and action and action.get("action") == "inspect" and action.get("path", "").startswith("archive/"):
+                    observation = archive_observation(sim, archives, action)
+                else:
+                    observation = sim.step(action)
                 incident_msgs.append({"role": "user", "content": "SIMULATOR RESULT:\n" + observation + "\nContinue the incident; JSON action only."})
                 if sim.verified:
                     break
@@ -1005,6 +1028,11 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                                  + json.dumps(compact) + "\nReply ONLY READY."})
                 ack = bm.call_parent(cfg, model, messages, reporting=True, trace=trace)
                 messages.append({"role": "assistant", "content": ack})
+                if mode == "adaptive":
+                    memory = benchmark_memory(cfg, model, messages, protected, trace, bm,
+                        archives, context_limit)
+                    if memory:
+                        result["adaptive_memory_compactions"] += 1
             if (mode == "summarized" and result["solved_subtasks"] % summary_every == 0
                     and result["solved_subtasks"] < tasks):
                 stage = f"summary:after:{name}"
@@ -1022,6 +1050,11 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         result["compiled_report"] = compiled
         result["compiled_verified_cases"] = sum(bool(value) for value in compiled["seals"].values())
         result["compiled_report_complete"] = result["compiled_verified_cases"] == tasks
+        if mode == "adaptive":
+            memory = benchmark_memory(cfg, model, messages, protected, trace, bm,
+                archives, context_limit)
+            if memory:
+                result["adaptive_memory_compactions"] += 1
         stage = "final_report"
         messages.append({"role": "user", "content": (
             "FINAL REPORT. From VERIFIED repairs only, output ONLY complete JSON "
@@ -1133,7 +1166,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 retry_stats = trace.active_adaptive_counters
                 result["adaptive_events"].append({"batch": name, "events": adaptive_events})
                 for key in (
-                        "adaptive_repeated_stage_rejections", "adaptive_stage_corrections",
+                        "adaptive_early_branches", "adaptive_memory_compactions", "adaptive_archive_reads",
+                            "adaptive_repeated_stage_rejections", "adaptive_stage_corrections",
                         "adaptive_repeated_recovery_rejections", "adaptive_recovery_corrections",
                         "adaptive_parent_checkpoints", "adaptive_pre_surprise_context_failures",
                         "adaptive_surprise_triggers", "adaptive_marker_count",
@@ -1180,4 +1214,10 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         result["calls"] = trace.calls
         result["input_over_limit_risk"] = any(
             r["prompt_tokens"] is not None and r["prompt_tokens"] > context_limit for r in trace.calls)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    (save_dir / "context_archives.json").write_text(json.dumps({
+        "parent": archives, "adaptive": getattr(trace, "adaptive_archive_batches", []),
+        "stages": getattr(trace, "stage_archives", [])},
+        ensure_ascii=False, indent=2), encoding="utf-8")
     return result
+

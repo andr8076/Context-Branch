@@ -26,6 +26,8 @@ from branch_runtime import (DelegationRefused, RunBudget, RunLimitExceeded,
                             deduplicate_reads, finish_interrupted_exchange, normalize_conversation,
                             task_fingerprint, task_identity)
 
+from context_memory import MEMORY_REQUEST, archive_snapshot, archive_note, read_archive
+
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "config.json"
 DATA = ROOT / "data" / "branches"
@@ -64,6 +66,9 @@ DEFAULTS = {
     "max_total_seconds": 600,
     "no_action_retries": 1,
     "retry_output_tokens": 256,
+    "context_memory": True,
+    "early_branching": True,
+    "memory_max_chars": 1800,
     "save_transcripts": False,
     "read_only_project_root": ""
 }
@@ -87,6 +92,7 @@ def config():
         raise ValueError("For privacy, api_base_url must be an HTTP loopback address (localhost)")
     for name, low, high in (("request_timeout_seconds", 5, 600), ("max_output_tokens", 64, 4096),
                             ("final_output_tokens", 64, 4096),
+                            ("memory_max_chars", 200, 4000),
                             ("max_agent_turns", 1, 12), ("max_branch_depth", 0, 4),
                             ("max_parent_result_chars", 200, 4000), ("max_context_chars", 400, 16000),
                             ("context_limit_tokens", 1024, 1048576), ("context_safety_tokens", 64, 4096),
@@ -98,6 +104,9 @@ def config():
             raise ValueError(f"{name} must be an integer between {low} and {high}")
     if values["max_output_tokens"] + values["context_safety_tokens"] >= values["context_limit_tokens"]:
         raise ValueError("context_limit_tokens must leave room for the prompt, output and safety reserve")
+    for key in ("context_memory", "early_branching"):
+        if type(values[key]) is not bool:
+            raise ValueError(key + " must be boolean")
     if type(values["save_transcripts"]) is not bool:
         raise ValueError("save_transcripts must be boolean")
     if values["read_only_project_root"]:
@@ -541,8 +550,13 @@ def search_project(cfg, query):
     return "\n".join(matches) if matches else "No matches in scanned project files"
 
 
-def agent_tools(cfg, depth):
+def agent_tools(cfg, depth, has_archives=False):
     tools = []
+    if cfg.get("context_memory", False) and has_archives:
+        tools.append({"type": "function", "function": {"name": "read_context_archive",
+            "description": "Retrieve exact historical observations omitted from working memory. Use small character ranges; historical data may be stale.",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"},
+                "start": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"]}}})
     if cfg["read_only_project_root"]:
         tools += [
             {"type": "function", "function": {"name": "read_project_file", "description": "Read a numbered range of a UTF-8 project file. Use start_line/max_lines for large sources; continue at the returned next line when needed.", "parameters": {"type":"object", "properties": {"path": {"type":"string"}, "start_line": {"type":"integer", "minimum":1}, "max_lines": {"type":"integer", "minimum":1, "maximum":200}}, "required": ["path"]}}},
@@ -763,6 +777,57 @@ def request_branch_reply(cfg, model, messages, tools, budget, metrics, api=None)
     return answer
 
 
+def compact_working_memory(cfg, model, messages, tools, budget, metrics, archives, api=None):
+    """Archive only after a complete, bounded summary; charge the shared ledger."""
+    if not cfg.get("context_memory", False) or len(messages) <= 3:
+        return False
+    shorter, removed = deduplicate_reads(messages)
+    if removed:
+        messages[:] = shorter
+        metrics["checkpoints"] += 1
+        budget.state["checkpoints"] += 1
+        budget.state["deduplicated_reads"] += removed
+    predicted = budget.predicted_prompt(messages, tools)
+    reserve = max(cfg["max_output_tokens"], cfg["final_output_tokens"])
+    # Leave room for the next bounded tool observation and for the summary request.
+    if predicted + reserve + 768 < budget.limits["context_limit_tokens"] * .78:
+        return False
+    request = messages + [{"role": "user", "content": MEMORY_REQUEST.format(
+        max_chars=cfg.get("memory_max_chars", 1800))}]
+    summary_cfg = dict(cfg, max_output_tokens=cfg["final_output_tokens"],
+                       request_timeout_seconds=min(cfg["request_timeout_seconds"], budget.remaining_seconds()))
+    reservation = budget.before_call(budget.predicted_prompt(request), summary_cfg["max_output_tokens"])
+    metrics["model_calls"] += 1
+    row = {"phase": "working_memory", "requested_max_tokens": summary_cfg["max_output_tokens"],
+           "prompt_est_tokens": reservation["prompt"], "error_type": None}
+    metrics["calls"].append(row)
+    try:
+        reply = chat(summary_cfg, model, request, None, **({"api": api} if api else {}))
+        budget.after_call(reservation, getattr(reply, "usage", {}))
+        summary = message_content(reply).strip()
+        row.update(reply_diagnostics(reply, None, summary_cfg["max_output_tokens"]))
+        stop = getattr(reply, "finish_reason", None)
+        completion = getattr(reply, "usage", {}).get("completion_tokens")
+        truncated = (stop in ("length", "max_tokens") or
+                     (not stop and type(completion) is int
+                      and completion >= summary_cfg["max_output_tokens"] - 3))
+        if not summary or len(summary) > cfg.get("memory_max_chars", 1800) or truncated:
+            raise RunLimitExceeded("memory_summary_failed", "Working memory was empty, oversized or truncated; original evidence retained")
+        candidate = messages[:2] + [{"role": "user", "content":
+            "MODEL-REPORTED WORKING MEMORY:\n" + summary}]
+        # Check actual replacement including archive instructions before committing.
+        candidate[-1]["content"] += "\n" + archive_note(archives + [None])
+        if budget.predicted_prompt(candidate, tools) >= predicted:
+            raise RunLimitExceeded("memory_not_reduced", "Summary did not reduce the active context; original evidence retained")
+        archive_snapshot(archives, messages)
+        messages[:] = candidate
+        metrics["memory_compactions"] = metrics.get("memory_compactions", 0) + 1
+        return True
+    except Exception as exc:
+        row["error_type"] = type(exc).__name__
+        raise
+
+
 def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None, _budget=None,
                *, api=None, data_dir=None):
     task = clip(task, cfg["max_context_chars"])
@@ -824,6 +889,9 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
     branch["root_id"] = root_id
     branch["status"] = "running"
     branch.pop("stop_reason", None)
+    archives = branch.setdefault("context_archives", [])
+    if existing_id and archives and not cfg["save_transcripts"]:
+        messages.append({"role": "user", "content": archive_note(archives)})
     metrics = {"model_calls": 0, "checkpoints": 0, "no_action_retries": 0,
                "repaired_transcript_fragments": repaired, "calls": []}
     save_branch(branch, data_dir)
@@ -840,9 +908,12 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
             model = chosen_model(request_cfg, api)
             branch["model"] = model
             save_branch(branch, data_dir)
-        tools = agent_tools(cfg, branch["depth"])
+        tools = agent_tools(cfg, branch["depth"], bool(archives))
         final = None
         for _ in range(cfg["max_agent_turns"]):
+            if compact_working_memory(cfg, model, messages, tools, budget, metrics, archives, api):
+                save_branch(branch, data_dir)
+                tools = agent_tools(cfg, branch["depth"], bool(archives))
             answer = request_branch_reply(cfg, model, messages, tools, budget, metrics, api)
             calls = answer.get("tool_calls") or []
             content = message_content(answer)
@@ -861,6 +932,26 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
                         if name == "read_project_file" and cfg["read_only_project_root"]:
                             output = read_project(cfg, args.get("path", ""),
                                                   args.get("start_line", 1), args.get("max_lines", 80))
+                            projected = budget.predicted_prompt(messages + [{"role": "tool",
+                                "tool_call_id": call["id"], "content": output}], tools)
+                            if (cfg.get("early_branching", False) and branch["depth"] < cfg["max_branch_depth"]
+                                    and len(output) > 1200
+                                    and projected + cfg["max_output_tokens"] + cfg["context_safety_tokens"]
+                                        >= cfg["context_limit_tokens"] * .55):
+                                child = run_branch(cfg,
+                                    f"Investigate source {args.get('path')} from line {args.get('start_line', 1)} "
+                                    f"for at most {args.get('max_lines', 80)} lines. Extract only evidence relevant "
+                                    f"to this goal: {branch['task']}. Include exact identifiers and source lines; "
+                                    "report uncertainty and whether more evidence is needed.",
+                                    relevant_context=relevant_context,
+                                    parent_id=branch["id"], _budget=budget, api=api, data_dir=data_dir)
+                                if child["branch_id"] not in branch["subbranches"]:
+                                    branch["subbranches"].append(child["branch_id"])
+                                output = "EARLY ISOLATED INVESTIGATION (model-reported, not a raw source read):\n" + nested_handoff(child)
+                                metrics["early_branches"] = metrics.get("early_branches", 0) + 1
+                        elif name == "read_context_archive" and cfg.get("context_memory", False):
+                            output = read_archive(archives, args.get("path", ""),
+                                                  args.get("start", 0), args.get("limit", 2400))
                         elif name == "search_project_files" and cfg["read_only_project_root"]:
                             output = search_project(cfg, args.get("query", ""))
                         elif name == "solve_nested_branch" and branch["depth"] < cfg["max_branch_depth"]:
@@ -886,6 +977,7 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
                 branch["stop_reason"] = unusable_stop_reason(metrics)
             break
         if final is None:
+            compact_working_memory(cfg, model, messages, None, budget, metrics, archives, api)
             messages.append({"role": "user", "content": "Tool budget exhausted. Answer now using ONLY compact final JSON, no more tool use."})
             final_msg = request_branch_reply(cfg, model, messages, None, budget, metrics, api)
             final = message_content(final_msg)
@@ -1080,3 +1172,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

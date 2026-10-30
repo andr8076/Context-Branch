@@ -307,9 +307,11 @@ def estimated_prompt_tokens(bm, messages, last_prompt_tokens=None, last_prompt_e
     return estimate
 
 
-def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_depth=3, context_limit=None):
+def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_depth=3, context_limit=None,
+                         start_stage="repair", before_request=None):
     """Return (success, events, counters); shared action cap across all stages."""
     from trap_benchmark import request_investigation_action
+    from context_memory import benchmark_memory, archive_observation
     events = []
     counters = {'no_actions': 0, 'retries': 0, 'recoveries': 0, 'retry_failures': 0}
     # Mutable references are retained by Trace if inference fails halfway through a stage.
@@ -333,7 +335,7 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
             event['status'] = 'depth_limit'
             return False
         child = prerequisite(stage, case['nested_depth'])
-        if child and not solve(child, depth + 1, stage):
+        if child and not stage_done(child, sim) and not solve(child, depth + 1, stage):
             event['status'] = 'child_blocked'
             return False
         context = [{'role': 'system', 'content': stage_instruction(stage, depth)},
@@ -347,6 +349,15 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
                             f'Now complete ONLY {stage}. Do not repeat the child investigation. '
                             f'You may inspect ONLY {", ".join(STAGE_PATHS[stage])}.'})
         original_context = [dict(m) for m in context]
+        archives = []
+        if not hasattr(trace, 'stage_archives'):
+            trace.stage_archives = []
+        trace.stage_archives.append({'case': case['name'], 'stage': stage, 'archives': archives})
+        def maintain_stage(incoming_chars=0):
+            event_memory = benchmark_memory(cfg, model, context, original_context, trace, bm,
+                archives, context_limit, incoming_chars, before_request=before_request)
+            if event_memory:
+                event.setdefault('memory_events', []).append(event_memory)
         inspected = {}  # path -> exact last simulator response, not case['docs'] or oracle
         last_change = None
         last_prompt_tokens = None
@@ -356,6 +367,7 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
         # All later evidence interpretation and repairs keep full reasoning.
         stage_start_limit = cfg.get('_stage_start_inspects', 0)
         while sim.actions < max_actions and not stage_done(stage, sim):
+            maintain_stage()
             starting = (event['stage_start_inspections'] < stage_start_limit
                         and not event['stage_start_disabled'])
             phase = (f'branch_recursive_{depth}_{stage}_stage_start' if starting
@@ -365,7 +377,7 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
             predicted = estimated_prompt_tokens(
                 bm, context, last_prompt_tokens, last_prompt_estimate)
             before_tokens = predicted
-            if (checkpoint_threshold and event['context_checkpoints'] < checkpoint_max
+            if (not archives and checkpoint_threshold and event['context_checkpoints'] < checkpoint_max
                     and predicted + budget + 256 >= int(context_limit * checkpoint_threshold)
                     and (inspected or last_change is not None)):
                 shorter = checkpoint_context(original_context, inspected, last_change)
@@ -418,7 +430,7 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
             try:
                 action, answer, info = request_investigation_action(
                     cfg, model, context, trace, bm, phase=phase,
-                    max_retries=cfg.get('_no_action_retries', 1))
+                    max_retries=cfg.get('_no_action_retries', 1), before_request=before_request)
             except Exception:
                 event['status'] = 'inference_error'
                 raise
@@ -429,6 +441,8 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
             counters['retries'] += info['retries']
             counters['recoveries'] += info['recovered']
             counters['retry_failures'] += info['failed']
+            incoming = len(case['docs'].get(action.get('path'), '')) if action and action.get('action') == 'inspect' else 0
+            maintain_stage(incoming)
             context.append({'role': 'assistant', 'content': answer})
             in_scope_inspect = (action is not None and action['action'] == 'inspect'
                                 and action.get('path') in STAGE_PATHS[stage])
@@ -439,7 +453,9 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
                     # Do not apply the cheap policy to complex or invalid actions.
                     # The action still gets handled normally by the simulator.
                     event['stage_start_disabled'] = True
-            if action and (action['action'] not in STAGE_ACTIONS[stage] or
+            if action and action.get('action') == 'inspect' and action.get('path', '').startswith('archive/'):
+                observation = archive_observation(sim, archives, action)
+            elif action and (action['action'] not in STAGE_ACTIONS[stage] or
                            (action['action'] == 'inspect' and action.get('path') not in STAGE_PATHS[stage])):
                 event['rejected_out_of_scope'] += 1
                 observation = sim.reject_out_of_scope(
@@ -463,7 +479,7 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
         event['status'] = 'verified' if event['completed'] else 'action_budget_exhausted'
         return event['completed']
 
-    success = solve('repair', 0, None)
+    success = solve(start_stage, 0, None)
     return success, events, counters
 
 
@@ -686,6 +702,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     this function measures adaptive context escape and verified resume.
     """
     from trap_benchmark import request_investigation_action
+    from context_memory import benchmark_memory, predicted_tokens, archive_observation
+
 
     events = []
     counters = {
@@ -713,6 +731,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         'adaptive_stage_corrections': 0,
         'adaptive_repeated_recovery_rejections': 0,
         'adaptive_recovery_corrections': 0,
+        'adaptive_early_branches': 0, 'adaptive_memory_compactions': 0,
+        'adaptive_archive_reads': 0,
         'adaptive_parent_checkpoints': 0,
         'adaptive_pre_surprise_context_failures': 0,
     }
@@ -738,8 +758,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                 raise AdaptiveStop('context_isolation_violation')
         if request_count >= max_calls:
             raise AdaptiveStop('model_call_budget_exhausted')
-        estimate = bm.approximate_tokens(prompt)
-        reserve = cfg.get('max_output_tokens', 1024)
+        estimate = predicted_tokens(prompt, bm.approximate_tokens, trace.calls)
+        reserve = max(cfg.get('max_output_tokens', 1024), cfg.get('_summary_output_tokens', 0)) if trace.phase.startswith('parent_summary') else cfg.get('max_output_tokens', 1024)
         if estimate + reserve > context_limit:
             raise AdaptiveStop('context_capacity_exceeded_estimate')
         if tokens_used() + estimate + reserve > max_tokens:
@@ -791,6 +811,11 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     journal_keys = set()
     rejected_stage_actions = {}
     correction = None
+    archives = []
+    if not hasattr(trace, 'adaptive_archive_batches'):
+        trace.adaptive_archive_batches = []
+    trace.adaptive_archive_batches.append({'case': case['name'], 'archives': archives})
+    early_attempts = set()
 
     def checkpoint_parent():
         """Rebuild the parent from observed exchanges without losing state evidence.
@@ -1051,12 +1076,71 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
             parent_event['child_prompt_tokens'] = child_event['prompt_tokens']
             parent_event['child_tokens'] = child_event['child_tokens']
 
+    def maintain_parent(incoming_chars=0):
+        event = benchmark_memory(cfg, model, parent_context, parent_base, trace, bm,
+            archives, context_limit, incoming_chars,
+            before_request=lambda prompt: before_request(prompt, parent_context))
+        if event:
+            counters['adaptive_memory_compactions'] += 1
+            parent_event.setdefault('memory_events', []).append(event)
+            if parent_event['resumed']:
+                restored_boundaries[id(parent_context)] = (parent_context, copy.deepcopy(parent_context))
+
+    def early_investigation(action):
+        if not action or action.get('action') != 'inspect':
+            return None
+        stage = action.get('path', '').split('/')[0]
+        threshold = cfg.get('_early_branch_threshold', 0)
+        if (not threshold or stage not in ('index', 'escrow', 'recovery')
+                or stage in early_attempts or stage_done(stage, sim)):
+            return None
+        dependency = prerequisite(stage, case['nested_depth'])
+        if dependency and not stage_done(dependency, sim):
+            return None  # The ordinary locked-source observation remains visible.
+        # Inspect source SIZE metadata only; no oracle or unseen evidence content
+        # enters the parent or the decision. Both shards belong to this investigation.
+        size = sum(len(case['docs'].get(path, '')) for path in STAGE_PATHS[stage]
+                   if path.startswith(stage + '/'))
+        projected = predicted_tokens(parent_context + [{'role': 'user', 'content': 'x' * size}],
+                                     bm.approximate_tokens, trace.calls)
+        if projected + cfg['max_output_tokens'] + 256 < context_limit * threshold:
+            return None
+        if counters['adaptive_branches'] >= max_children:
+            raise AdaptiveStop('branch_count_limit')
+        early_attempts.add(stage)
+        counters['adaptive_early_branches'] += 1
+        counters['adaptive_branch_attempts'] += 1
+        counters['adaptive_branches'] += 1
+        start = len(trace.calls)
+        try:
+            success, child_events, stats = solve_recursive_case(sim, case, cfg, model, trace, bm,
+                max_actions, max_depth=0, context_limit=context_limit, start_stage=stage,
+                before_request=lambda prompt: before_request(prompt, prompt))
+        except Exception:
+            counters['adaptive_branch_failures'] += 1
+            events.extend(getattr(trace, 'active_recursive_events', []))
+            raise
+        for key in ('no_actions', 'retries', 'recoveries', 'retry_failures'):
+            counters[key] += stats[key]
+        child = child_events[0]
+        child.update(depth=1, parent='parent', trigger='projected_evidence_pressure')
+        events.extend(child_events)
+        counters['adaptive_child_decisions'] += child['model_actions']
+        counters['adaptive_child_actions'] += child['model_actions']
+        counters['adaptive_child_tokens'] += child_tokens_used(start)
+        if not success:
+            counters['adaptive_branch_failures'] += 1
+            raise AdaptiveStop('adaptive_child_action_budget_exhausted')
+        # The simulator verifies only the state change, not a model's conclusion.
+        return 'EARLY BRANCH VERIFIED: ' + verified_handoff(stage, sim) + '. Continue the remaining incident.'
+
     success = False
     try:
         while (sim.actions < max_actions and tokens_used() < max_tokens
                and not sim.verified):
             trace.phase = 'adaptive_parent'
             after_resume = parent_event['resumed']
+            maintain_parent()
             current_estimate = bm.approximate_tokens(parent_context)
             if (current_estimate + cfg['max_output_tokens'] + 256
                     >= context_limit * 0.78):
@@ -1094,9 +1178,18 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
             if after_resume:
                 counters['adaptive_post_resume_decisions'] += 1
                 parent_event['post_resume_decisions'] += 1
+            early_receipt = early_investigation(action)
+            if early_receipt:
+                parent_context.append({'role': 'user', 'content': early_receipt})
+                continue
+            incoming = len(case['docs'].get(action.get('path'), '')) if action and action.get('action') == 'inspect' else 0
+            maintain_parent(incoming)
             parent_context.append({'role': 'assistant', 'content': answer})
             history_start = len(sim.history)
-            if action and action.get('action') == 'delegate':
+            if action and action.get('action') == 'inspect' and action.get('path', '').startswith('archive/'):
+                counters['adaptive_archive_reads'] += 1
+                observation = archive_observation(sim, archives, action)
+            elif action and action.get('action') == 'delegate':
                 observation = sim.reject_out_of_scope('adaptive_parent', action, [],
                     ['inspect', 'rebuild_index', 'unlock_escrow', 'recover', 'repair', 'verify'])
                 parent_event['rejected_out_of_scope'] = parent_event.get('rejected_out_of_scope', 0) + 1
@@ -1240,4 +1333,5 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                 'child_failed' if (parent_event['branch_started']
                                    and not parent_event['branch_completed']) else
                 'action_budget_exhausted')
+
 
