@@ -162,7 +162,7 @@ class Trace:
             self.calls.append(row)
 
     def totals(self):
-        peak_main = max((r["prompt_tokens"] or r["prompt_est_tokens"] for r in self.calls if r["phase"].startswith("parent")), default=0)
+        peak_main = max((r["prompt_tokens"] or r["prompt_est_tokens"] for r in self.calls if r["phase"].startswith(("parent", "adaptive_parent"))), default=0)
         peak_branch = max((r["prompt_tokens"] or r["prompt_est_tokens"] for r in self.calls if r["phase"].startswith("branch")), default=0)
         total_prompt = sum((r["prompt_tokens"] if r["prompt_tokens"] is not None else r["prompt_est_tokens"]) for r in self.calls)
         total_completion = sum((r["completion_tokens"] if r["completion_tokens"] is not None else (r["completion_est_tokens"] or 0)) for r in self.calls)
@@ -904,10 +904,15 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "autonomous_tokens_used", "autonomous_token_budget",
         "autonomous_branch_count", "autonomous_context_count", "autonomous_max_depth",
         "adaptive_surprise_triggers", "adaptive_marker_count", "adaptive_branch_attempts",
+        "adaptive_repeated_stage_rejections", "adaptive_stage_corrections",
+        "adaptive_repeated_recovery_rejections", "adaptive_recovery_corrections",
+        "adaptive_parent_checkpoints", "adaptive_pre_surprise_context_failures",
         "adaptive_branches", "adaptive_branch_failures", "adaptive_resumes",
         "adaptive_decisions", "adaptive_child_decisions", "adaptive_child_actions",
         "adaptive_parent_prompt_before_marker", "adaptive_parent_prompt_after_resume",
         "adaptive_child_prompt_tokens", "adaptive_child_tokens",
+        "adaptive_child_transcript_tokens_discarded", "adaptive_context_reclaimed_tokens",
+        "adaptive_receipt_tokens",
         "adaptive_child_transcript_leaks", "adaptive_child_resolutions",
         "adaptive_nested_blocker_failures",
         "adaptive_post_resume_decisions", "adaptive_post_resume_actions",
@@ -1143,14 +1148,25 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{max((r.get('autonomous_token_budget', 0) for r in rows), default=0)} | "
                                  f"{max((r.get('autonomous_max_depth', 0) for r in rows), default=0)} |")
         if "adaptive" in args.modes:
+            lines += ["", "## Adaptive parent recovery", "",
+                      "| Tasks | Repeated recovery-stage rejections | Stage corrections | Recovery-only rejections | Recovery-only corrections | Parent checkpoints | Pre-surprise context failures |",
+                      "|---:|---:|---:|---:|---:|---:|---:|"]
+            for n in args.tasks:
+                rows = [r for r in data if r["tasks"] == n and r["mode"] == "adaptive"]
+                if rows:
+                    values = [sum(r.get(key, 0) for r in rows) for key in (
+                        "adaptive_repeated_stage_rejections", "adaptive_stage_corrections",
+                        "adaptive_repeated_recovery_rejections", "adaptive_recovery_corrections",
+                        "adaptive_parent_checkpoints", "adaptive_pre_surprise_context_failures")]
+                    lines.append("| " + " | ".join(map(str, [n, *values])) + " |")
             lines += ["", "## Adaptive surprise-branch diagnostics", "",
                       "The adaptive arm injects one explicit unexpected blocker at the first repair attempt. "
                       "The controller saves the parent message list at a marker, resolves only that blocker in "
                       "a private child context, and resumes the parent with a compact receipt. The parent must "
                       "then use its preserved evidence to apply and verify the original repair. Child transcripts "
                       "and simulator oracle values must never enter the resumed parent.", "",
-                      "| Tasks | Surprise triggers | Markers | Child branches | Child failures | Resumes | Child tokens | Parent tokens before/after | Transcript leaks |",
-                      "|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+                      "| Tasks | Surprise triggers | Markers | Child branches | Child failures | Resumes | Child tokens | Discarded child context | Reclaimed parent context | Parent tokens before/after | Receipt tokens | Transcript leaks |",
+                      "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
             for n in args.tasks:
                 rows = [r for r in data if r["tasks"] == n and r["mode"] == "adaptive"]
                 if rows:
@@ -1160,9 +1176,14 @@ def write_files(directory, data, cfg, args, reset_events=None):
                                  f"{sum(r.get('adaptive_branch_failures', 0) for r in rows)} | "
                                  f"{sum(r.get('adaptive_resumes', 0) for r in rows)} | "
                                  f"{sum(r.get('adaptive_child_tokens', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_child_transcript_tokens_discarded', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_context_reclaimed_tokens', 0) for r in rows)} | "
                                  f"{sum(r.get('adaptive_parent_prompt_before_marker', 0) for r in rows)} / "
                                  f"{sum(r.get('adaptive_parent_prompt_after_resume', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_receipt_tokens', 0) for r in rows)} | "
                                  f"{sum(r.get('adaptive_child_transcript_leaks', 0) for r in rows)} |")
+            lines += ["", "Context reclamation is an estimate using the largest observed child prompt and the resumed parent prompt. "
+                      "It measures context retained by the parent, not total inference tokens saved."]
             lines += ["", "### Post-resume continuation proof", "",
                       "A complete adaptive proof requires a resolved child blocker followed by fresh parent "
                       "decisions and simulator actions after the marker is restored. Verification must occur "

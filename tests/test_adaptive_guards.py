@@ -35,6 +35,7 @@ class NestedFake(DeliberateFakeJan):
 
 class AdaptiveGuardTests(unittest.TestCase):
     def run_case(self, fake=None, **overrides):
+        nested_depth = overrides.pop('_nested_depth', 0)
         cfg = {**bm.bc.DEFAULTS, 'api_base_url': 'http://fake/v1', 'max_output_tokens': 1024,
                'timeout_seconds': 30, '_autonomous_max_tokens': 100000,
                '_adaptive_surprise_levels': 2, '_context_limit': 8192}
@@ -42,7 +43,7 @@ class AdaptiveGuardTests(unittest.TestCase):
         fake = fake or NestedFake()
         with tempfile.TemporaryDirectory() as temp, patch.object(bm.bc, 'http_json', fake):
             result = tb.run_trap_trial('adaptive', 17, 1, cfg, 'mock', cfg['_context_limit'],
-                                      Path(temp), bm, nested_depth=0, recovery_log_lines=0,
+                                      Path(temp), bm, nested_depth=nested_depth, recovery_log_lines=0,
                                       nested_log_lines=0, pressure_records=0, max_actions=48)
         return result, fake
 
@@ -191,6 +192,70 @@ class AdaptiveGuardTests(unittest.TestCase):
         self.assertEqual(result['verified_cases'], 1, result['error'])
         self.assertEqual(result['adaptive_child_resolutions'], 3)
 
+    def test_parent_repeated_recovery_gets_observation_based_correction(self):
+        class Rejected(NestedFake):
+            count = 0
+            def __call__(self, method, url, cfg, payload=None):
+                if method == 'POST' and self.count < 3:
+                    self.count += 1
+                    self.messages_seen.append(json.loads(json.dumps(payload['messages'])))
+                    return {'choices': [{'message': {'content': json.dumps(
+                        {'action': 'recover', 'token': 'WRONG'})}, 'finish_reason': 'stop'}]}
+                return super().__call__(method, url, cfg, payload)
+        result, fake = self.run_case(Rejected())
+        self.assertEqual(result['adaptive_repeated_recovery_rejections'], 2)
+        self.assertEqual(result['adaptive_recovery_corrections'], 2)
+        self.assertIn('no spaces or separators', json.dumps(fake.messages_seen))
+        self.assertNotIn('reconciliation_token=', json.dumps(fake.messages_seen[:3]))
+
+    def test_parent_repeated_nested_rejection_gets_stage_correction(self):
+        class MalformedIndexToken(NestedFake):
+            malformed = 0
+
+            def __call__(self, method, url, cfg, payload=None):
+                response = super().__call__(method, url, cfg, payload)
+                if method == 'POST' and self.malformed < 2:
+                    answer = response['choices'][0]['message']['content']
+                    action = tb.parse_action(answer)
+                    if action and action.get('action') == 'rebuild_index':
+                        token = action['token']
+                        action['token'] = token[:len(token) // 2] + '+' + token[len(token) // 2:]
+                        response['choices'][0]['message']['content'] = json.dumps(action)
+                        self.malformed += 1
+                return response
+
+        result, fake = self.run_case(MalformedIndexToken(), _nested_depth=2)
+        self.assertEqual(result['verified_cases'], 1, result['error'])
+        self.assertEqual(result['adaptive_repeated_stage_rejections'], 1)
+        self.assertEqual(result['adaptive_stage_corrections'], 1)
+        self.assertEqual(result['adaptive_repeated_recovery_rejections'], 0)
+        self.assertEqual(result['adaptive_branch_failures'], 0)
+        self.assertIn('RECOVERY-STAGE CORRECTION (index)', json.dumps(fake.messages_seen))
+        self.assertIn('including plus signs', json.dumps(fake.messages_seen))
+
+    def test_duplicate_parent_reads_checkpoint_and_preserve_evidence(self):
+        class RepeatedReads(NestedFake):
+            count = 0
+            def __call__(self, method, url, cfg, payload=None):
+                if method == 'POST' and self.count < 35:
+                    self.count += 1
+                    self.messages_seen.append(json.loads(json.dumps(payload['messages'])))
+                    return {'choices': [{'message': {'content': json.dumps(
+                        {'action': 'inspect', 'path': 'guide/index'})}, 'finish_reason': 'stop'}]}
+                return super().__call__(method, url, cfg, payload)
+        result, fake = self.run_case(RepeatedReads())
+        self.assertGreater(result['adaptive_parent_checkpoints'], 0)
+        compacted = [msgs for msgs in fake.messages_seen
+                     if 'PARENT CONTEXT CHECKPOINT' in json.dumps(msgs)]
+        self.assertTrue(compacted)
+        self.assertIn('MANDATORY RECOVERY', json.dumps(compacted[0]))
+
+    def test_pre_surprise_context_failure_is_separate(self):
+        result, _ = self.run_case(_context_limit=400)
+        self.assertEqual(result['error_type'], 'context_capacity_exceeded_estimate')
+        self.assertEqual(result['adaptive_pre_surprise_context_failures'], 1)
+        self.assertEqual(result['adaptive_branch_failures'], 0)
+
     def test_corrupted_resume_is_measured_before_inference(self):
         original = tb.request_investigation_action
 
@@ -204,6 +269,33 @@ class AdaptiveGuardTests(unittest.TestCase):
         self.assertEqual(result['error_type'], 'context_isolation_violation')
         self.assertEqual(result['adaptive_child_transcript_leaks'], 1)
         self.assertNotIn('LEAKED PRIVATE TRANSCRIPT', json.dumps(fake.messages_seen))
+
+    def test_long_child_context_is_discarded_at_resume(self):
+        class LongChild(NestedFake):
+            remaining = 10
+
+            def __call__(self, method, url, cfg, payload=None):
+                if (method == 'POST' and payload and
+                        'ADAPTIVE CHILD CONTEXT' in payload['messages'][0]['content'] and
+                        'level=1' in payload['messages'][0]['content'] and self.remaining > 0):
+                    self.remaining -= 1
+                    action = {'action': 'inspect', 'path': 'adaptive/blocker'}
+                    answer = json.dumps(action)
+                    self.messages_seen.append(json.loads(json.dumps(payload['messages'])))
+                    self.limits.append(payload['max_tokens'])
+                    return {'choices': [{'message': {'content': answer}, 'finish_reason': 'stop'}],
+                            'usage': {'prompt_tokens': len(json.dumps(payload['messages'])) // 4,
+                                      'completion_tokens': len(answer) // 4}}
+                return super().__call__(method, url, cfg, payload)
+
+        result, _ = self.run_case(LongChild(), _adaptive_surprise_levels=1)
+        self.assertEqual(result['verified_cases'], 1, result['error'])
+        self.assertEqual(result['adaptive_resumes'], 1)
+        self.assertGreater(result['adaptive_child_transcript_tokens_discarded'], 0)
+        self.assertGreater(result['adaptive_context_reclaimed_tokens'], 0)
+        child_event = result['adaptive_events'][0]['events'][1]
+        self.assertGreater(child_event['child_transcript_tokens_discarded'], 0)
+        self.assertGreater(child_event['context_reclaimed_tokens'], 0)
 
 
 if __name__ == '__main__':
