@@ -1072,6 +1072,11 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                     if after_resume:
                         counters['adaptive_post_resume_checkpoints'] += 1
                         parent_event['post_resume_checkpoints'] += 1
+                        # Keep the isolation sentinel current after replacing
+                        # the resumed parent list.  The child transcript must
+                        # remain absent from every later parent request.
+                        restored_boundaries[id(shorter)] = (
+                            shorter, copy.deepcopy(shorter))
                     else:
                         counters['adaptive_parent_checkpoints'] += 1
             before = bm.approximate_tokens(parent_context)
