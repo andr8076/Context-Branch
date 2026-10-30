@@ -131,6 +131,36 @@ class IntegrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             b.safe_file(project, "../private.txt")
 
+    def test_state_files_are_atomic_and_corrupt_json_is_rejected(self):
+        target = b.DATA / "branch-state.json"
+        b.ensure_store()
+        b.atomic_json_write(target, {"status": "ok", "value": 1})
+        self.assertTrue(target.is_file())
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["status"], "ok")
+        target.write_text('{"broken": ', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            b.load_json_if_exists(target)
+        self.assertEqual(target.exists(), True)
+
+    def test_cleanup_prunes_stale_parent_and_child_links(self):
+        parent_id = "a" * 32
+        child_id = "b" * 32
+        parent = {"id": parent_id, "parent_id": None, "subbranches": [child_id, "c" * 32], "status": "success", "task": "Parent", "updated": "2025-01-01T00:00:00Z"}
+        child = {"id": child_id, "parent_id": "missing" * 4, "subbranches": [], "status": "success", "task": "Child", "updated": "2025-01-01T00:00:00Z"}
+        b.save_branch(parent)
+        b.save_branch(child)
+        stale_budget = b.DATA / "budgets" / "stale.json"
+        stale_budget.parent.mkdir(parents=True, exist_ok=True)
+        stale_budget.write_text('{"root_id": "garbage"}', encoding='utf-8')
+        report = b.cleanup_orphaned_state()
+        self.assertEqual(report["pruned_subbranches"], 1)
+        self.assertEqual(report["cleared_parent_links"], 1)
+        refreshed_parent = b.load_branch(parent_id)
+        self.assertEqual(refreshed_parent["subbranches"], [child_id])
+        refreshed_child = b.load_branch(child_id)
+        self.assertIsNone(refreshed_child["parent_id"])
+        self.assertFalse(stale_budget.exists())
+
     def test_invalid_endpoints_and_protocol(self):
         self.cfg["api_base_url"] = "https://remote.example/v1"
         b.CONFIG.write_text(json.dumps(self.cfg))
@@ -139,7 +169,7 @@ class IntegrationTests(unittest.TestCase):
         init = b.handle_rpc({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocolVersion":"2025-03-26"}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "jan-branch-context")
         tools = b.handle_rpc({"jsonrpc":"2.0", "id":2, "method":"tools/list"})
-        self.assertEqual(len(tools["result"]["tools"]), 5)
+        self.assertEqual(len(tools["result"]["tools"]), 6)
         self.assertIsNone(b.handle_rpc({"jsonrpc":"2.0", "method":"notifications/initialized"}))
 
     def test_nested_branch_retrieval(self):

@@ -11,7 +11,10 @@ import json
 import os
 import re
 import sys
+import tempfile
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
@@ -39,6 +42,8 @@ status (success, partial, or blocked), result (solution and essential details),
 what_changed (external actions actually completed, or 'Nothing'),
 next_step (what the parent should do), caveats (critical uncertainty).
 Do not include private deliberation. Be concise and concrete."""
+
+STORE_LOCK = threading.RLock()
 
 DEFAULTS = {
     "api_base_url": "http://127.0.0.1:1337/v1",
@@ -206,12 +211,36 @@ def chat(cfg, model, messages, tools=None, reasoning_effort=None):
     return ChatMessage(message, answer.get("usage"), choices[0].get("finish_reason"))
 
 
+@contextmanager
+def locked_store():
+    with STORE_LOCK:
+        ensure_store()
+        yield
+
+
 def ensure_store():
     DATA.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.name == "posix":
         DATA.parent.chmod(0o700)
         DATA.chmod(0o700)
+
+
+def atomic_json_write(target, value):
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(target.parent), delete=False) as fh:
+        json.dump(value, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+        temporary = Path(fh.name)
+    try:
+        os.replace(temporary, target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    if os.name == "posix":
+        target.chmod(0o600)
 
 
 def branch_path(branch_id):
@@ -221,22 +250,12 @@ def branch_path(branch_id):
 
 
 def save_branch(branch):
-    ensure_store()
-    save_private_json(branch_path(branch["id"]), branch)
+    with locked_store():
+        save_private_json(branch_path(branch["id"]), branch)
 
 
 def save_private_json(target, value):
-    temporary = target.with_suffix(".tmp")
-    fd = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(value, fh, ensure_ascii=False, indent=2)
-            fh.write("\n")
-        os.replace(temporary, target)
-        if os.name == "posix":
-            target.chmod(0o600)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_json_write(Path(target), value)
 
 
 def budget_path(root_id):
@@ -245,12 +264,89 @@ def budget_path(root_id):
 
 
 def save_budget(root_id, ledger):
+    with locked_store():
+        target = budget_path(root_id)
+        target.parent.mkdir(mode=0o700, exist_ok=True)
+        if os.name == "posix":
+            target.parent.chmod(0o700)
+        save_private_json(target, ledger)
+
+
+def load_json_if_exists(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        with path.open(encoding="utf-8") as fh:
+            value = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"State file is corrupt: {path.name}: {exc.msg}") from exc
+    return value
+
+
+def prune_stale_branch_refs(branch):
+    branch_id = str(branch.get("id") or "")
+    valid = set()
+    for file in DATA.glob("*.json"):
+        try:
+            with file.open(encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("id"), str) and re.fullmatch(r"[0-9a-f]{32}", data["id"]):
+            valid.add(data["id"])
+    changed = False
+    if isinstance(branch.get("subbranches"), list):
+        cleaned = []
+        for child_id in branch["subbranches"]:
+            if child_id in valid and child_id != branch_id:
+                cleaned.append(child_id)
+            else:
+                changed = True
+        if cleaned != branch["subbranches"]:
+            branch["subbranches"] = cleaned
+            changed = True
+    parent_id = branch.get("parent_id")
+    if parent_id and parent_id not in valid:
+        branch["parent_id"] = None
+        changed = True
+    return changed
+
+
+def cleanup_orphaned_state():
     ensure_store()
-    target = budget_path(root_id)
-    target.parent.mkdir(mode=0o700, exist_ok=True)
-    if os.name == "posix":
-        target.parent.chmod(0o700)
-    save_private_json(target, ledger)
+    issues = {"pruned_subbranches": 0, "cleared_parent_links": 0, "removed_budget_files": 0}
+    valid_ids = set()
+    branch_files = []
+    for path in sorted(DATA.glob("*.json"), key=lambda p: p.name):
+        try:
+            with path.open(encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("id"), str) and re.fullmatch(r"[0-9a-f]{32}", data["id"]):
+            valid_ids.add(data["id"])
+            branch_files.append(data)
+    for branch in branch_files:
+        original = list(branch.get("subbranches", []))
+        cleaned = []
+        for child_id in original:
+            if child_id in valid_ids and child_id != branch.get("id"):
+                cleaned.append(child_id)
+            else:
+                issues["pruned_subbranches"] += 1
+        if cleaned != original:
+            branch["subbranches"] = cleaned
+            save_branch(branch)
+        if branch.get("parent_id") and branch["parent_id"] not in valid_ids:
+            branch["parent_id"] = None
+            save_branch(branch)
+            issues["cleared_parent_links"] += 1
+    for budget_path in sorted((DATA / "budgets").glob("*.json")):
+        if budget_path.stem not in valid_ids:
+            budget_path.unlink(missing_ok=True)
+            issues["removed_budget_files"] += 1
+    return issues
 
 
 def root_branch(branch):
@@ -265,11 +361,18 @@ def root_branch(branch):
 
 
 def load_branch(branch_id):
-    p = branch_path(branch_id)
-    if not p.is_file():
-        raise ValueError("Branch not found")
-    with p.open(encoding="utf-8") as fh:
-        return json.load(fh)
+    with locked_store():
+        p = branch_path(branch_id)
+        if not p.is_file():
+            raise ValueError("Branch not found")
+        try:
+            with p.open(encoding="utf-8") as fh:
+                value = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Branch state file is corrupt for {branch_id}: {exc.msg}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"Branch state file for {branch_id} is not a JSON object")
+        return value
 
 
 def utcnow():
@@ -445,8 +548,12 @@ def format_parent(branch, cfg):
     usage = branch.get("usage", {})
     root_id = branch.get("root_id") or root_branch(branch)["id"]
     if budget_path(root_id).exists():
-        ledger = json.loads(budget_path(root_id).read_text(encoding="utf-8"))
-        usage = RunBudget(root_id, cfg, ledger).public()
+        ledger = load_json_if_exists(budget_path(root_id))
+        if isinstance(ledger, dict):
+            try:
+                usage = RunBudget(root_id, cfg, ledger).public()
+            except (TypeError, ValueError):
+                usage = {"root_id": root_id, "error": "budget_state_invalid"}
     return {"branch_id": branch["id"], "parent_id": branch.get("parent_id"),
             "status": branch["status"], "result": clip(result.get("result", ""), cfg["max_parent_result_chars"]),
             "what_changed": clip(result.get("what_changed", "Nothing"), 350),
@@ -687,7 +794,7 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
     root_id = root["id"]
     if _budget is None:
         path = budget_path(root_id)
-        saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        saved = load_json_if_exists(path)
         budget = RunBudget(root_id, cfg, saved, lambda state: save_budget(root_id, state))
         if saved is None and (parent or existing_id):
             # Pre-upgrade usage is unknown. Charge existing branch slots so a
@@ -827,7 +934,8 @@ TOOLS = [
     {"name": "branch_get", "description": "Read an earlier branch result by ID. Full transcript available only when save_transcripts was explicitly enabled.",
      "inputSchema": {"type":"object", "properties": {"branch_id": {"type":"string"}, "include_transcript": {"type":"boolean", "default":False}}, "required": ["branch_id"]}},
     {"name": "branch_list", "description": "List recent local context branches and their states.", "inputSchema": {"type":"object", "properties": {}}},
-    {"name": "branch_health", "description": "Check Jan's local API connection and show the model ID used for new branches.", "inputSchema": {"type":"object", "properties": {}}}
+    {"name": "branch_health", "description": "Check Jan's local API connection and show the model ID used for new branches.", "inputSchema": {"type":"object", "properties": {}}},
+    {"name": "branch_cleanup", "description": "Prune stale parent/child links and orphaned budget files left by interrupted branch activity.", "inputSchema": {"type":"object", "properties": {}}}
 ]
 
 
@@ -850,12 +958,34 @@ def dispatch_tool(name, args):
             try:
                 with path.open(encoding="utf-8") as fh:
                     b = json.load(fh)
-                found.append({"branch_id": b["id"], "parent_id": b["parent_id"], "status": b["status"],
-                              "task": clip(b["task"], 110), "updated": b["updated"]})
-            except (OSError, KeyError, ValueError):
+                if not isinstance(b, dict):
+                    continue
+                if not isinstance(b.get("id"), str):
+                    continue
+                found.append({"branch_id": b["id"], "parent_id": b.get("parent_id"), "status": b.get("status"),
+                              "task": clip(b.get("task", ""), 110), "updated": b.get("updated")})
+            except (OSError, KeyError, TypeError, ValueError):
                 continue
         return {"branches": found}
     if name == "branch_health":
+        ensure_store()
+        valid_branch_ids = set()
+        invalid_or_stale = 0
+        for path in sorted(DATA.glob("*.json"), key=lambda p: p.name):
+            try:
+                payload = load_json_if_exists(path)
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                invalid_or_stale += 1
+                continue
+            branch_id = payload.get("id")
+            if isinstance(branch_id, str) and re.fullmatch(r"[0-9a-f]{32}", branch_id):
+                valid_branch_ids.add(branch_id)
+        stale_budgets = 0
+        for budget_path in sorted((DATA / "budgets").glob("*.json"), key=lambda p: p.name):
+            if budget_path.stem not in valid_branch_ids:
+                stale_budgets += 1
         ids = available_models(cfg)
         model = ids[0] if cfg["model"] == "auto" else cfg["model"]
         if model not in ids:
@@ -863,7 +993,12 @@ def dispatch_tool(name, args):
         return {"ok": True, "api": cfg["api_base_url"], "model": model,
                 "check": "models_endpoint_reachable_and_model_advertised; generation_not_tested",
                 "transcripts_saved": cfg["save_transcripts"], "read_only_project_root": cfg["read_only_project_root"] or "disabled",
-                "context_limit_tokens": cfg["context_limit_tokens"]}
+                "context_limit_tokens": cfg["context_limit_tokens"],
+                "store_state": {"branch_files": len(list(DATA.glob("*.json"))), "stale_or_invalid_files": invalid_or_stale,
+                                "budget_files": len(list((DATA / "budgets").glob("*.json"))), "stale_budget_files": stale_budgets}}
+    if name == "branch_cleanup":
+        report = cleanup_orphaned_state()
+        return {"ok": True, "cleanup": report}
     raise ValueError("Unknown tool: " + str(name))
 
 
