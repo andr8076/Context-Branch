@@ -250,6 +250,36 @@ class AdaptiveGuardTests(unittest.TestCase):
         self.assertTrue(compacted)
         self.assertIn('MANDATORY RECOVERY', json.dumps(compacted[0]))
 
+    def test_post_resume_checkpoint_compacts_rejected_logs_and_finishes(self):
+        class RejectedAfterResume(NestedFake):
+            rejected = 0
+
+            def __call__(self, method, url, cfg, payload=None):
+                messages = payload.get('messages', []) if payload else []
+                resumed = any('ADAPTIVE BRANCH RESUME FROM MARKER' in m.get('content', '')
+                              for m in messages)
+                if method == 'POST' and resumed and self.rejected < 4:
+                    self.rejected += 1
+                    self.messages_seen.append(json.loads(json.dumps(messages)))
+                    answer = json.dumps({'action': 'repair', 'release': 'REL-WRONG',
+                                         'route': 'ROUTE-WRONG', 'certificate': 'CERT-WRONG'})
+                    return {'choices': [{'message': {'content': answer}, 'finish_reason': 'stop'}],
+                            'usage': {'prompt_tokens': len(json.dumps(messages)) // 4,
+                                      'completion_tokens': len(answer) // 4}}
+                return super().__call__(method, url, cfg, payload)
+
+        result, fake = self.run_case(RejectedAfterResume(), _adaptive_surprise_levels=1)
+        self.assertEqual(result['verified_cases'], 1, result['error'])
+        self.assertGreater(result['adaptive_post_resume_checkpoints'], 0)
+        self.assertEqual(result['adaptive_post_resume_context_failures'], 0)
+        self.assertEqual(result['adaptive_post_resume_verified'], 1)
+        checkpoint_messages = [msgs for msgs in fake.messages_seen
+                               if 'explicitly rejected or blocked observations were compacted'
+                               in json.dumps(msgs)]
+        self.assertTrue(checkpoint_messages)
+        self.assertIn('ADAPTIVE BRANCH RESUME FROM MARKER',
+                      json.dumps(checkpoint_messages[0]))
+
     def test_pre_surprise_context_failure_is_separate(self):
         result, _ = self.run_case(_context_limit=400)
         self.assertEqual(result['error_type'], 'context_capacity_exceeded_estimate')

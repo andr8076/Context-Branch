@@ -801,6 +801,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         "adaptive_post_resume_decisions": 0,
         "adaptive_post_resume_actions": 0,
         "adaptive_post_resume_verified": 0,
+        "adaptive_post_resume_checkpoints": 0,
+        "adaptive_post_resume_context_failures": 0,
         "adaptive_events": [],
         "partial_failure": False, "interrupted_batch": None,
         "nested_depth": nested_depth, "nested_log_lines": nested_log_lines,
@@ -912,7 +914,9 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                             "adaptive_child_transcript_leaks",
                             "adaptive_child_resolutions", "adaptive_nested_blocker_failures",
                             "adaptive_post_resume_decisions",
-                            "adaptive_post_resume_actions", "adaptive_post_resume_verified"):
+                            "adaptive_post_resume_actions", "adaptive_post_resume_verified",
+                            "adaptive_post_resume_checkpoints",
+                            "adaptive_post_resume_context_failures"):
                         result[key] += retry_stats.get(key, 0)
                     result["out_of_scope_actions"] += sum(
                         e.get("rejected_out_of_scope", 0) for e in nested_events)
@@ -1145,7 +1149,9 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                         "adaptive_child_transcript_leaks",
                         "adaptive_child_resolutions", "adaptive_nested_blocker_failures",
                         "adaptive_post_resume_decisions",
-                        "adaptive_post_resume_actions", "adaptive_post_resume_verified"):
+                        "adaptive_post_resume_actions", "adaptive_post_resume_verified",
+                        "adaptive_post_resume_checkpoints",
+                        "adaptive_post_resume_context_failures"):
                     result[key] += retry_stats.get(key, 0)
                 result["out_of_scope_actions"] += sum(
                     e.get("rejected_out_of_scope", 0) for e in adaptive_events)

@@ -14,10 +14,11 @@ still stops the trial. Parent checkpointing does not change saved resume markers
 JSON, CSV and SUMMARY.md expose `adaptive_repeated_stage_rejections`,
 `adaptive_stage_corrections`, the recovery-only compatibility counters
 `adaptive_repeated_recovery_rejections` and `adaptive_recovery_corrections`,
-`adaptive_parent_checkpoints`, and `adaptive_pre_surprise_context_failures`. The
-last metric counts context-related stops before any surprise, independently of
-child branch failures. Adaptive parent API calls now contribute to
-`peak_main_prompt_tokens`.
+`adaptive_parent_checkpoints`, `adaptive_post_resume_checkpoints`,
+`adaptive_pre_surprise_context_failures`, and
+`adaptive_post_resume_context_failures`. The last two metrics separate context
+stops before the surprise from context stops after the parent resumes. Adaptive
+parent API calls now contribute to `peak_main_prompt_tokens`.
 
 ## Context recycling
 

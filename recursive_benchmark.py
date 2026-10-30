@@ -703,6 +703,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         'adaptive_child_transcript_leaks': 0, 'adaptive_child_resolutions': 0,
         'adaptive_post_resume_decisions': 0, 'adaptive_post_resume_actions': 0,
         'adaptive_post_resume_verified': 0,
+        'adaptive_post_resume_checkpoints': 0,
+        'adaptive_post_resume_context_failures': 0,
         # The recovery-only counters remain for compatibility.  These broader
         # counters also cover the prerequisite reconstruction stages (index and
         # escrow), which can otherwise consume the parent action budget before
@@ -780,7 +782,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         'context_reclaimed_tokens': 0,
         'child_transcript_exposed': False, 'child_resolved_blocker': False,
         'post_resume_decisions': 0, 'post_resume_actions': 0,
-        'post_resume_verified': False,
+        'post_resume_verified': False, 'post_resume_checkpoints': 0,
+        'post_resume_context_failure': False,
     }
     events.append(parent_event)
     parent_base = copy.deepcopy(parent_context)
@@ -790,18 +793,80 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     correction = None
 
     def checkpoint_parent():
-        # Retain every distinct observed exchange, including successful changes
-        # and rejection outcomes. Never reconstruct evidence from the oracle.
-        rebuilt = copy.deepcopy(parent_base)
+        """Rebuild the parent from observed exchanges without losing state evidence.
+
+        Adaptive parents can need a checkpoint after the child returns.  The
+        old pre-surprise journal only covered the initial investigation, so a
+        post-resume checkpoint must walk the actual parent messages instead.
+        It may remove exact duplicate inspections/no-action results and replace
+        only explicitly rejected or blocked observations with a short receipt.
+        Successful or ambiguous observations are retained verbatim.
+        """
+        simulator_prefix = 'SIMULATOR RESULT:\n'
+        continue_suffix = '\nContinue the parent incident. JSON action only.'
+        rebuilt = copy.deepcopy(parent_context[:2])
         rebuilt.append({'role': 'user', 'content':
-            'PARENT CONTEXT CHECKPOINT: duplicate exchanges were removed. '
-            'All distinct observed evidence and action outcomes follow; shared state persists.'})
-        for action_text, observed in parent_journal:
-            rebuilt.extend(({'role': 'assistant', 'content': action_text},
-                            {'role': 'user', 'content': observed}))
-        if correction:
-            rebuilt.append({'role': 'user', 'content': correction})
-        return rebuilt
+            'PARENT CONTEXT CHECKPOINT: duplicate no-op exchanges were removed and '
+            'explicitly rejected or blocked observations were compacted. All unique '
+            'evidence, branch receipts, and successful state changes remain verbatim; '
+            'shared state persists.'})
+        seen_pairs = set()
+        deduplicated = 0
+        compacted = 0
+        preserved = 0
+        index = 2
+        while index < len(parent_context):
+            message = parent_context[index]
+            if (message.get('role') == 'assistant' and index + 1 < len(parent_context)
+                    and parent_context[index + 1].get('role') == 'user'):
+                following = parent_context[index + 1].get('content', '')
+                if following.startswith(simulator_prefix):
+                    answer = message.get('content', '')
+                    observation = following[len(simulator_prefix):]
+                    if observation.endswith(continue_suffix):
+                        observation = observation[:-len(continue_suffix)]
+                    pair = (answer, observation)
+                    try:
+                        action = json.loads(answer) if answer else None
+                    except (TypeError, ValueError):
+                        action = None
+                    action_name = action.get('action') if isinstance(action, dict) else None
+                    first_line = observation.splitlines()[0].strip().upper() if observation else ''
+                    no_op_observation = first_line.startswith(('INVALID ACTION:', 'NO SUCH DOCUMENT.'))
+                    compacted_pair, compact_detail = compact_non_mutating_change(pair)
+                    if compact_detail is not None:
+                        answer, compact_observation = compacted_pair
+                        if compact_observation.startswith(simulator_prefix):
+                            compact_observation = compact_observation[len(simulator_prefix):]
+                        observation = compact_observation
+                        compacted += 1
+                    duplicate_is_safe = (
+                        pair in seen_pairs and
+                        (action_name == 'inspect' or no_op_observation or compact_detail is not None)
+                    )
+                    if duplicate_is_safe:
+                        deduplicated += 1
+                    else:
+                        rebuilt.extend((
+                            {'role': 'assistant', 'content': answer},
+                            {'role': 'user', 'content':
+                             simulator_prefix + observation + continue_suffix},
+                        ))
+                        preserved += 1
+                    seen_pairs.add(pair)
+                    index += 2
+                    continue
+            if (message.get('role') == 'user'
+                    and message.get('content', '').startswith('PARENT CONTEXT CHECKPOINT:')):
+                index += 1
+                continue
+            rebuilt.append(copy.deepcopy(message))
+            index += 1
+        return rebuilt, {
+            'deduplicated_exchanges': deduplicated,
+            'compacted_observations': compacted,
+            'distinct_exchanges_preserved': preserved,
+        }
 
     def record_context_reclamation(child_event, marker, resumed, receipt):
         """Record the context that disappeared at a branch boundary.
@@ -992,17 +1057,23 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                and not sim.verified):
             trace.phase = 'adaptive_parent'
             after_resume = parent_event['resumed']
-            if (not parent_event['surprise_triggered'] and
-                    bm.approximate_tokens(parent_context) + cfg['max_output_tokens'] + 256
+            current_estimate = bm.approximate_tokens(parent_context)
+            if (current_estimate + cfg['max_output_tokens'] + 256
                     >= context_limit * 0.78):
-                shorter = checkpoint_parent()
-                if bm.approximate_tokens(shorter) < bm.approximate_tokens(parent_context):
+                shorter, checkpoint_stats = checkpoint_parent()
+                shorter_estimate = bm.approximate_tokens(shorter)
+                if shorter_estimate < current_estimate:
                     parent_event.setdefault('checkpoint_details', []).append({
-                        'before_est_tokens': bm.approximate_tokens(parent_context),
-                        'after_est_tokens': bm.approximate_tokens(shorter),
-                        'distinct_exchanges_preserved': len(parent_journal)})
+                        'phase': 'post_resume' if after_resume else 'pre_surprise',
+                        'before_est_tokens': current_estimate,
+                        'after_est_tokens': shorter_estimate,
+                        **checkpoint_stats})
                     parent_context = shorter
-                    counters['adaptive_parent_checkpoints'] += 1
+                    if after_resume:
+                        counters['adaptive_post_resume_checkpoints'] += 1
+                        parent_event['post_resume_checkpoints'] += 1
+                    else:
+                        counters['adaptive_parent_checkpoints'] += 1
             before = bm.approximate_tokens(parent_context)
             action, answer, info = request_investigation_action(
                 cfg, model, parent_context, trace, bm,
@@ -1150,6 +1221,12 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                                            'context_overflow_confirmed',
                                            'context_checkpoint_blocked')):
             counters['adaptive_pre_surprise_context_failures'] += 1
+        if (parent_event.get('resumed') and
+                parent_event['status'] in ('context_capacity_exceeded_estimate',
+                                           'context_overflow_confirmed',
+                                           'context_checkpoint_blocked')):
+            counters['adaptive_post_resume_context_failures'] += 1
+            parent_event['post_resume_context_failure'] = True
         raise
     finally:
         if not success and parent_event.get('status') == 'running':

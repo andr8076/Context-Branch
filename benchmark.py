@@ -916,7 +916,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
         "adaptive_child_transcript_leaks", "adaptive_child_resolutions",
         "adaptive_nested_blocker_failures",
         "adaptive_post_resume_decisions", "adaptive_post_resume_actions",
-        "adaptive_post_resume_verified",
+        "adaptive_post_resume_verified", "adaptive_post_resume_checkpoints",
+        "adaptive_post_resume_context_failures",
         "action_schema_alias_repairs",
         "no_action_investigation_calls", "empty_investigation_replies",
         "no_action_retry_attempts", "no_action_retry_recoveries", "no_action_retry_failures", "out_of_scope_actions",
@@ -1188,8 +1189,8 @@ def write_files(directory, data, cfg, args, reset_events=None):
                       "A complete adaptive proof requires a resolved child blocker followed by fresh parent "
                       "decisions and simulator actions after the marker is restored. Verification must occur "
                       "in that resumed parent context.", "",
-                      "| Tasks | Blockers resolved by child | Parent decisions after resume | Parent actions after resume | Verified after resume |",
-                      "|---:|---:|---:|---:|---:|"]
+                      "| Tasks | Blockers resolved by child | Parent decisions after resume | Parent actions after resume | Verified after resume | Post-resume checkpoints | Post-resume context failures |",
+                      "|---:|---:|---:|---:|---:|---:|---:|"]
             for n in args.tasks:
                 rows = [r for r in data if r["tasks"] == n and r["mode"] == "adaptive"]
                 if rows:
@@ -1197,7 +1198,9 @@ def write_files(directory, data, cfg, args, reset_events=None):
                         f"| {n} | {sum(r.get('adaptive_child_resolutions', 0) for r in rows)} | "
                         f"{sum(r.get('adaptive_post_resume_decisions', 0) for r in rows)} | "
                         f"{sum(r.get('adaptive_post_resume_actions', 0) for r in rows)} | "
-                        f"{sum(r.get('adaptive_post_resume_verified', 0) for r in rows)} |")
+                                 f"{sum(r.get('adaptive_post_resume_verified', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_post_resume_checkpoints', 0) for r in rows)} | "
+                                 f"{sum(r.get('adaptive_post_resume_context_failures', 0) for r in rows)} |")
         lines += ["", "A repair is counted as **verified** only after the AI successfully submits a policy-valid "
                   "release/route/certificate triple AND requests verification. A plausible written answer is not enough. "
                   "Wrong repairs return noisy simulator logs, costing context; decoy documents also add context. "
