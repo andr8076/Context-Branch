@@ -125,6 +125,7 @@ class Trace:
         phase = self.phase
         started = time.perf_counter()
         row = {
+            "budget_scope": getattr(self, 'budget_scope', None),
             "phase": phase, "prompt_est_tokens": approximate_tokens(messages),
             "prompt_chars": len(json.dumps(messages, ensure_ascii=False)),
             "elapsed_seconds": None, "prompt_tokens": None,
@@ -671,6 +672,8 @@ def arguments(argv=None):
     parser.add_argument("--check-llama-server", action="store_true", help="Validate binary and model without starting the server or running trials")
     parser.add_argument("--reuse-llama", action="store_true", help="Opt out of fresh llama-server between trials (by default each trial uses a NEW process)")
     parser.add_argument("--scenario", choices=("archive", "repair"), default="archive", help="Archive lookups (legacy) or stateful repair traps (new)")
+    parser.add_argument('--surprise-workload', choices=('shared', 'none', 'legacy'), default='shared',
+                        help='Repair disturbance: shared across all modes (default), none, or legacy adaptive-only')
     parser.add_argument("--modes", choices=("linear", "summarized", "branch", "recursive", "autonomous", "adaptive"),
                         nargs="+", default=["linear", "summarized", "branch"],
                         help="Competitors to run; add recursive, autonomous or adaptive branching (repair only)")
@@ -862,7 +865,8 @@ def write_files(directory, data, cfg, args, reset_events=None, run_status="compl
                   "scoring_version": 3,
                   "simulator_rules_version": 2,
                   "mandatory_authority_inspection": args.scenario == "repair",
-                  "benchmark_version": "1.12.1", "scenario": args.scenario,
+                  "benchmark_version": "1.13.0", "scenario": args.scenario,
+                  "surprise_workload": args.surprise_workload,
                   "adaptive_max_depth": args.adaptive_max_depth,
                   "adaptive_max_children": args.adaptive_max_children,
                   "adaptive_max_calls": args.adaptive_max_calls,
@@ -1308,7 +1312,8 @@ def main(argv=None):
             puzzle = create_trap_puzzle(seed, n, args.trap_log_lines, args.trap_density, args.recovery_log_lines,
                                         args.nested_depth, args.nested_log_lines,
                                         args.pressure_records, args.pressure_detail_chars,
-                                        adaptive_surprise=("adaptive" in args.modes))
+                                        adaptive_surprise=(args.surprise_workload == 'shared' or
+                                            (args.surprise_workload == 'legacy' and 'adaptive' in args.modes)))
             mandatory_paths = {"registry/releases", "registry/approvals", "network/aliases",
                                "network/routes", "security/certificates"} | {
                                path for path in puzzle["cases"][0]["docs"]
@@ -1398,6 +1403,7 @@ def main(argv=None):
     cfg["_summary_retries"] = args.summary_retries
     cfg["_context_memory_threshold"] = args.context_memory_threshold
     cfg["_early_branch_threshold"] = args.early_branch_threshold
+    cfg['_surprise_workload'] = args.surprise_workload
     cfg["_memory_max_chars"] = args.summary_max_chars
     # Per-request control is best-effort: older llama.cpp builds may ignore it.
     cfg["_report_reasoning_effort"] = "none" if args.engine == "llama" and args.report_reasoning == "none" else None

@@ -719,7 +719,7 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     this function measures adaptive context escape and verified resume.
     """
     from trap_benchmark import request_investigation_action
-    from context_memory import benchmark_memory, predicted_tokens, archive_observation
+    from context_memory import benchmark_memory, predicted_tokens, archive_observation, context_budget
 
 
     events = []
@@ -775,9 +775,15 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
                 raise AdaptiveStop('context_isolation_violation')
         if request_count >= max_calls:
             raise AdaptiveStop('model_call_budget_exhausted')
-        estimate = predicted_tokens(prompt, bm.approximate_tokens, trace.calls)
         reserve = max(cfg.get('max_output_tokens', 1024), cfg.get('_summary_output_tokens', 0)) if trace.phase.startswith('parent_summary') else cfg.get('max_output_tokens', 1024)
-        if estimate + reserve > context_limit:
+        scope = sim.stall_scope
+        check = context_budget(prompt, bm.approximate_tokens, trace.calls, scope, reserve, context_limit)
+        trace.budget_scope = scope
+        if not hasattr(trace, 'context_budget_checks'):
+            trace.context_budget_checks = []
+        trace.context_budget_checks.append(dict(check, phase=trace.phase))
+        estimate = check['prompt_estimate']
+        if not check['fits']:
             raise AdaptiveStop('context_capacity_exceeded_estimate')
         if tokens_used() + estimate + reserve > max_tokens:
             raise AdaptiveStop('token_budget_exhausted')
@@ -1163,11 +1169,13 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
             trace.phase = 'adaptive_parent'
             after_resume = parent_event['resumed']
             maintain_parent()
-            current_estimate = bm.approximate_tokens(parent_context)
-            if (current_estimate + cfg['max_output_tokens'] + 256
-                    >= context_limit * 0.78):
+            check = context_budget(parent_context, bm.approximate_tokens, trace.calls,
+                                   sim.stall_scope, cfg['max_output_tokens'], context_limit)
+            current_estimate = check['prompt_estimate']
+            if check['required_tokens'] + 256 >= context_limit * 0.78:
                 shorter, checkpoint_stats = checkpoint_parent()
-                shorter_estimate = bm.approximate_tokens(shorter)
+                shorter_estimate = context_budget(shorter, bm.approximate_tokens, trace.calls,
+                    sim.stall_scope, cfg['max_output_tokens'], context_limit)['prompt_estimate']
                 if shorter_estimate < current_estimate:
                     parent_event.setdefault('checkpoint_details', []).append({
                         'phase': 'post_resume' if after_resume else 'pre_surprise',

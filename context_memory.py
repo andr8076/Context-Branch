@@ -34,6 +34,18 @@ def archive_snapshot(archives, messages):
     return f"archive/{len(archives)}"
 
 
+def context_budget(messages, estimate, calls, scope, output_tokens, limit):
+    """One accounting rule for cleanup and admission; calibrate within a conversation."""
+    observations = [row for row in calls if row.get('budget_scope') == scope]
+    raw = estimate(messages)
+    predicted = predicted_tokens(messages, estimate, observations)
+    return {'scope': scope, 'raw_prompt_estimate': raw,
+            'prompt_estimate': predicted, 'output_reserve': output_tokens,
+            'context_limit': limit, 'calibration_samples': len(observations),
+            'required_tokens': predicted + output_tokens,
+            'fits': predicted + output_tokens <= limit}
+
+
 def archive_note(archives):
     return (f"Historical observations are archived as archive/1 through archive/{len(archives)}. "
             "Retrieve a numbered archive in small ranges if memory omits a necessary detail. "

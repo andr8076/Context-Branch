@@ -365,6 +365,8 @@ ACTION_SYSTEM = (
     'To unlock the approvals ledger: {"action":"recover","token":"<joined fragments>"}. '
     'To repair: {"action":"repair","release":"REL-...","route":"ROUTE-...","certificate":"CERT-..."}. '
     'Then verify: {"action":"verify"}. '
+    'If a simulator observation exposes an unexpected blocker, inspect its stated document path '
+    'and resolve it with {"action":"resolve_blocker","token":"<observed token>","level":1}. '
     "Only document paths listed in guide/index can be inspected. Recovery is mandatory in every incident: "
     "first solve any nested index and escrow prerequisites in guide/index. "
     "For EACH prerequisite inspect BOTH matching CURRENT shards, and join in the listed order. "
@@ -747,10 +749,12 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         raise ValueError(f"Unknown mode {mode}")
     if max_actions < 2:
         raise ValueError("max_actions must be >= 2")
+    workload = cfg.get('_surprise_workload', 'legacy')
+    surprise = workload == 'shared' or (workload == 'legacy' and mode == 'adaptive')
     puzzle = create_trap_puzzle(seed, tasks, trap_log_lines, trap_density, recovery_log_lines,
                                 nested_depth, nested_log_lines, pressure_records,
-                                pressure_detail_chars, adaptive_surprise=(mode == "adaptive"))
-    if mode == "adaptive":
+                                pressure_detail_chars, adaptive_surprise=surprise)
+    if surprise:
         for case in puzzle["cases"]:
             case["adaptive_surprise_levels"] = cfg.get("_adaptive_surprise_levels", 1)
             case["adaptive_nested_tokens"] = {}
@@ -1228,6 +1232,8 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         result["failed_phase"] = stage
         result["final_status"] = result["error_type"] if stage == "final_report" else "not_attempted"
     finally:
+        result['context_budget_checks'] = getattr(trace, 'context_budget_checks', [])
+        result['surprise_workload'] = workload
         visible = result.get("visible_seals", {})
         result["final_recovered_subtasks"] = sum(
             result["reported_answers"].get(name) != truth and visible.get(name) == truth
