@@ -27,6 +27,7 @@ from branch_runtime import (DelegationRefused, RunBudget, RunLimitExceeded,
                             task_fingerprint, task_identity)
 
 from context_memory import MEMORY_REQUEST, archive_snapshot, archive_note, read_archive
+from receipt_archive import ReceiptArchive
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "config.json"
@@ -550,8 +551,15 @@ def search_project(cfg, query):
     return "\n".join(matches) if matches else "No matches in scanned project files"
 
 
-def agent_tools(cfg, depth, has_archives=False):
+def agent_tools(cfg, depth, has_archives=False, has_receipts=False):
     tools = []
+    if has_receipts or depth < cfg["max_branch_depth"]:
+        tools.append({"type": "function", "function": {"name": "read_child_evidence",
+        "description": "Read a bounded historical message from a returned child receipt archive. Use its sources indexes; observations may be stale.",
+        "parameters": {"type": "object", "properties": {
+            "archive": {"type": "string"}, "message_index": {"type": "integer"},
+            "start": {"type": "integer"}, "limit": {"type": "integer"}},
+            "required": ["archive", "message_index"]}}})
     if cfg.get("context_memory", False) and has_archives:
         tools.append({"type": "function", "function": {"name": "read_context_archive",
             "description": "Retrieve exact historical observations omitted from working memory. Use small character ranges; historical data may be stale.",
@@ -577,7 +585,8 @@ def format_parent(branch, cfg, data_dir=None):
                 usage = RunBudget(root_id, cfg, ledger).public()
             except (TypeError, ValueError):
                 usage = {"root_id": root_id, "error": "budget_state_invalid"}
-    return {"branch_id": branch["id"], "parent_id": branch.get("parent_id"),
+    return {"receipt": branch.get("receipt"),
+            "branch_id": branch["id"], "parent_id": branch.get("parent_id"),
             "status": branch["status"], "result": clip(result.get("result", ""), cfg["max_parent_result_chars"]),
             "what_changed": clip(result.get("what_changed", "Nothing"), 350),
             "next_step": clip(result.get("next_step", ""), 500),
@@ -599,6 +608,8 @@ def message_content(answer):
 
 def nested_handoff(child):
     """Keep a bounded JSON receipt; never cut serialized child JSON mid-field."""
+    if child.get("receipt"):
+        return child["receipt"]
     data = {key: child[key] for key in ("branch_id", "parent_id", "status", "result",
             "what_changed", "next_step", "caveats", "stop_reason", "verification")}
     data["subbranch_count"] = len(child.get("subbranches", []))
@@ -829,7 +840,7 @@ def compact_working_memory(cfg, model, messages, tools, budget, metrics, archive
 
 
 def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None, _budget=None,
-               *, api=None, data_dir=None):
+               *, api=None, data_dir=None, _receipt_fits=None):
     task = clip(task, cfg["max_context_chars"])
     relevant_context = clip(relevant_context, cfg["max_context_chars"])
     if not task:
@@ -888,10 +899,15 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
         budget.add_branch(task_fingerprint(task, relevant_context))
     branch["root_id"] = root_id
     branch["status"] = "running"
+    branch.pop("receipt", None)
     branch.pop("stop_reason", None)
+    receipt_ids = branch.setdefault("receipt_archives", [])
+    receipt_store = ReceiptArchive(Path(data_dir or DATA) / "receipts")
     archives = branch.setdefault("context_archives", [])
     if existing_id and archives and not cfg["save_transcripts"]:
         messages.append({"role": "user", "content": archive_note(archives)})
+    if existing_id and receipt_ids:
+        messages.append({"role": "user", "content": "Available child evidence archives: " + json.dumps(receipt_ids)})
     metrics = {"model_calls": 0, "checkpoints": 0, "no_action_retries": 0,
                "repaired_transcript_fragments": repaired, "calls": []}
     save_branch(branch, data_dir)
@@ -908,12 +924,12 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
             model = chosen_model(request_cfg, api)
             branch["model"] = model
             save_branch(branch, data_dir)
-        tools = agent_tools(cfg, branch["depth"], bool(archives))
+        tools = agent_tools(cfg, branch["depth"], bool(archives), bool(receipt_ids))
         final = None
         for _ in range(cfg["max_agent_turns"]):
             if compact_working_memory(cfg, model, messages, tools, budget, metrics, archives, api):
                 save_branch(branch, data_dir)
-                tools = agent_tools(cfg, branch["depth"], bool(archives))
+                tools = agent_tools(cfg, branch["depth"], bool(archives), bool(receipt_ids))
             answer = request_branch_reply(cfg, model, messages, tools, budget, metrics, api)
             calls = answer.get("tool_calls") or []
             content = message_content(answer)
@@ -929,6 +945,20 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
                         if not isinstance(args, dict):
                             raise ValueError("Expected arguments object")
                         name = spec.get("name")
+                        def fits_tool(text):
+                            candidate = messages + [{"role": "tool", "tool_call_id": call["id"], "content": text}]
+                            return (budget.predicted_prompt(candidate, tools) + cfg["max_output_tokens"]
+                                    + cfg["context_safety_tokens"] <= cfg["context_limit_tokens"])
+                        def accept_child(child):
+                            output = nested_handoff(child)
+                            if child.get("receipt"):
+                                identifier = json.loads(child["receipt"].split("\n", 1)[1])["archive"]
+                                if identifier not in receipt_ids:
+                                    receipt_ids.append(identifier)
+                                save_branch(branch, data_dir)
+                            if len(output) > 4500 or not fits_tool(output):
+                                raise RunLimitExceeded("context_limit", "Child handoff does not fit parent context")
+                            return output
                         if name == "read_project_file" and cfg["read_only_project_root"]:
                             output = read_project(cfg, args.get("path", ""),
                                                   args.get("start_line", 1), args.get("max_lines", 80))
@@ -944,11 +974,20 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
                                     f"to this goal: {branch['task']}. Include exact identifiers and source lines; "
                                     "report uncertainty and whether more evidence is needed.",
                                     relevant_context=relevant_context,
-                                    parent_id=branch["id"], _budget=budget, api=api, data_dir=data_dir)
+                                    parent_id=branch["id"], _budget=budget, api=api, data_dir=data_dir,
+                                    _receipt_fits=fits_tool)
                                 if child["branch_id"] not in branch["subbranches"]:
                                     branch["subbranches"].append(child["branch_id"])
-                                output = "EARLY ISOLATED INVESTIGATION (model-reported, not a raw source read):\n" + nested_handoff(child)
+                                output = accept_child(child)
                                 metrics["early_branches"] = metrics.get("early_branches", 0) + 1
+                        elif name == "read_child_evidence":
+                            if args.get("archive") not in receipt_ids:
+                                raise ValueError("Archive was not returned to this branch")
+                            fragment = receipt_store.retrieve(args["archive"], args.get("message_index"),
+                                                              args.get("start", 0), args.get("limit", 1200))
+                            output = json.dumps(fragment, ensure_ascii=False)
+                            if len(output) > 4500 or not fits_tool(output):
+                                raise ValueError("Evidence range does not fit parent budget; request a smaller range")
                         elif name == "read_context_archive" and cfg.get("context_memory", False):
                             output = read_archive(archives, args.get("path", ""),
                                                   args.get("start", 0), args.get("limit", 2400))
@@ -957,10 +996,10 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
                         elif name == "solve_nested_branch" and branch["depth"] < cfg["max_branch_depth"]:
                             child = run_branch(cfg, args.get("task", ""), args.get("relevant_context", ""),
                                                parent_id=branch["id"], _budget=budget,
-                                               api=api, data_dir=data_dir)
+                                               api=api, data_dir=data_dir, _receipt_fits=fits_tool)
                             if child["branch_id"] not in branch["subbranches"]:
                                 branch["subbranches"].append(child["branch_id"])
-                            output = nested_handoff(child)
+                            output = accept_child(child)
                         else:
                             output = "Unsupported or disabled tool"
                     except RunLimitExceeded:
@@ -1025,6 +1064,32 @@ def run_branch(cfg, task, relevant_context="", parent_id=None, existing_id=None,
             metrics["repaired_transcript_fragments"] += dropped
         else:
             branch.pop("transcript", None)
+        # Preserve earlier compacted observations as well as the final working
+        # conversation. Receipt generation uses the existing structured result,
+        # so it requires no additional model call or uncharged inference.
+        if parent_id:
+            evidence = [message for snapshot in archives for message in snapshot] + list(messages)
+            outcome = branch.get("outcome", {})
+            report = {"outcome": branch["status"],
+                      "findings": clip(outcome.get("result", ""), 1000),
+                      "sources": "Historical message indexes (role): " + clip(
+                          ", ".join(f"{i}:{m.get('role')}" for i, m in enumerate(evidence)), 500),
+                      "changes": "Nothing; runtime tools are read-only",
+                      "unresolved": clip(outcome.get("caveats", "") + " Next: " + outcome.get("next_step", ""), 500)}
+            staged = []
+            try:
+                receipt_store.handoff(staged, evidence, report,
+                    fits=lambda candidate: _receipt_fits(candidate[-1]["content"]) if _receipt_fits else True)
+                branch["receipt"] = staged[-1]["content"]
+                messages.clear()
+            except Exception as ex:
+                # Keep a recovery copy even when optional transcript saving is off.
+                branch["transcript"] = evidence
+                branch["status"] = "blocked"
+                branch["stop_reason"] = "receipt_handoff_failed"
+                branch["outcome"] = {"status": "blocked", "result": "Child receipt handoff failed",
+                    "what_changed": "Nothing", "next_step": "Recover retained child evidence before retrying",
+                    "caveats": f"{type(ex).__name__}: {str(ex)[:300]}"}
         branch["runtime"] = metrics
         branch["usage"] = budget.public()
         branch["updated"] = utcnow()

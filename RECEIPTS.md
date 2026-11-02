@@ -1,8 +1,10 @@
 # Receipt and evidence lifecycle
 
-`receipt_archive.ReceiptArchive` is a standalone, domain-independent component.
-It is not yet wired into the existing model runtime or simulator controllers.
-The caller generates the receipt and supplies its context-budget predicate.
+`receipt_archive.ReceiptArchive` is wired into `branch_context.run_branch`.
+Nested and automatically isolated child work returns a durable receipt before
+the parent resumes. Simulator controllers are separate and do not yet use it.
+The runtime derives receipts from the existing structured final response;
+there is no additional receipt-generation model call.
 
 Receipts contain outcome, findings, sources, changes, and unresolved issues.
 All five fields are text. They are capped as a whole and marked model-reported
@@ -29,6 +31,7 @@ Run the model-free lifecycle checks:
 
 ```bash
 python3 -m unittest discover -s tests -p test_receipt_archive.py -v
+python3 -m unittest discover -s tests -p test_runtime_receipts.py -v
 ```
 
 The continuation test intentionally omits an exact value from the receipt,
@@ -37,7 +40,24 @@ it in a subsequent calculation. Other checks exercise verification failure,
 storage failure, budget refusal, and invalid archive references. They prove
 controller behavior, not a model's ability to write or interpret good receipts.
 
-Next integration gate: expose this lifecycle through the general runtime's
-child-return and evidence-read tools, charge retrieval to its shared budgets,
-and test receipt generation and later retrieval with scripted model replies.
-Keep the existing runtime behavior until that integration is tested.
+Runtime receipts remain model-reported and preserve success/partial/blocked
+status, findings, a historical message-index directory, and unresolved work.
+Evidence includes prior working-memory snapshots. The parent can call
+`read_child_evidence(archive, message_index, start=0, limit=1200)` for exact
+omitted details, including on a later `branch_resume`. Only archives returned
+to that branch are accessible through this tool. Retrieval occupies a normal
+tool turn; subsequent inference uses the shared root call/token budget.
+Both receipts and retrieval are checked against calibrated prompt estimates,
+tool schemas, output reserve, and context safety allowance. Oversized retrieval
+is refused rather than cutting serialized JSON. Token estimates remain estimates.
+
+Archives persist under the branch data directory's `receipts/`, even with
+`save_transcripts=false`. If a receipt cannot be stored or admitted, the runtime
+reports a blocked handoff and retains a recovery transcript. Optional saved
+transcripts are not erased. Disk retention/garbage collection is not implemented.
+
+The scripted runtime tests cover continuation after release, later retrieval,
+shared accounting, partial outcomes, storage failures, budget refusal, and
+oversized receipts. They establish controller behavior, not universal model
+reliability or net inference savings. The next live test should target this
+runtime path; simulator benchmarks do not test this integration.
