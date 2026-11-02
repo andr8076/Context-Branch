@@ -5,7 +5,11 @@ OpenAI-compatible API. It is a bounded assistant/runtime, not an independent
 verification system: a `success` status is the model's report, and conclusions
 still need review against authoritative sources.
 
-## v1.12 — evidence-preserving benchmark policy
+## v1.12.1 — evidence-preserving benchmark policy
+
+Stall guards now count repeated actions separately in each parent and child
+conversation. Completed-stage receipts name the next step, and an unverified
+case at its action limit reports `action_budget_exhausted` explicitly.
 
 Unfinished repair investigations keep their exact evidence. Adaptive mode isolates
 each index, escrow and recovery investigation before its first shard read, using

@@ -125,9 +125,17 @@ def verified_handoff(child, sim):
     if not stage_done(child, sim):
         raise ValueError('Cannot hand off an unverified stage')
     return {
-        'index': 'index rebuilt; escrow shards unlocked',
-        'escrow': 'escrow unlocked; recovery shards unlocked',
-        'recovery': 'approval ledger recovered; registry/approvals unlocked',
+        'index': ('index rebuilt; escrow shards unlocked. Next: inspect escrow/shard-a and '
+                  'escrow/shard-b, then unlock_escrow with the exact joined CURRENT token. '
+                  'Recovery is still gated by escrow; do not repeat index'),
+        'escrow': ('escrow unlocked; recovery shards unlocked. Next: inspect recovery/shard-a '
+                   'and recovery/shard-b, then recover with the exact joined CURRENT token. '
+                   'Do not repeat index or escrow'),
+        'recovery': ('approval ledger recovered; registry/approvals unlocked. Next: inspect '
+                     'guide/policy and all five authoritative documents: registry/releases, '
+                     'registry/approvals, network/aliases, network/routes, security/certificates. '
+                     'Apply the observed policy; keep each route paired with its own certificate. '
+                     'Then repair and verify. Do not repeat prerequisite investigations'),
         'repair': 'repair verified by simulator',
     }[child]
 
@@ -368,6 +376,7 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
         # All later evidence interpretation and repairs keep full reasoning.
         stage_start_limit = cfg.get('_stage_start_inspects', 0)
         while sim.actions < max_actions and not stage_done(stage, sim):
+            sim.stall_scope = f'recursive:{id(event)}:{stage}'
             maintain_stage()
             starting = (event['stage_start_inspections'] < stage_start_limit
                         and not event['stage_start_disabled'])
@@ -571,6 +580,7 @@ def solve_autonomous_case(sim, case, cfg, model, trace, bm, max_actions,
             while (sim.actions + counters['delegate_attempts'] < max_actions
                    and autonomous_tokens_used() < max_tokens
                    and not stage_done(stage, sim)):
+                sim.stall_scope = f'autonomous:{id(event)}:{stage}'
                 phase = f'branch_autonomous_{depth}_{stage}'
                 try:
                     action, answer, info = request_investigation_action(
@@ -979,6 +989,7 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         try:
             while (sim.actions < max_actions and tokens_used() < max_tokens
                    and not resolved()):
+                sim.stall_scope = f'adaptive_child:{id(child_event)}'
                 trace.phase = 'branch_adaptive_child'
                 action, answer, info = request_investigation_action(
                     cfg, model, child_context, trace, bm,
@@ -1148,6 +1159,7 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     try:
         while (sim.actions < max_actions and tokens_used() < max_tokens
                and not sim.verified):
+            sim.stall_scope = 'adaptive_parent'
             trace.phase = 'adaptive_parent'
             after_resume = parent_event['resumed']
             maintain_parent()

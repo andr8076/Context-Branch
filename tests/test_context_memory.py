@@ -150,6 +150,43 @@ class MemoryTests(unittest.TestCase):
         sim.step(action)
         self.assertEqual(sim.actions, 3)
 
+    def test_parent_reads_do_not_trip_child_stall_guard(self):
+        case = tb.create_trap_puzzle(17, 1)['cases'][0]
+        sim = tb.RepairSimulator(case, stall_limit=3)
+        action = {'action': 'inspect', 'path': 'guide/index'}
+        sim.stall_scope = 'parent'
+        sim.step(action)
+        sim.step(action)
+        sim.stall_scope = 'child:index'
+        sim.step(action)
+        sim.step(action)
+        with self.assertRaises(tb.InvestigationStalled):
+            sim.step(action)
+        sim.stall_scope = 'parent'
+        with self.assertRaises(tb.InvestigationStalled):
+            sim.step(action)
+        self.assertEqual(sim.actions, 4)
+
+    def test_action_limit_failure_has_explicit_trial_error(self):
+        cfg = dict(bc.DEFAULTS, _recursive_max_depth=3)
+        with tempfile.TemporaryDirectory() as temp, patch.object(bc, 'http_json', RecursiveFakeJan()):
+            result = tb.run_trap_trial('recursive', 17, 1, cfg, 'm', 8192,
+                                      Path(temp), bm, nested_depth=2, max_actions=2)
+        self.assertEqual(result['verified_cases'], 0)
+        self.assertEqual(result['error_type'], 'action_budget_exhausted')
+        self.assertEqual(result['failed_phase'], 'investigate:batch_1')
+        self.assertIn('2/2 actions', result['error'])
+
+    def test_handoff_names_remaining_stage_and_keeps_policy_choice_with_model(self):
+        case = tb.create_trap_puzzle(17, 1)['cases'][0]
+        sim = tb.RepairSimulator(case)
+        sim.recovery_completed = True
+        receipt = rb.verified_handoff('recovery', sim)
+        self.assertIn('guide/policy', receipt)
+        self.assertIn('registry/approvals', receipt)
+        self.assertIn('each route paired with its own certificate', receipt)
+        self.assertNotIn(case['expected_repair']['route'], receipt)
+
     def test_three_isolated_stages_resume_and_verify_without_summary(self):
         parents = []
         class ReceiptAwareFake(RecursiveFakeJan):

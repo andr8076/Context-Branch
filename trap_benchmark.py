@@ -450,7 +450,8 @@ class RepairSimulator:
     history: list = field(default_factory=list)
     stall_limit: int = 0
     repeated_actions: dict = field(default_factory=dict)
-    progress_state: tuple = ()
+    progress_states: dict = field(default_factory=dict)
+    stall_scope: str = 'parent'
 
     def check_stall(self, action):
         if not self.stall_limit:
@@ -458,14 +459,16 @@ class RepairSimulator:
         state = (tuple(sorted(self.nested_completed)), self.recovery_completed,
                  self.applied, self.verified, self.surprise_triggered,
                  self.surprise_resolved, tuple(sorted(self.adaptive_nested_resolved)))
-        if state != self.progress_state:
-            self.repeated_actions.clear()
-            self.progress_state = state
+        scope = self.stall_scope
+        if state != self.progress_states.get(scope):
+            self.repeated_actions[scope] = {}
+            self.progress_states[scope] = state
+        counts = self.repeated_actions.setdefault(scope, {})
         key = json.dumps(action, sort_keys=True)
-        self.repeated_actions[key] = self.repeated_actions.get(key, 0) + 1
-        if self.repeated_actions[key] >= self.stall_limit:
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] >= self.stall_limit:
             raise InvestigationStalled(
-                f'No verified state change: action repeated {self.stall_limit} times: {key}')
+                f'No verified state change in {scope}: action repeated {self.stall_limit} times: {key}')
 
     def reject_out_of_scope(self, stage, action, paths, actions):
         """Reject a wrong-stage action without executing it in shared state."""
@@ -1043,6 +1046,10 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                                              "events": sim.history,
                                              "expected_repair_debug_only": case["expected_repair"]})
             case_recorded = True
+            if not sim.verified and sim.actions >= max_actions and result['error_type'] == 'none':
+                result['error_type'] = 'action_budget_exhausted'
+                result['error'] = f'Incident {name} remained unverified after {sim.actions}/{max_actions} actions'
+                result['failed_phase'] = f'investigate:{name}'
             if mode in ("branch", "recursive", "autonomous", "adaptive"):
                 # No model call gets the independent case history as part of the parent.
                 trace.phase = "parent_ack"

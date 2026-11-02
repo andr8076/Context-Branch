@@ -1,4 +1,11 @@
-## v1.12 — evidence-preserving benchmark policy
+## v1.12.1 — evidence-preserving benchmark policy
+
+Stall counts belong to each conversation: a parent's guide read does not count
+against a child, and returning to a parent preserves its own counts. Stage
+receipts name the next unlocked investigation and direct the repair parent to
+the policy and authoritative documents. An unverified incident at the action
+limit records `error_type=action_budget_exhausted`, even if a final report is
+subsequently generated. A valid report cannot turn an unverified case into success.
 
 Unfinished repair investigations keep their exact evidence. Adaptive mode isolates
 each index, escrow and recovery investigation before its first shard read, using

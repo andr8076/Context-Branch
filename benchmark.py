@@ -862,7 +862,7 @@ def write_files(directory, data, cfg, args, reset_events=None, run_status="compl
                   "scoring_version": 3,
                   "simulator_rules_version": 2,
                   "mandatory_authority_inspection": args.scenario == "repair",
-                  "benchmark_version": "1.12.0", "scenario": args.scenario,
+                  "benchmark_version": "1.12.1", "scenario": args.scenario,
                   "adaptive_max_depth": args.adaptive_max_depth,
                   "adaptive_max_children": args.adaptive_max_children,
                   "adaptive_max_calls": args.adaptive_max_calls,
