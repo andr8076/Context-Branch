@@ -378,7 +378,7 @@ def classify_exception(exc):
                          'context_capacity_exceeded_estimate', 'token_budget_exhausted',
                          'model_call_budget_exhausted', 'branch_depth_limit',
                          'branch_count_limit', 'nested_child_failed',
-                         'adaptive_scope_loop',
+                         'adaptive_scope_loop', 'investigation_stalled',
                          'adaptive_child_action_budget_exhausted',
                          'adaptive_child_token_budget_exhausted',
                          'context_isolation_violation'):
@@ -498,7 +498,7 @@ def compact_history(cfg, model, messages, preserved, trace, max_chars, summary_r
             trace.phase = "parent_summary" if attempt == 0 else "parent_summary_retry"
             current_messages = request_messages if attempt == 0 else messages + [
                 {"role": "user", "content": request + "\n"
-                 "Your previous summary attempt was empty or cut off. Return ONLY "
+                 "Your previous summary failed its size or completeness check. Return ONLY "
                  "a concise memory satisfying the original compaction instructions. "
                  "No analysis; stay within the stated character limit."}]
             if before_request is not None:
@@ -521,9 +521,7 @@ def compact_history(cfg, model, messages, preserved, trace, max_chars, summary_r
                 first_status = status
             if status == "success":
                 break
-            # Retry only empty or cut-off output, never a fully produced
-            # oversized note: a size violation is not safe memory compaction.
-            if status not in ("empty", "truncated_confirmed", "truncated_suspected"):
+            if status not in ("empty", "oversized", "truncated_confirmed", "truncated_suspected"):
                 break
     finally:
         trace.summary_events.append({
@@ -723,11 +721,11 @@ def arguments(argv=None):
     parser.add_argument("--summary-output-tokens", type=int, default=2048,
                         help="Output cap only for periodic summaries (default 2048)")
     parser.add_argument("--summary-retries", type=int, default=1,
-                        help="Retries for empty or truncated summaries (default 1)")
+                        help="Retries for empty, oversized or truncated summaries (default 1)")
     parser.add_argument("--context-memory-threshold", type=float, default=0.55,
-                        help="Repair working-memory trigger fraction; 0 disables active compaction")
+                        help="Completed repair history memory trigger fraction; unfinished evidence stays exact")
     parser.add_argument("--early-branch-threshold", type=float, default=0.55,
-                        help="Adaptive projected investigation trigger fraction; 0 disables early branching")
+                        help="Adaptive stage isolation: any positive value enables; 0 disables (legacy flag)")
     parser.add_argument("--summary-every", type=int, default=2, help="Summarize history after every N completed lookups, except after the last (default: 2)")
     parser.add_argument("--summary-max-chars", type=int, default=1800, help="Maximum length of each compact memory note (default: 1800 chars)")
     parser.add_argument("--trap-log-lines", type=int, default=32, help="Repair: non-authoritative log lines per trap (default 32; 0-150)")
@@ -864,7 +862,7 @@ def write_files(directory, data, cfg, args, reset_events=None, run_status="compl
                   "scoring_version": 3,
                   "simulator_rules_version": 2,
                   "mandatory_authority_inspection": args.scenario == "repair",
-                  "benchmark_version": "1.11.0", "scenario": args.scenario,
+                  "benchmark_version": "1.12.0", "scenario": args.scenario,
                   "adaptive_max_depth": args.adaptive_max_depth,
                   "adaptive_max_children": args.adaptive_max_children,
                   "adaptive_max_calls": args.adaptive_max_calls,

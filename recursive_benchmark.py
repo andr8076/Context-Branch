@@ -128,6 +128,7 @@ def verified_handoff(child, sim):
         'index': 'index rebuilt; escrow shards unlocked',
         'escrow': 'escrow unlocked; recovery shards unlocked',
         'recovery': 'approval ledger recovered; registry/approvals unlocked',
+        'repair': 'repair verified by simulator',
     }[child]
 
 
@@ -355,7 +356,7 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
         trace.stage_archives.append({'case': case['name'], 'stage': stage, 'archives': archives})
         def maintain_stage(incoming_chars=0):
             event_memory = benchmark_memory(cfg, model, context, original_context, trace, bm,
-                archives, context_limit, incoming_chars, before_request=before_request)
+                archives, context_limit, incoming_chars, before_request=before_request, unfinished=True)
             if event_memory:
                 event.setdefault('memory_events', []).append(event_memory)
         inspected = {}  # path -> exact last simulator response, not case['docs'] or oracle
@@ -476,6 +477,12 @@ def solve_recursive_case(sim, case, cfg, model, trace, bm, max_actions, max_dept
                             'SIMULATOR RESULT:\n' + observation +
                             f'\nContinue ONLY {stage}. Output one permitted JSON action.'})
         event['completed'] = stage_done(stage, sim)
+        if event['completed']:
+            from context_memory import archive_snapshot
+            event['completed_evidence'] = {
+                'archive': archive_snapshot(archives, context),
+                'sources': sorted(inspected), 'stage': stage,
+                'receipt': verified_handoff(stage, sim)}
         event['status'] = 'verified' if event['completed'] else 'action_budget_exhausted'
         return event['completed']
 
@@ -1079,7 +1086,7 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
     def maintain_parent(incoming_chars=0):
         event = benchmark_memory(cfg, model, parent_context, parent_base, trace, bm,
             archives, context_limit, incoming_chars,
-            before_request=lambda prompt: before_request(prompt, parent_context))
+            before_request=lambda prompt: before_request(prompt, parent_context), unfinished=True)
         if event:
             counters['adaptive_memory_compactions'] += 1
             parent_event.setdefault('memory_events', []).append(event)
@@ -1091,20 +1098,21 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
             return None
         stage = action.get('path', '').split('/')[0]
         threshold = cfg.get('_early_branch_threshold', 0)
-        if (not threshold or stage not in ('index', 'escrow', 'recovery')
-                or stage in early_attempts or stage_done(stage, sim)):
+        if not threshold or stage not in ('index', 'escrow', 'recovery'):
+            return None
+        if stage_done(stage, sim):
+            sim.check_stall(action)
+            sim.actions += 1
+            sim.history.append({'action': dict(action), 'label': 'completed_stage_receipt',
+                                'observation_chars': 0})
+            return 'STAGE ALREADY VERIFIED: ' + verified_handoff(stage, sim)
+        if stage in early_attempts:
             return None
         dependency = prerequisite(stage, case['nested_depth'])
         if dependency and not stage_done(dependency, sim):
             return None  # The ordinary locked-source observation remains visible.
-        # Inspect source SIZE metadata only; no oracle or unseen evidence content
-        # enters the parent or the decision. Both shards belong to this investigation.
-        size = sum(len(case['docs'].get(path, '')) for path in STAGE_PATHS[stage]
-                   if path.startswith(stage + '/'))
-        projected = predicted_tokens(parent_context + [{'role': 'user', 'content': 'x' * size}],
-                                     bm.approximate_tokens, trace.calls)
-        if projected + cfg['max_output_tokens'] + 256 < context_limit * threshold:
-            return None
+        # Known simulator stage boundaries are an explicit isolation policy.
+        # Isolate before either shard, regardless of the current prompt size.
         if counters['adaptive_branches'] >= max_children:
             raise AdaptiveStop('branch_count_limit')
         early_attempts.add(stage)
@@ -1123,7 +1131,7 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         for key in ('no_actions', 'retries', 'recoveries', 'retry_failures'):
             counters[key] += stats[key]
         child = child_events[0]
-        child.update(depth=1, parent='parent', trigger='projected_evidence_pressure')
+        child.update(depth=1, parent='parent', trigger='investigation_boundary')
         events.extend(child_events)
         counters['adaptive_child_decisions'] += child['model_actions']
         counters['adaptive_child_actions'] += child['model_actions']
@@ -1131,6 +1139,8 @@ def solve_adaptive_case(sim, case, cfg, model, trace, bm, max_actions,
         if not success:
             counters['adaptive_branch_failures'] += 1
             raise AdaptiveStop('adaptive_child_action_budget_exhausted')
+        parent_event.setdefault('completed_stages', []).append({
+            'stage': stage, 'verified': True, 'receipt': verified_handoff(stage, sim)})
         # The simulator verifies only the state change, not a model's conclusion.
         return 'EARLY BRANCH VERIFIED: ' + verified_handoff(stage, sim) + '. Continue the remaining incident.'
 

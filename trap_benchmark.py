@@ -19,6 +19,10 @@ from context_memory import benchmark_memory, archive_observation
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
+class InvestigationStalled(RuntimeError):
+    error_kind = 'investigation_stalled'
+
+
 def token(rng, n=5):
     return "".join(rng.choices(ALPHABET, k=n))
 
@@ -444,9 +448,28 @@ class RepairSimulator:
     adaptive_nested_viewed: set = field(default_factory=set)
     adaptive_nested_resolved: set = field(default_factory=set)
     history: list = field(default_factory=list)
+    stall_limit: int = 0
+    repeated_actions: dict = field(default_factory=dict)
+    progress_state: tuple = ()
+
+    def check_stall(self, action):
+        if not self.stall_limit:
+            return
+        state = (tuple(sorted(self.nested_completed)), self.recovery_completed,
+                 self.applied, self.verified, self.surprise_triggered,
+                 self.surprise_resolved, tuple(sorted(self.adaptive_nested_resolved)))
+        if state != self.progress_state:
+            self.repeated_actions.clear()
+            self.progress_state = state
+        key = json.dumps(action, sort_keys=True)
+        self.repeated_actions[key] = self.repeated_actions.get(key, 0) + 1
+        if self.repeated_actions[key] >= self.stall_limit:
+            raise InvestigationStalled(
+                f'No verified state change: action repeated {self.stall_limit} times: {key}')
 
     def reject_out_of_scope(self, stage, action, paths, actions):
         """Reject a wrong-stage action without executing it in shared state."""
+        self.check_stall(action)
         self.actions += 1
         self.invalid_actions += 1
         self.history.append({"action": action, "label": "stage_scope_rejected", "observation_chars": 0})
@@ -455,6 +478,7 @@ class RepairSimulator:
                 "Do not repeat the child investigation.")
 
     def step(self, action):
+        self.check_stall(action)
         self.actions += 1
         if action is None:
             self.invalid_actions += 1
@@ -837,7 +861,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
         for case in puzzle["cases"]:
             name = case["name"]
             stage = f"investigate:{name}"
-            sim = RepairSimulator(case)
+            sim = RepairSimulator(case, stall_limit=cfg.get('_stall_limit', 3))
             active_sim = sim
             active_case = case
             case_recorded = False
@@ -857,7 +881,7 @@ def run_trap_trial(mode, seed, tasks, cfg, model, context_limit, save_dir, bm,
                 if mode != "summarized":
                     return
                 event = benchmark_memory(cfg, model, incident_msgs, incident_protected, trace,
-                    bm, archives, context_limit, incoming_chars)
+                    bm, archives, context_limit, incoming_chars, unfinished=True)
                 if event:
                     result["summaries_generated"] += 1
                     result["summary_chars_peak"] = max(result["summary_chars_peak"], event["chars"])

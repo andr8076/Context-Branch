@@ -1,31 +1,32 @@
-## v1.11 active memory comparison
+## v1.12 — evidence-preserving benchmark policy
 
-Repair mode now enables `--context-memory-threshold 0.55` and
-`--early-branch-threshold 0.55` by default. The first applies to the summarized
-baseline, adaptive parents and recursive stages. The second applies to adaptive
-prerequisite investigations before raw shard evidence enters the parent.
-For a historical comparison set both thresholds to zero explicitly.
+Unfinished repair investigations keep their exact evidence. Adaptive mode isolates
+each index, escrow and recovery investigation before its first shard read, using
+the simulator's published stage boundaries. Successful children leave a verified
+state-change receipt; their exact observed transcripts are archived with stage
+and source indexes. Hidden answers never enter model prompts.
 
-Active summaries preserve the immutable mission/incident instructions and ask
-the model to retain unfinished evidence, exact identifiers, uncertainty and next
-steps. They archive only already-visible messages. No hidden expected answer
-is supplied or restored if the model loses a fact. A model may recover detail
-with `inspect` on `archive/N`, using optional `start` character offset. Retrieval
-consumes one simulator action and is recorded in the audit trail. Archives are
-saved in the trial directory. Summary failures remain failures.
+Completed-history memory pressure uses the normal response allowance. Summary
+fit is checked separately with the summary allowance. Another summary requires
+at least 512 tokens of new context; replacements must save at least 256 tokens
+and 15%. Oversized summaries get one retry by default and are never truncated
+into acceptance. Three identical actions without a verified state change stop
+the trial with `investigation_stalled`, including repeated archive reads.
 
-The summary output reserve and observed tokenizer calibration participate in
-pressure estimates. Lookahead uses document-size metadata, not unseen content.
-A document larger than the available window can still fail; this implementation
-does not claim arbitrary-size document streaming. Stage-oriented early branches
-are benchmark-controlled and use the same shared action/call/token limits.
+`--early-branch-threshold` is retained for compatibility: any positive value
+enables stage isolation; zero disables it. `--context-memory-threshold` applies
+only to completed history. `--summary-every` controls between-case summaries.
+A one-case test should generate no mid-investigation summaries.
 
-Compare `summarized` and `adaptive` on repeated seeds at the same context limit.
-Check that `summaries_generated` is positive in the baseline, that
-`adaptive_early_branches` fires under pressure, and that final verification still
-passes. Report total inference work separately from retained-context savings.
-The existing adaptive surprise workload remains mode-specific, so this is a
-system comparison rather than a pure single-variable causal experiment.
+Start with one adaptive case, one repeat, small evidence and no extra pressure.
+Require a verified case and a correct final report before increasing the workload.
+This checks controller behavior; a longer matched comparison is still needed to
+measure net token or energy savings. The adaptive surprise workload is mode-specific.
+
+These changes concern the repair benchmark. The general runtime still uses its
+existing model-reported summaries and file-read isolation; it has no simulator
+that can certify arbitrary work as complete. Runtime archives are saved even
+when `save_transcripts` is false if `context_memory` is enabled.
 
 # Evidence-gated repairs and reproducible context-pressure experiment
 

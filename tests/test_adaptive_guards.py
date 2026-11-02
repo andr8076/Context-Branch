@@ -36,7 +36,7 @@ class NestedFake(DeliberateFakeJan):
 class AdaptiveGuardTests(unittest.TestCase):
     def run_case(self, fake=None, **overrides):
         nested_depth = overrides.pop('_nested_depth', 0)
-        cfg = {**bm.bc.DEFAULTS, 'api_base_url': 'http://fake/v1', 'max_output_tokens': 1024,
+        cfg = {**bm.bc.DEFAULTS, '_stall_limit': 0, 'api_base_url': 'http://fake/v1', 'max_output_tokens': 1024,
                'timeout_seconds': 30, '_autonomous_max_tokens': 100000,
                '_adaptive_surprise_levels': 2, '_context_limit': 8192}
         cfg.update(overrides)
@@ -330,3 +330,4 @@ class AdaptiveGuardTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

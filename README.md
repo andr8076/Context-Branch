@@ -5,59 +5,35 @@ OpenAI-compatible API. It is a bounded assistant/runtime, not an independent
 verification system: a `success` status is the model's report, and conclusions
 still need review against authoritative sources.
 
-## v1.11 — proactive context management
+## v1.12 — evidence-preserving benchmark policy
 
-Three context-saving mechanisms now work before an investigation completes:
+Unfinished repair investigations keep their exact evidence. Adaptive mode isolates
+each index, escrow and recovery investigation before its first shard read, using
+the simulator's published stage boundaries. Successful children leave a verified
+state-change receipt; their exact observed transcripts are archived with stage
+and source indexes. Hidden answers never enter model prompts.
 
-- **Early isolation:** the runtime routes large project-file reads into a child
-  when the projected parent prompt plus output reserve reaches 55% of its
-  configured window. The child gets the goal, supplied relevant context and a
-  source/range request. The parent receives a model-reported receipt, not raw
-  source text. Existing depth, branch, call, token and time limits still apply.
-  This currently covers `read_project_file`, not arbitrary third-party tools.
-- **Bounded working memory:** after removing duplicate reads, the runtime can
-  summarize unique history into a capped memory of goals, constraints, evidence
-  references, outcomes and unresolved work. Exact prior exchanges are retained
-  in local archives, accessible through `read_context_archive`. Summaries are
-  lossy model reports; archival retrieval is available when detail is missing.
-- **Active comparison baseline:** repair `summarized` mode compacts during a
-  case, including before a selected large observation enters context. It no
-  longer has to finish a case before invoking its summarizer.
+Completed-history memory pressure uses the normal response allowance. Summary
+fit is checked separately with the summary allowance. Another summary requires
+at least 512 tokens of new context; replacements must save at least 256 tokens
+and 15%. Oversized summaries get one retry by default and are never truncated
+into acceptance. Three identical actions without a verified state change stop
+the trial with `investigation_stalled`, including repeated archive reads.
 
-The adaptive repair benchmark also isolates index, escrow and recovery stages
-when their projected evidence size reaches the early-branch threshold. This
-uses published stage boundaries and document sizes, never the repair oracle.
-It is a controller policy for this simulator, not proof of general autonomous
-problem decomposition. Adaptive parents and recursive stages can use working
-memory; original task instructions survive compaction unchanged.
+`--early-branch-threshold` is retained for compatibility: any positive value
+enables stage isolation; zero disables it. `--context-memory-threshold` applies
+only to completed history. `--summary-every` controls between-case summaries.
+A one-case test should generate no mid-investigation summaries.
 
-Both benchmark thresholds default to `0.55`:
+Start with one adaptive case, one repeat, small evidence and no extra pressure.
+Require a verified case and a correct final report before increasing the workload.
+This checks controller behavior; a longer matched comparison is still needed to
+measure net token or energy savings. The adaptive surprise workload is mode-specific.
 
-```bash
---context-memory-threshold 0.55 --early-branch-threshold 0.55
-```
-
-Set either to `0` to disable that mechanism. `--summary-every` still controls
-between-case compaction for the summarized arm. `--summary-max-chars` also caps
-active benchmark memory. Summary requests and archive reads count toward the
-applicable request/token and action budgets. Summarization can fail explicitly;
-there is no guarantee that one huge observation or irreducible task will fit.
-
-For the runtime, `context_memory` and `early_branching` default to `true`, with
-`memory_max_chars: 1800`. **With context memory enabled, archived historical
-exchanges are saved locally even when `save_transcripts` is false.** They are
-kept in the branch record and removed with it. Disable `context_memory` for the
-previous duplicate-only policy. This manages conversations owned by this
-runtime; it does not rewrite the external Jan/ChatGPT parent conversation.
-
-New benchmark diagnostics include `adaptive_early_branches`,
-`adaptive_memory_compactions`, `adaptive_archive_reads`, mid-case entries in
-`summaries`, and exact archived exchanges in each trial's
-`context_archives.json`. Existing reclamation estimates describe surprise
-branches; they do not measure the added early-stage branches. Use verified
-completion, peak context, total inference tokens and elapsed time together.
-Offline tests establish controller behavior only; live model savings remain
-an empirical question.
+These changes concern the repair benchmark. The general runtime still uses its
+existing model-reported summaries and file-read isolation; it has no simulator
+that can certify arbitrary work as complete. Runtime archives are saved even
+when `save_transcripts` is false if `context_memory` is enabled.
 
 ## Trust and limits
 

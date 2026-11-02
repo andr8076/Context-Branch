@@ -55,21 +55,27 @@ def read_archive(archives, path, start=0, limit=2400):
 
 
 def benchmark_memory(cfg, model, messages, preserved, trace, bm, archives,
-                     context_limit, incoming_chars=0, before_request=None):
+                     context_limit, incoming_chars=0, before_request=None, unfinished=False):
     """Pressure-aware model compaction, before an observation enters the prompt."""
+    # A summary cannot certify that unfinished evidence is safe to discard.
+    if unfinished:
+        return None
     threshold = cfg.get('_context_memory_threshold', 0)
     if not threshold or len(messages) <= len(preserved) + 1:
         return None
     if messages[-1].get("content", "").startswith("Historical observations are archived"):
         return None
     estimate = predicted_tokens(messages, bm.approximate_tokens, trace.calls)
-    reserve = max(cfg['max_output_tokens'], cfg.get('_summary_output_tokens', 2048))
+    reserve = cfg['max_output_tokens']
     incoming = predicted_tokens([{'role': 'user', 'content': 'x' * incoming_chars}],
                                 bm.approximate_tokens, trace.calls) if incoming_chars else 0
     if estimate + reserve + incoming + 256 < context_limit * threshold:
         return None
+    previous = getattr(trace, '_memory_sizes', {}).get(id(messages), 0)
+    if previous and estimate < previous + 512:
+        return None
     def guard(prompt):
-        if predicted_tokens(prompt, bm.approximate_tokens, trace.calls) + reserve + 256 > context_limit:
+        if predicted_tokens(prompt, bm.approximate_tokens, trace.calls) + cfg.get('_summary_output_tokens', 2048) + 256 > context_limit:
             raise MemoryCompactionError('Working-memory summary cannot fit; original evidence retained')
         if before_request:
             before_request(prompt)
@@ -82,11 +88,15 @@ def benchmark_memory(cfg, model, messages, preserved, trace, bm, archives,
     shorter[2:2] = [dict(m) for m in preserved[2:]]
     shorter.append({'role': 'user', 'content': archive_note(archives + [None]) +
         ' Use inspect with path=archive/N and start=<character offset> to retrieve 2400 characters.'})
-    if predicted_tokens(shorter, bm.approximate_tokens, trace.calls) >= estimate:
-        # No destructive replacement and no automatic retry loop.
-        raise MemoryCompactionError('Working-memory summary did not reduce context; original evidence retained')
+    after = predicted_tokens(shorter, bm.approximate_tokens, trace.calls)
+    if not hasattr(trace, '_memory_sizes'):
+        trace._memory_sizes = {}
+    trace._memory_sizes[id(messages)] = estimate
+    if estimate - after < max(256, estimate * .15):
+        return None
     reference = archive_snapshot(archives, messages)
     messages[:] = shorter
+    trace._memory_sizes[id(messages)] = after
     return {'archive': reference, 'chars': len(summary), 'text': summary,
             'before_est_tokens': estimate,
             'after_est_tokens': predicted_tokens(shorter, bm.approximate_tokens, trace.calls)}
@@ -94,6 +104,8 @@ def benchmark_memory(cfg, model, messages, preserved, trace, bm, archives,
 
 def archive_observation(sim, archives, action):
     """A retrieval consumes one ordinary action and appears in the audit trail."""
+    if hasattr(sim, 'check_stall'):
+        sim.check_stall(action)
     sim.actions += 1
     label = 'archive_read'
     try:

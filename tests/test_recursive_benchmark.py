@@ -124,7 +124,7 @@ class AutonomousFakeJan(RecursiveFakeJan):
 
 class RecursiveContextTests(unittest.TestCase):
     def cfg(self):
-        c=dict(bm.bc.DEFAULTS)
+        c=dict(bm.bc.DEFAULTS, _stall_limit=0)  # Exercise legacy checkpoint/retry limits independently.
         c.update({'max_output_tokens':1024, 'max_branch_depth':0,
                   'max_agent_turns':1,'save_transcripts':False, '_recursive_max_depth':3})
         return c
@@ -815,3 +815,4 @@ class RecursiveContextTests(unittest.TestCase):
 
 if __name__=='__main__':
     unittest.main()
+

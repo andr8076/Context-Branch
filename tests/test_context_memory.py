@@ -95,7 +95,7 @@ class MemoryTests(unittest.TestCase):
             self.assertIn('UNIQUE-SOURCE-DETAIL', json.dumps(child['transcript']))
             self.assertEqual(result['usage']['model_calls'], 4)
 
-    def test_active_summary_runs_inside_first_case_and_archive_is_retrievable(self):
+    def test_unfinished_case_evidence_is_not_summarized(self):
         cfg = dict(bc.DEFAULTS, _context_memory_threshold=.4, _memory_max_chars=1800,
                    _summary_output_tokens=512, max_output_tokens=256)
         actions = iter([{'action': 'inspect', 'path': 'logs/diagnostics'},
@@ -116,15 +116,14 @@ class MemoryTests(unittest.TestCase):
             result = tb.run_trap_trial('summarized', 17, 1, cfg, 'm', 8192, Path(temp), bm,
                                       trap_log_lines=100, max_actions=3)
             archives = json.loads((Path(temp) / 'context_archives.json').read_text())['parent']
-        self.assertGreater(result['summaries_generated'], 0, result['error'])
-        self.assertEqual(result['summaries'][0]['during_batch'], 'batch_1')
-        self.assertIn('NON-AUTHORITATIVE HISTORICAL LOG', json.dumps(archives))
-        self.assertTrue(any('archive/1 chars' in json.dumps(m) for m in seen))
+        self.assertEqual(result['summaries_generated'], 0, result['error'])
+        self.assertEqual(archives, [])
+        self.assertTrue(any('NON-AUTHORITATIVE HISTORICAL LOG' in json.dumps(m) for m in seen))
         self.assertEqual(result['verified_cases'], 0)
 
     def test_early_benchmark_branch_runs_before_parent_reads_shards(self):
         fake = RecursiveFakeJan()
-        cfg = dict(bc.DEFAULTS, _early_branch_threshold=.1, _context_memory_threshold=0,
+        cfg = dict(bc.DEFAULTS, _early_branch_threshold=.8, _context_memory_threshold=0,
                    _adaptive_max_tokens=300000, _adaptive_max_calls=96, max_output_tokens=512)
         with tempfile.TemporaryDirectory() as temp, patch.object(bc, 'http_json', fake):
             result = tb.run_trap_trial('adaptive', 17, 1, cfg, 'm', 8192, Path(temp), bm,
@@ -136,6 +135,93 @@ class MemoryTests(unittest.TestCase):
         self.assertTrue(any('EARLY BRANCH VERIFIED' in json.dumps(m) for m in parents))
         self.assertNotIn('INDEX SHARD A:', json.dumps(parents))
         self.assertIn('INDEX SHARD A:', json.dumps(fake.messages_seen))
+
+    def test_stall_guard_stops_rereads_and_resets_after_verified_progress(self):
+        case = tb.create_trap_puzzle(17, 1)['cases'][0]
+        sim = tb.RepairSimulator(case, stall_limit=3)
+        action = {'action': 'inspect', 'path': 'guide/index'}
+        sim.step(action)
+        sim.step(action)
+        with self.assertRaises(tb.InvestigationStalled) as caught:
+            sim.step(action)
+        self.assertEqual(bm.classify_exception(caught.exception), 'investigation_stalled')
+        self.assertEqual(sim.actions, 2)
+        sim.recovery_completed = True
+        sim.step(action)
+        self.assertEqual(sim.actions, 3)
+
+    def test_three_isolated_stages_resume_and_verify_without_summary(self):
+        parents = []
+        class ReceiptAwareFake(RecursiveFakeJan):
+            def __call__(self, method, url, cfg, payload=None):
+                if method != 'POST' or 'RECURSIVE STAGE=' in payload['messages'][0]['content']:
+                    return super().__call__(method, url, cfg, payload)
+                parents.append(copy.deepcopy(payload['messages']))
+                visible = json.dumps(payload['messages'])
+                for stage, receipt in [('index', 'index rebuilt;'), ('escrow', 'escrow unlocked;'),
+                                       ('recovery', 'approval ledger recovered;')]:
+                    if receipt not in visible:
+                        return {'choices': [{'message': {'content': json.dumps({
+                            'action': 'inspect', 'path': stage + '/shard-a'})}, 'finish_reason': 'stop'}]}
+                adjusted = copy.deepcopy(payload)
+                adjusted['messages'][0]['content'] = 'RECURSIVE STAGE=repair'
+                return super().__call__(method, url, cfg, adjusted)
+        case = tb.create_trap_puzzle(17, 1, nested_depth=2, nested_log_lines=8,
+                                    recovery_log_lines=8, pressure_records=0)['cases'][0]
+        sim = tb.RepairSimulator(case, stall_limit=3)
+        cfg = dict(bc.DEFAULTS, max_output_tokens=512, _early_branch_threshold=.8,
+                   _context_memory_threshold=.55, _adaptive_max_tokens=100000)
+        trace = bm.Trace('adaptive', ReceiptAwareFake())
+        success, events, counters = rb.solve_adaptive_case(
+            sim, case, cfg, 'm', trace, bm, 28, context_limit=8192)
+        self.assertTrue(success)
+        self.assertTrue(sim.verified)
+        self.assertEqual(counters['adaptive_early_branches'], 3)
+        self.assertEqual(trace.summary_events, [])
+        for stage in ('index', 'escrow', 'recovery'):
+            self.assertNotIn(stage.upper() + ' SHARD A:', json.dumps(parents))
+            archive = next(a for a in trace.stage_archives if a['stage'] == stage)
+            self.assertIn(stage.upper() + ' SHARD A:', json.dumps(archive['archives']))
+            event = next(e for e in events if e['stage'] == stage)
+            self.assertEqual(event['completed_evidence']['sources'],
+                             sorted(['guide/index', stage + '/shard-a', stage + '/shard-b']))
+
+    def test_oversized_summary_gets_one_bounded_retry(self):
+        trace = bm.Trace('test', None)
+        original = [{'role': 'system', 'content': 'S'}, {'role': 'user', 'content': 'Goal'},
+                    {'role': 'user', 'content': 'Observed evidence'}]
+        with patch.object(bm, 'call_parent', side_effect=['x' * 401, 'Completed: evidence archived.']) as call:
+            shorter, summary = bm.compact_history(bc.DEFAULTS, 'm', original, original[:2], trace, 400)
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(trace.summary_events[0]['first_status'], 'oversized')
+        self.assertTrue(trace.summary_events[0]['recovered_on_retry'])
+        self.assertIn(summary, shorter[-1]['content'])
+        self.assertEqual(original[-1]['content'], 'Observed evidence')
+
+    def test_memory_trigger_uses_normal_reserve_and_requires_new_growth(self):
+        trace = bm.Trace('test', None)
+        messages = [{'role': 'system', 'content': 'S'}, {'role': 'user', 'content': 'Goal'},
+                    {'role': 'user', 'content': 'Evidence ' * 1000},
+                    {'role': 'assistant', 'content': 'Done'}]
+        preserved = copy.deepcopy(messages[:2])
+        cfg = dict(bc.DEFAULTS, max_output_tokens=256, _summary_output_tokens=2048,
+                   _context_memory_threshold=.55)
+        with patch.object(bm, 'compact_history') as compact:
+            self.assertIsNone(cm.benchmark_memory(cfg, 'm', messages, preserved, trace, bm, [], 8192))
+        compact.assert_not_called()
+        messages[2]['content'] *= 2
+        archives = []
+        original = copy.deepcopy(messages)
+        with patch.object(bm, 'compact_history', return_value=(preserved + [
+                {'role': 'assistant', 'content': 'Completed work.'}], 'Completed work.')) as compact:
+            event = cm.benchmark_memory(cfg, 'm', messages, preserved, trace, bm, archives, 8192)
+            self.assertIsNotNone(event)
+            self.assertEqual(archives[0], original)
+            messages.append({'role': 'user', 'content': 'Next'})
+            # Even large lookahead must not cause repeated summaries of unchanged memory.
+            self.assertIsNone(cm.benchmark_memory(cfg, 'm', messages, preserved, trace, bm,
+                                                  archives, 8192, incoming_chars=20000))
+        self.assertEqual(compact.call_count, 1)
 
     def test_disabled_memory_does_not_call_model(self):
         cfg = dict(bc.DEFAULTS, context_memory=False)
